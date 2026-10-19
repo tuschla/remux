@@ -1,4 +1,6 @@
-use crate::services::{MediaResolveService, StreamService, image::ImageService};
+use crate::services::{
+    MediaResolveService, RememberedAudio, StreamService, image::ImageService,
+};
 use anyhow::Context;
 use axum::{
     Json,
@@ -1642,7 +1644,7 @@ async fn rank_item_sources(
     user_cfg: &api::UserConfiguration,
     server_metadata_language: Option<&str>,
     original_language: Option<&str>,
-    remembered_audio: Option<i64>,
+    remembered_audio: Option<&RememberedAudio>,
     remembered_subtitle: Option<i64>,
 ) {
     crate::services::StreamService::rank_media_sources(
@@ -1765,11 +1767,17 @@ async fn item_for_user(
 
     // Same remembered track selections PlaybackInfo resolves with, so both
     // endpoints rank and default sources identically.
-    let (remembered_audio, remembered_subtitle) = media
+    let db = &state
+        .ctx
+        .db;
+    let (remembered_audio, remembered_subtitle) = match media
         .user_state
         .as_ref()
-        .map(|s| (s.audio_idx, s.subtitle_idx))
-        .unwrap_or_default();
+    {
+        Some(s) if want_streams => (RememberedAudio::load(db, s).await, s.subtitle_idx),
+        Some(s) => (None, s.subtitle_idx),
+        None => (None, None),
+    };
 
     let needs_streams = want_streams
         && matches!(
@@ -1936,7 +1944,7 @@ async fn item_for_user(
                         .preferred_metadata_language
                         .as_deref(),
                     original_language.as_deref(),
-                    remembered_audio,
+                    remembered_audio.as_ref(),
                     remembered_subtitle,
                 )
                 .await;
@@ -2018,7 +2026,7 @@ async fn item_for_user(
                         .preferred_metadata_language
                         .as_deref(),
                     original_language.as_deref(),
-                    remembered_audio,
+                    remembered_audio.as_ref(),
                     remembered_subtitle,
                 )
                 .await;
@@ -2117,7 +2125,20 @@ async fn item_for_user(
             // (never persisted) — derive them here for the detail page. Must
             // run before the label block below, which needs to know the real
             // resolved subtitle to judge a possible burn-in.
-            for source in sources.iter_mut() {
+            let stream_ids = media
+                .sources
+                .as_deref()
+                .unwrap_or(&[]);
+            for (i, source) in sources
+                .iter_mut()
+                .enumerate()
+            {
+                let stream_id = stream_ids
+                    .get(i)
+                    .map_or(source.id, |stream| stream.id);
+                let audio_idx = remembered_audio
+                    .as_ref()
+                    .and_then(|audio| audio.index_for(stream_id, source));
                 source.resolve_default_streams(
                     &user_cfg,
                     server_config
@@ -2126,7 +2147,7 @@ async fn item_for_user(
                     original_language.as_deref(),
                     None,
                     None,
-                    remembered_audio,
+                    audio_idx,
                     remembered_subtitle,
                 );
             }

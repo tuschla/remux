@@ -22,7 +22,7 @@ use crate::{
     db::auth,
     playback::session::TranscodeSession,
     playback_session,
-    playback_session::ServedPlayback,
+    playback_session::{PlayedStream, ServedPlayback},
     services::{self, MediaResolveService},
     signals::{
         Event, PlaybackContext, PlaybackPosition, RemoteCommandInfo, RemotePlayInfo,
@@ -95,6 +95,90 @@ pub async fn sessions_capabilities_by_id(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// The stream PlaybackInfo selected for a playback report's source. Without
+/// a known answer for its play session: the user's latest answer on this
+/// device for that source (for any source when the report names none), else
+/// for the item's own id (Jellyfin's id for the first-ranked source) the
+/// first stored stream, and for one of the item's streams that stream.
+/// Answers are looked up by user and device, not device alone: several users
+/// of one client can share a DeviceId. `None` when none of that is known;
+/// the index is then stored without a stream and applies to every release,
+/// as it always did before streams were recorded.
+async fn reported_stream(
+    state: &AppState,
+    session: &auth::AuthSession,
+    data: &api::PlaybackInfo,
+) -> Option<PlayedStream> {
+    let user_id = session
+        .user
+        .id;
+    let device_id = session
+        .device
+        .id
+        .as_str();
+    let media_source_id: Option<Uuid> = data
+        .media_source_id
+        .as_deref()
+        .and_then(|id| {
+            id.parse()
+                .ok()
+        });
+    let play_session_id = data
+        .play_session_id
+        .as_deref();
+    let answered = play_session_id
+        .and_then(|psid| {
+            services::StreamService::selected_stream_for(
+                &state.ctx,
+                psid,
+                media_source_id.unwrap_or(data.item_id),
+            )
+        })
+        .or_else(|| {
+            services::StreamService::answered_stream_for(
+                &state.ctx,
+                user_id,
+                device_id,
+                data.item_id,
+                media_source_id,
+            )
+        });
+    let id = match (answered, media_source_id) {
+        (Some(answered), _) => answered,
+        (None, Some(source_id)) if source_id == data.item_id => {
+            services::StreamService::first_stored_stream_id(&state.ctx, data.item_id)
+                .await?
+        }
+        (None, Some(source_id)) => {
+            db::Media::get_by_id(
+                &state
+                    .ctx
+                    .db,
+                &source_id,
+            )
+            .await
+            .ok()
+            .flatten()
+            .filter(|m| {
+                m.kind == db::MediaKind::Stream && m.parent_id == Some(data.item_id)
+            })?
+            .id
+        }
+        (None, None) => return None,
+    };
+    Some(PlayedStream {
+        id,
+        automatic_audio: services::StreamService::automatic_audio_for(
+            &state.ctx,
+            user_id,
+            device_id,
+            data.item_id,
+            id,
+            play_session_id,
+        ),
+    })
+}
+
 #[post("/sessions/playing")]
 pub async fn report_playback_start(
     State(state): State<AppState>,
@@ -110,6 +194,7 @@ pub async fn report_playback_start(
                 .db,
             &session,
             &data,
+            reported_stream(&state, &session, &data).await,
         )
         .await
         .map_err(|e| {
@@ -192,6 +277,7 @@ pub async fn report_playback_progress(
                 &session.user,
                 psid,
                 &data,
+                reported_stream(&state, &session, &data).await,
             )
             .await
             .context_internal("failed to update progress")?;
