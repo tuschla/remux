@@ -12,6 +12,15 @@ use crate::{
 };
 use remux_sdks::remux::{PlayMethod, PlaybackInfo, QueueItem};
 
+/// The stream a PlaybackInfo answer told the client to play, which a
+/// reported audio track index points into.
+#[derive(Debug, Clone, Copy)]
+pub struct PlayedStream {
+    pub id: Uuid,
+    /// The track the answer had the stream play unless asked for another.
+    pub automatic_audio: Option<i64>,
+}
+
 #[derive(Clone)]
 pub struct PlaybackSession {
     pub play_session_id: String,
@@ -401,13 +410,15 @@ impl PlaybackSessionManager {
     ///
     /// Updates the in-memory session state, notifies the transcode buffer
     /// monitor, persists the playback position to the DB, and logs stream-
-    /// selection changes.
+    /// selection changes. `answered_stream` looks up the stream PlaybackInfo
+    /// answered for the report's item.
     pub async fn progress(
         &self,
         db: &sqlx::SqlitePool,
         user: &db::User,
         psid: &str,
         data: &PlaybackInfo,
+        answered_stream: impl FnOnce(Uuid) -> Option<PlayedStream>,
     ) -> anyhow::Result<()> {
         let ps_snapshot = self.get(psid);
         let ps = match ps_snapshot.as_ref() {
@@ -558,12 +569,22 @@ impl PlaybackSessionManager {
                 })
                 .unwrap_or_default();
 
-            let audio_idx = if cfg.remember_audio_selections {
-                data.audio_stream_index
-                    .or(ps.audio_stream_index)
-                    .map(|x| x as i64)
-            } else {
-                None
+            let audio = match data
+                .audio_stream_index
+                .or(ps.audio_stream_index)
+            {
+                Some(index) if cfg.remember_audio_selections => {
+                    let index = index as i64;
+                    let played = answered_stream(item_id);
+                    Some(db::AudioPick {
+                        index,
+                        stream_id: played.map(|p| p.id),
+                        chosen: played
+                            .and_then(|p| p.automatic_audio)
+                            .is_some_and(|automatic| automatic != index),
+                    })
+                }
+                _ => None,
             };
             let subtitle_idx = if cfg.remember_subtitle_selections {
                 data.subtitle_stream_index
@@ -578,7 +599,7 @@ impl PlaybackSessionManager {
                 user,
                 &media,
                 position_ticks,
-                audio_idx,
+                audio,
                 subtitle_idx,
                 media.runtime,
             )
