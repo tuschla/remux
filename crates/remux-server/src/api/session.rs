@@ -256,6 +256,18 @@ pub async fn report_playback_progress(
                 &session.user,
                 psid,
                 &data,
+                |item_id| {
+                    services::StreamService::answered_stream(
+                        &state.ctx,
+                        session
+                            .user
+                            .id,
+                        &session
+                            .device
+                            .id,
+                        item_id,
+                    )
+                },
             )
             .await
             .context_internal("failed to update progress")?;
@@ -400,6 +412,36 @@ pub async fn report_playback_stopped(
             )
             .await
             .context_internal("failed to record stop")?;
+        // Jellyfin clients re-key a playback when they switch streams (say a
+        // direct play reported without a PlaySessionId, then HLS under the
+        // switch's) and report its stop under the new id, where HLS left only
+        // an unclaimed transcode stub. Then the device's playback of the item
+        // is the one stopping; left running, it would pass for one in progress.
+        let user_id = session
+            .user
+            .id;
+        if playback
+            .as_ref()
+            .is_none_or(|playback| playback.user_id != user_id)
+            && let Some(replaced) = state
+                .ctx
+                .sessions
+                .get_by_device(
+                    &session
+                        .device
+                        .id,
+                )
+                .filter(|replaced| {
+                    replaced.user_id == user_id
+                        && Some(replaced.item_id) == changed_item_id
+                })
+        {
+            state
+                .ctx
+                .sessions
+                .stop(&replaced.play_session_id)
+                .await;
+        }
         state
             .ctx
             .signals
