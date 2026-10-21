@@ -190,11 +190,34 @@ pub async fn serve(config: Config, paths: FilesystemPaths) -> Result<()> {
         .web_path
         .clone();
     let addr = std::net::SocketAddr::new(config.host, config.port);
-    let (router, _) = init_app(config, Some(paths), admin, move |pool| {
+    let (router, ctx) = init_app(config, Some(paths), admin, move |pool| {
         WebClientService::from_filesystem(&web_path, pool)
     })
     .await?;
-    bind_and_serve(router, addr).await
+    tokio::select! {
+        result = bind_and_serve(router, addr) => result,
+        Ok(()) = shutdown_signal() => {
+            // HLS ffmpeg writes to files and never notices remux exiting.
+            info!("shutting down: stopping playback sessions");
+            ctx.sessions
+                .stop_all()
+                .await;
+            Ok(())
+        }
+    }
+}
+
+/// Resolves on Ctrl-C, SIGTERM on Unix, or console close on Windows.
+async fn shutdown_signal() -> std::io::Result<()> {
+    #[cfg(unix)]
+    let mut terminate =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    #[cfg(windows)]
+    let mut terminate = tokio::signal::windows::ctrl_close()?;
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => result,
+        _ = terminate.recv() => Ok(()),
+    }
 }
 
 pub async fn bind_and_serve(router: Router, addr: std::net::SocketAddr) -> Result<()> {
