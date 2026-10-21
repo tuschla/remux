@@ -880,6 +880,11 @@ async fn variant_hls_video_inner(
         .read()
         .await;
     let is_live = session_read.is_live;
+    // Requests keep a live ffmpeg running (see `engine::LIVE_IDLE`).
+    let live_state = session_read
+        .live_state
+        .clone();
+    live_state.touch();
     let use_fmp4 = session_read.use_fmp4();
     let playlist_path = session_read.variant_playlist_path();
     let psid = session_read
@@ -888,7 +893,7 @@ async fn variant_hls_video_inner(
 
     // For live streams, fMP4 sessions, and resumed TS-HLS sessions we must
     // serve the ffmpeg-written playlist:
-    // - live streams need FFmpeg's EVENT playlist
+    // - live streams need FFmpeg's sliding-window playlist
     // - fMP4 segments snap to keyframe boundaries, so actual durations differ
     //   from the target and the playlist must reflect the real segment timing
     // - resumed TS-HLS sessions start ffmpeg at a non-zero segment number; a
@@ -900,7 +905,7 @@ async fn variant_hls_video_inner(
         session_read.start_time_secs,
     ) {
         drop(session_read);
-        // For live streams, serve FFmpeg's EVENT playlist directly.
+        // For live streams, serve FFmpeg's sliding-window playlist directly.
         // For fMP4 VOD, also use ffmpeg's playlist because fMP4 segments snap to
         // keyframe boundaries so actual durations differ from our target.
         // For resumed TS-HLS sessions, ffmpeg's playlist carries the correct
@@ -924,6 +929,12 @@ async fn variant_hls_video_inner(
         // EVENT→VOD so hls.js treats the stream as a completed VOD rather than
         // a live feed; leave live streams untouched.
         let is_complete = !is_live && content.contains("#EXT-X-ENDLIST");
+        // ffmpeg doesn't write EXT-X-DISCONTINUITY-SEQUENCE.
+        let discontinuity_sequence = if is_live {
+            live_state.discontinuity_sequence(&content)
+        } else {
+            0
+        };
 
         // Scope each segment URL to the playback session, matching Jellyfin's
         // HLS URL shape. This keeps session lookup out of query-string
@@ -942,6 +953,12 @@ async fn variant_hls_video_inner(
                     line.replace("\"init.mp4\"", &format!("\"hls/{}/init.mp4\"", psid))
                 } else if is_complete && line == "#EXT-X-PLAYLIST-TYPE:EVENT" {
                     "#EXT-X-PLAYLIST-TYPE:VOD".to_string()
+                } else if discontinuity_sequence > 0
+                    && line.starts_with("#EXT-X-MEDIA-SEQUENCE:")
+                {
+                    format!(
+                        "{line}\n#EXT-X-DISCONTINUITY-SEQUENCE:{discontinuity_sequence}"
+                    )
                 } else {
                     line.to_string()
                 }
@@ -1204,6 +1221,9 @@ async fn hls_segment_inner(
             let s = session
                 .read()
                 .await;
+            // Requests keep a live ffmpeg running (see `engine::LIVE_IDLE`).
+            s.live_state
+                .touch();
             let prev = s
                 .last_segment_index
                 .load(Ordering::Relaxed);
@@ -1228,7 +1248,20 @@ async fn hls_segment_inner(
             let current_idx = get_current_transcoding_index(&output_dir);
             let segment_gap_threshold = 24 / segment_length;
 
+            // Live is never seek-restarted: `-ss` on a live input produces
+            // nothing for a long time and resets the playlist under the player.
+            // A live segment below the newest one was already cleaned up, so it
+            // gets an immediate 404 instead of a 60 s wait, and ExoPlayer
+            // re-prepares at the live edge.
+            if s.is_live && current_idx.is_some_and(|cur| requested_idx < cur) {
+                None::<()>.context_not_found(&format!(
+                    "segment {} is no longer available",
+                    segment_id
+                ))?;
+            }
+
             let needs_restart = match current_idx {
+                _ if s.is_live => false, // live waits for ffmpeg
                 None => {
                     // No segments on disk yet. If FFmpeg is still running
                     // (Starting/Running), just fall through to the wait loop —
@@ -1635,5 +1668,128 @@ mod tests {
         ctx.sessions
             .stop_transcode("hls-selection")
             .await;
+    }
+
+    /// A live session whose ffmpeg output the test writes itself.
+    fn attach_live_session(
+        ctx: &crate::AppContext,
+        play_session_id: &str,
+    ) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let session = super::TranscodeSession::new(
+            play_session_id.into(),
+            uuid::Uuid::nil(),
+            uuid::Uuid::nil(),
+            "http://iptv.invalid/channel.ts".into(),
+            dir.path()
+                .to_path_buf(),
+            "copy".into(),
+            "aac".into(),
+            None,
+            None,
+            false,
+            6,
+            Default::default(),
+            0,
+            true,
+            Some("h264".into()),
+            Some("aac".into()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        ctx.sessions
+            .attach_transcode(play_session_id, session);
+        dir
+    }
+
+    #[tokio::test]
+    async fn live_playlist_counts_discontinuities_that_slid_out() {
+        let (server, guard) = crate::integration_test::new_test_server()
+            .await
+            .unwrap();
+        let dir = attach_live_session(&guard.0, "live-discontinuity");
+        let playlist = dir
+            .path()
+            .join("main.m3u8");
+        let url = format!(
+            "/videos/{}/main.m3u8?PlaySessionId=live-discontinuity",
+            uuid::Uuid::nil()
+        );
+
+        // ffmpeg restarted with append_list: segment 17 follows a discontinuity.
+        std::fs::write(
+            &playlist,
+            "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXT-X-MEDIA-SEQUENCE:15\n\
+             #EXTINF:6.0,\nsegment_00015.ts\n#EXTINF:6.0,\nsegment_00016.ts\n\
+             #EXT-X-DISCONTINUITY\n#EXTINF:6.0,\nsegment_00017.ts\n",
+        )
+        .unwrap();
+        let served = server
+            .get(&url)
+            .await
+            .text();
+        assert!(
+            !served.contains("#EXT-X-DISCONTINUITY-SEQUENCE"),
+            "{served}"
+        );
+
+        // The window slid past segment 17.
+        std::fs::write(
+            &playlist,
+            "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXT-X-MEDIA-SEQUENCE:18\n\
+             #EXTINF:6.0,\nsegment_00018.ts\n#EXTINF:6.0,\nsegment_00019.ts\n",
+        )
+        .unwrap();
+        let served = server
+            .get(&url)
+            .await
+            .text();
+        assert!(
+            served.contains(
+                "#EXT-X-MEDIA-SEQUENCE:18\n#EXT-X-DISCONTINUITY-SEQUENCE:1\n"
+            ),
+            "{served}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cleaned_up_live_segment_is_an_immediate_404() {
+        let (server, guard) = crate::integration_test::new_test_server()
+            .await
+            .unwrap();
+        let dir = attach_live_session(&guard.0, "live-cleaned-up");
+        for name in ["segment_00040.ts", "segment_00041.ts"] {
+            std::fs::write(
+                dir.path()
+                    .join(name),
+                "ts",
+            )
+            .unwrap();
+        }
+        let segment = |name: &str| {
+            format!("/videos/{}/hls/live-cleaned-up/{name}", uuid::Uuid::nil())
+        };
+
+        server
+            .get(&segment("segment_00041.ts"))
+            .await
+            .assert_status_ok();
+        // Not a wait for ffmpeg, which only writes newer segments.
+        let gone = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            server
+                .get(&segment("segment_00010.ts"))
+                .expect_failure(),
+        )
+        .await
+        .expect("answered without waiting");
+        gone.assert_status(http::StatusCode::NOT_FOUND);
     }
 }

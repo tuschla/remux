@@ -535,7 +535,7 @@ pub trait StreamSource: Send + Sync {
     async fn serve(&self, state: &AppState, headers: &HeaderMap) -> Result<Response>;
 }
 
-static AVAILABILITY_CLIENT: std::sync::LazyLock<reqwest::Client> =
+pub(crate) static AVAILABILITY_CLIENT: std::sync::LazyLock<reqwest::Client> =
     std::sync::LazyLock::new(|| {
         reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(3))
