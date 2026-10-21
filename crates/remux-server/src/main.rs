@@ -74,7 +74,9 @@ async fn main() -> Result<()> {
             .as_deref(),
     );
 
-    serve(config.resolve(), load_paths()).await
+    serve(config.resolve(), load_paths()).await?;
+    // Shutdown signal handled: don't wait for in-flight blocking tasks.
+    std::process::exit(0)
 }
 
 #[cfg(test)]

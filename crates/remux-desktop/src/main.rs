@@ -3,8 +3,10 @@
 mod ffmpeg;
 
 use anyhow::Result;
+use remux_server::playback_session::PlaybackSessionManager;
 use std::{
     path::{Path, PathBuf},
+    sync::{Arc, OnceLock},
     time::{Duration, SystemTime},
 };
 use tao::event_loop::{ControlFlow, EventLoop};
@@ -100,6 +102,12 @@ fn main() -> Result<()> {
 
     // Start the remux server in a background tokio thread with embedded assets.
     let rt = tokio::runtime::Runtime::new()?;
+    let rt_handle = rt
+        .handle()
+        .clone();
+    // Filled once the server is up, so Quit can stop its transcodes.
+    let sessions: Arc<OnceLock<PlaybackSessionManager>> = Arc::new(OnceLock::new());
+    let server_sessions = sessions.clone();
     let server_config = config.clone();
     let data_dir_for_ffmpeg = config
         .data_dir
@@ -114,7 +122,7 @@ fn main() -> Result<()> {
                      environment variable."
                 );
             }
-            if let Err(e) = serve(server_config).await {
+            if let Err(e) = serve(server_config, &server_sessions).await {
                 tracing::error!("server error: {e:#}");
             }
         });
@@ -175,13 +183,20 @@ fn main() -> Result<()> {
                 let _ = open::that(&log_dir);
             } else if ev.id == quit_id {
                 tracing::info!("quit");
+                // Exiting runs no destructors: ffmpeg would outlive the app.
+                if let Some(sessions) = sessions.get() {
+                    rt_handle.block_on(sessions.stop_all());
+                }
                 *control_flow = ControlFlow::Exit;
             }
         }
     });
 }
 
-async fn serve(config: remux_server::Config) -> anyhow::Result<()> {
+async fn serve(
+    config: remux_server::Config,
+    sessions: &OnceLock<PlaybackSessionManager>,
+) -> anyhow::Result<()> {
     #[cfg(dashboard_built)]
     let admin = remux_server::embedded_static::EmbeddedDir {
         dir: &DASHBOARD,
@@ -196,7 +211,7 @@ async fn serve(config: remux_server::Config) -> anyhow::Result<()> {
     };
 
     let addr = std::net::SocketAddr::new(config.host, config.port);
-    let (router, _) = remux_server::init_app(config, None, admin, |pool| {
+    let (router, ctx) = remux_server::init_app(config, None, admin, |pool| {
         #[cfg(jellyfin_web_built)]
         {
             remux_server::WebClientService::from_embedded(&JELLYFIN_WEB, pool)
@@ -209,6 +224,10 @@ async fn serve(config: remux_server::Config) -> anyhow::Result<()> {
         }
     })
     .await?;
+    let _ = sessions.set(
+        ctx.sessions
+            .clone(),
+    );
     remux_server::bind_and_serve(router, addr).await
 }
 
