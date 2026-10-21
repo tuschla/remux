@@ -1,10 +1,12 @@
 use remux_sdks::remux::{AudioCodec, TranscodeReasons, VideoCodec};
 use std::{
+    collections::BTreeSet,
     path::PathBuf,
-    sync::{Arc, atomic::AtomicU32},
-    time::Instant,
+    sync::{Arc, Mutex, atomic::AtomicU32},
+    time::{Duration, Instant},
 };
 use tokio::sync::{Notify, watch};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -53,6 +55,79 @@ impl SegmentContainer {
     }
 }
 
+/// Client requests and playlist discontinuities of a live session.
+pub struct LiveState {
+    /// Last playlist or segment request. The engine stops the ffmpeg of a
+    /// client that went away without a Stop (`engine::LIVE_IDLE`).
+    last_request: Mutex<Instant>,
+    /// Media sequence numbers of segments that follow an
+    /// `#EXT-X-DISCONTINUITY`, kept after they slide out of the playlist.
+    discontinuities: Mutex<BTreeSet<u64>>,
+}
+
+impl Default for LiveState {
+    fn default() -> Self {
+        Self {
+            last_request: Mutex::new(Instant::now()),
+            discontinuities: Mutex::default(),
+        }
+    }
+}
+
+impl LiveState {
+    /// Record a playlist or segment request.
+    pub fn touch(&self) {
+        *self
+            .last_request
+            .lock()
+            .expect("last_request lock is not poisoned") = Instant::now();
+    }
+
+    /// Time since the last playlist or segment request.
+    pub fn idle_for(&self) -> Duration {
+        self.last_request
+            .lock()
+            .expect("last_request lock is not poisoned")
+            .elapsed()
+    }
+
+    /// `#EXT-X-DISCONTINUITY-SEQUENCE` of a sliding-window live playlist: the
+    /// number of discontinuities before its first segment (RFC 8216 §6.2.2).
+    /// ffmpeg doesn't write the tag, and a discontinuity that slid out of the
+    /// window can't be counted from the playlist alone, so every served
+    /// playlist records the discontinuities it lists.
+    pub fn discontinuity_sequence(&self, playlist: &str) -> u64 {
+        let mut seen = self
+            .discontinuities
+            .lock()
+            .expect("discontinuities lock is not poisoned");
+        let mut media_sequence: u64 = 0;
+        let mut next = 0;
+        let mut after_discontinuity = false;
+        for line in playlist
+            .lines()
+            .map(str::trim)
+        {
+            if let Some(n) = line.strip_prefix("#EXT-X-MEDIA-SEQUENCE:") {
+                media_sequence = n
+                    .parse()
+                    .unwrap_or(0);
+                next = media_sequence;
+            } else if line == "#EXT-X-DISCONTINUITY" {
+                after_discontinuity = true;
+            } else if !line.is_empty() && !line.starts_with('#') {
+                if after_discontinuity {
+                    seen.insert(next);
+                    after_discontinuity = false;
+                }
+                next += 1;
+            }
+        }
+        seen.range(..media_sequence)
+            .count() as u64
+    }
+}
+
 pub struct TranscodeSession {
     pub id: String,
     pub item_id: Uuid,
@@ -73,6 +148,11 @@ pub struct TranscodeSession {
     /// Kill channel and done notifier for the ffmpeg subprocess.
     pub kill_tx: Option<tokio::sync::oneshot::Sender<()>>,
     pub wait_done: Arc<Notify>,
+    /// Cancelled when the session is stopped, so a live session doesn't
+    /// restart ffmpeg afterwards.
+    pub stopped: CancellationToken,
+    /// Used by live sessions only.
+    pub live_state: Arc<LiveState>,
     /// Index of the last segment the client has requested (0-based).
     pub last_segment_index: Arc<AtomicU32>,
     /// Start offset of this transcode in seconds (from start_time_ticks).
@@ -81,7 +161,8 @@ pub struct TranscodeSession {
     pub playback_offset_secs: Arc<AtomicU32>,
     /// Total runtime of the media in Jellyfin ticks (100-ns units).
     pub runtime_ticks: i64,
-    /// True for live TV — variant playlist is served from the ffmpeg-written EVENT file.
+    /// True for live TV — variant playlist is served from the ffmpeg-written
+    /// sliding-window file.
     pub is_live: bool,
     /// Codec name of the source video stream (e.g. "hevc", "h264"), used when
     /// rebuilding `TranscodeParams` on seek-restart.
@@ -158,6 +239,8 @@ impl TranscodeSession {
             transcode_reasons,
             kill_tx: None,
             wait_done: Arc::new(Notify::new()),
+            stopped: CancellationToken::new(),
+            live_state: Arc::default(),
             last_segment_index: Arc::new(AtomicU32::new(0)),
             start_time_secs: 0,
             playback_offset_secs: Arc::new(AtomicU32::new(0)),
@@ -225,5 +308,35 @@ impl TranscodeSession {
             self.media_source_id
                 .as_simple(),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn discontinuity_sequence_counts_discontinuities_that_slid_out() {
+        let live_state = LiveState::default();
+        // ffmpeg restarted with append_list: segment 17 follows a discontinuity.
+        let before = "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:6\n\
+                      #EXT-X-MEDIA-SEQUENCE:15\n\
+                      #EXTINF:6.0,\nsegment_00015.ts\n\
+                      #EXTINF:6.0,\nsegment_00016.ts\n\
+                      #EXT-X-DISCONTINUITY\n\
+                      #EXTINF:6.0,\nsegment_00017.ts\n";
+        // Still listed: the tag itself carries it.
+        assert_eq!(live_state.discontinuity_sequence(before), 0);
+        let after = "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:6\n\
+                     #EXT-X-MEDIA-SEQUENCE:18\n\
+                     #EXTINF:6.0,\nsegment_00018.ts\n\
+                     #EXT-X-DISCONTINUITY\n\
+                     #EXTINF:6.0,\nsegment_00019.ts\n";
+        // Segment 17's discontinuity slid out; 19's is still listed.
+        assert_eq!(live_state.discontinuity_sequence(after), 1);
+        // Both slid out.
+        let later =
+            "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:20\n#EXTINF:6.0,\nsegment_00020.ts\n";
+        assert_eq!(live_state.discontinuity_sequence(later), 2);
     }
 }

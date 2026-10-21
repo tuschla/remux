@@ -102,8 +102,10 @@ async fn create_hls_session(
     let video_codec = resolved_codecs.video;
     let audio_codec = resolved_codecs.audio;
     let burn_subtitle = resolved_codecs.burn_subtitle;
+    // Segment math divides by it; 0 would panic.
     let segment_length = q
         .segment_length
+        .filter(|&length| length > 0)
         .unwrap_or(6) as u32;
 
     // Look up existing session or create a new one.
@@ -880,6 +882,11 @@ async fn variant_hls_video_inner(
         .read()
         .await;
     let is_live = session_read.is_live;
+    // Requests keep a live ffmpeg running (see `engine::LIVE_IDLE`).
+    let live_state = session_read
+        .live_state
+        .clone();
+    live_state.touch();
     let use_fmp4 = session_read.use_fmp4();
     let playlist_path = session_read.variant_playlist_path();
     let psid = session_read
@@ -888,7 +895,7 @@ async fn variant_hls_video_inner(
 
     // For live streams, fMP4 sessions, and resumed TS-HLS sessions we must
     // serve the ffmpeg-written playlist:
-    // - live streams need FFmpeg's EVENT playlist
+    // - live streams need FFmpeg's sliding-window playlist
     // - fMP4 segments snap to keyframe boundaries, so actual durations differ
     //   from the target and the playlist must reflect the real segment timing
     // - resumed TS-HLS sessions start ffmpeg at a non-zero segment number; a
@@ -900,7 +907,7 @@ async fn variant_hls_video_inner(
         session_read.start_time_secs,
     ) {
         drop(session_read);
-        // For live streams, serve FFmpeg's EVENT playlist directly.
+        // For live streams, serve FFmpeg's sliding-window playlist directly.
         // For fMP4 VOD, also use ffmpeg's playlist because fMP4 segments snap to
         // keyframe boundaries so actual durations differ from our target.
         // For resumed TS-HLS sessions, ffmpeg's playlist carries the correct
@@ -924,6 +931,12 @@ async fn variant_hls_video_inner(
         // EVENT→VOD so hls.js treats the stream as a completed VOD rather than
         // a live feed; leave live streams untouched.
         let is_complete = !is_live && content.contains("#EXT-X-ENDLIST");
+        // ffmpeg doesn't write EXT-X-DISCONTINUITY-SEQUENCE.
+        let discontinuity_sequence = if is_live {
+            live_state.discontinuity_sequence(&content)
+        } else {
+            0
+        };
 
         // Scope each segment URL to the playback session, matching Jellyfin's
         // HLS URL shape. This keeps session lookup out of query-string
@@ -942,6 +955,12 @@ async fn variant_hls_video_inner(
                     line.replace("\"init.mp4\"", &format!("\"hls/{}/init.mp4\"", psid))
                 } else if is_complete && line == "#EXT-X-PLAYLIST-TYPE:EVENT" {
                     "#EXT-X-PLAYLIST-TYPE:VOD".to_string()
+                } else if discontinuity_sequence > 0
+                    && line.starts_with("#EXT-X-MEDIA-SEQUENCE:")
+                {
+                    format!(
+                        "{line}\n#EXT-X-DISCONTINUITY-SEQUENCE:{discontinuity_sequence}"
+                    )
                 } else {
                     line.to_string()
                 }
@@ -1204,6 +1223,9 @@ async fn hls_segment_inner(
             let s = session
                 .read()
                 .await;
+            // Requests keep a live ffmpeg running (see `engine::LIVE_IDLE`).
+            s.live_state
+                .touch();
             let prev = s
                 .last_segment_index
                 .load(Ordering::Relaxed);
@@ -1228,7 +1250,31 @@ async fn hls_segment_inner(
             let current_idx = get_current_transcoding_index(&output_dir);
             let segment_gap_threshold = 24 / segment_length;
 
+            // Live is never seek-restarted: `-ss` on a live input produces
+            // nothing for a long time and resets the playlist under the player.
+            // A live segment below the newest one was already cleaned up, so it
+            // gets an immediate 404 instead of a 60 s wait, and ExoPlayer
+            // re-prepares at the live edge.
+            if s.is_live {
+                let finished = matches!(
+                    s.state,
+                    TranscodeState::Error(_) | TranscodeState::Complete
+                );
+                if finished || current_idx.is_some_and(|cur| requested_idx < cur) {
+                    debug!(
+                        requested_idx,
+                        ?current_idx,
+                        "Live segment no longer available"
+                    );
+                    None::<()>.context_not_found(&format!(
+                        "segment {} is no longer available",
+                        segment_id
+                    ))?;
+                }
+            }
+
             let needs_restart = match current_idx {
+                _ if s.is_live => false, // live waits for ffmpeg
                 None => {
                     // No segments on disk yet. If FFmpeg is still running
                     // (Starting/Running), just fall through to the wait loop —
