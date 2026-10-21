@@ -25,14 +25,8 @@ use crate::{
         hw_accel,
         session::{SegmentContainer, TranscodeSession, TranscodeState},
     },
-    playback_session::{FfmpegTrack, ServedPlayback},
+    playback_session::{FfmpegTrack, ServedPlayback, StopMode, TRANSCODE_CREATE_LOCKS},
 };
-
-/// Serializes the lookup-or-create-transcode sequence per play_session_id so
-/// two racing requests for the same session can't each spawn their own
-/// ffmpeg process.
-static TRANSCODE_CREATE_LOCKS: crate::keyed_lock::KeyedLock<String> =
-    crate::keyed_lock::KeyedLock::new();
 
 enum HlsSessionResult {
     Transcode(Arc<tokio::sync::RwLock<TranscodeSession>>, String),
@@ -56,6 +50,11 @@ async fn create_hls_session(
                 .as_simple()
                 .to_string()
         });
+    // One creation per play_session_id at a time (no duplicate ffmpeg); stops
+    // from the client take this lock too, so they see the transcode created.
+    let _create_guard = TRANSCODE_CREATE_LOCKS
+        .lock(play_session_id.clone())
+        .await;
 
     debug!("Using play session ID: {}", play_session_id);
 
@@ -92,7 +91,7 @@ async fn create_hls_session(
             state
                 .ctx
                 .sessions
-                .stop_transcode(&play_session_id)
+                .stop_transcode(&play_session_id, StopMode::Detached)
                 .await;
         }
         return Ok(HlsSessionResult::Forbidden(
@@ -111,16 +110,6 @@ async fn create_hls_session(
     // StartTimeTicks.  In that case we must stop the old transcode job and
     // restart from the requested position — otherwise the player waits for
     // segments that the old job will never produce at the new offset.
-    //
-    // Serialize the whole stop/lookup/create/attach sequence per
-    // play_session_id: the lookup-or-create path below awaits DB queries and
-    // filesystem ops with no lock held, so two requests racing for the same
-    // session would otherwise both see no existing transcode and each spawn
-    // their own ffmpeg process, with the loser's session silently overwritten
-    // (and its ffmpeg process orphaned) by attach_transcode.
-    let _create_guard = TRANSCODE_CREATE_LOCKS
-        .lock(play_session_id.clone())
-        .await;
     let is_seeking = q
         .start_time_ticks
         .is_some_and(|t| t > 0);
@@ -136,10 +125,11 @@ async fn create_hls_session(
                 start_time_ticks = ?q.start_time_ticks,
                 "seek detected — stopping old transcode session and restarting"
             );
+            // The restart reuses this play session's output dir.
             state
                 .ctx
                 .sessions
-                .stop_transcode(&play_session_id)
+                .stop_transcode(&play_session_id, StopMode::Reaped)
                 .await;
         }
     }
@@ -513,6 +503,8 @@ async fn create_hls_session(
         };
         let session = TranscodeSession::new(
             play_session_id.clone(),
+            auth.user
+                .id,
             id,
             media_source_id,
             input_url.clone(),
@@ -547,10 +539,20 @@ async fn create_hls_session(
             session_hw_accel,
         );
 
-        state
+        if !state
             .ctx
             .sessions
-            .attach_transcode(&play_session_id, session.clone());
+            .attach_transcode(
+                &play_session_id,
+                &auth
+                    .device
+                    .id,
+                session.clone(),
+            )
+        {
+            return Err(anyhow::anyhow!("shutting down")
+                .context_internal("server is shutting down"));
+        }
 
         // Start transcoding in background
         let session_clone = session.clone();
@@ -879,6 +881,10 @@ async fn variant_hls_video_inner(
     let session_read = session
         .read()
         .await;
+    // A client fetching playlists is still on this transcode.
+    let _request = session_read
+        .requests
+        .begin();
     let is_live = session_read.is_live;
     let use_fmp4 = session_read.use_fmp4();
     let playlist_path = session_read.variant_playlist_path();
@@ -1139,6 +1145,17 @@ async fn hls_segment_inner(
         .ctx
         .sessions
         .get_transcode(&play_session_id);
+    // In flight until answered: a client waiting for a slow segment is
+    // still on this transcode.
+    let _request = match &session {
+        Some(s) => Some(
+            s.read()
+                .await
+                .requests
+                .begin(),
+        ),
+        None => None,
+    };
 
     // The fMP4 init segment is served at "init.mp4" — strip_segment_extension
     // reduces that to "init", so we detect it here and serve it directly.
@@ -1633,7 +1650,7 @@ mod tests {
         );
         drop(session);
         ctx.sessions
-            .stop_transcode("hls-selection")
+            .stop_transcode("hls-selection", super::StopMode::Detached)
             .await;
     }
 }
