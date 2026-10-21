@@ -93,7 +93,9 @@ async fn main() -> Result<()> {
         );
     }
 
-    serve(config, load_paths()).await
+    serve(config, load_paths()).await?;
+    // Don't wait for in-flight blocking tasks.
+    std::process::exit(0)
 }
 
 #[cfg(test)]
