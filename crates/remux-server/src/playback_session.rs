@@ -1196,6 +1196,8 @@ async fn kill_transcode(ts: Arc<tokio::sync::RwLock<TranscodeSession>>) {
         let mut s = ts
             .write()
             .await;
+        s.stopped
+            .cancel();
         (
             s.kill_tx
                 .take(),
