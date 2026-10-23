@@ -343,7 +343,7 @@ impl CatalogAddon for IptvAddon {
         &self,
         _ctx: &AppContext,
         local_id: &str,
-    ) -> Result<Option<Pin<Box<dyn Stream<Item = db::Media> + Send>>>> {
+    ) -> Result<Option<Pin<Box<dyn Stream<Item = Result<db::Media>> + Send>>>> {
         if local_id != "all" {
             return Ok(None);
         }
@@ -446,7 +446,11 @@ impl CatalogAddon for IptvAddon {
             }
         }
 
-        Ok(Some(Box::pin(futures::stream::iter(items))))
+        Ok(Some(Box::pin(futures::stream::iter(
+            items
+                .into_iter()
+                .map(Ok::<_, anyhow::Error>),
+        ))))
     }
 }
 

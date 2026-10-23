@@ -109,7 +109,7 @@ pub trait RemoteMediaStream: Send + Sync {
     async fn stream(
         &self,
         ctx: &AppContext,
-    ) -> Result<Pin<Box<dyn Stream<Item = db::Media> + Send>>>;
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<db::Media>> + Send>>>;
 }
 
 #[derive(Debug)]
@@ -751,11 +751,14 @@ pub trait IndexAddon: Send + Sync {
 #[async_trait]
 pub trait CatalogAddon: Send + Sync {
     async fn catalog_list(&self, ctx: &AppContext) -> Result<Vec<CatalogInfo>>;
+    /// Streams the catalog's items. An `Err` item means the source failed
+    /// partway (e.g. a page fetch failed): the `Ok` items are then only part
+    /// of the catalog, so consumers must not treat a missing item as removed.
     async fn catalog_stream(
         &self,
         ctx: &AppContext,
         local_id: &str,
-    ) -> Result<Option<Pin<Box<dyn Stream<Item = db::Media> + Send>>>>;
+    ) -> Result<Option<Pin<Box<dyn Stream<Item = Result<db::Media>> + Send>>>>;
 }
 
 #[derive(Debug, Clone, Default)]
@@ -3723,7 +3726,7 @@ impl RemoteMediaStream for AddonCatalogStream {
     async fn stream(
         &self,
         ctx: &AppContext,
-    ) -> Result<Pin<Box<dyn Stream<Item = db::Media> + Send>>> {
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<db::Media>> + Send>>> {
         self.addon
             .catalog_stream(ctx, &self.local_id)
             .await?

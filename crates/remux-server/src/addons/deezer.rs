@@ -1102,7 +1102,7 @@ impl CatalogAddon for DeezerAddon {
         &self,
         _ctx: &AppContext,
         local_id: &str,
-    ) -> Result<Option<Pin<Box<dyn Stream<Item = db::Media> + Send>>>> {
+    ) -> Result<Option<Pin<Box<dyn Stream<Item = Result<db::Media>> + Send>>>> {
         if !self
             .playlists()
             .iter()
@@ -1115,9 +1115,8 @@ impl CatalogAddon for DeezerAddon {
         let playlist = self
             .fetch_playlist(local_id)
             .await?;
-        Ok(Some(Box::pin(stream::iter(vec![build_playlist_media(
-            &playlist,
-        )]))))
+        let item = Ok::<_, anyhow::Error>(build_playlist_media(&playlist));
+        Ok(Some(Box::pin(stream::once(futures::future::ready(item)))))
     }
 }
 
