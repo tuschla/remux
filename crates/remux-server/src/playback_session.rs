@@ -574,32 +574,36 @@ impl PlaybackSessionManager {
                 })
                 .unwrap_or_default();
 
+            // Remembering off forgets the stored pick, as Jellyfin does, so
+            // switching it back on does not revive a pick from before.
             let audio = if cfg.remember_audio_selections {
                 data.audio_stream_index
                     .or(ps.audio_stream_index)
-                    .map(|x| {
+                    .map_or(db::TrackMemory::Keep, |x| {
                         let index = x as i64;
                         let played = ps
                             .played_stream
                             .filter(|_| ps.item_id == item_id)
                             .or(reported_stream);
-                        db::AudioPick {
+                        db::TrackMemory::Remember(db::AudioPick {
                             index,
                             stream_id: played.map(|p| p.id),
                             chosen: played
                                 .and_then(|p| p.automatic_audio)
                                 .is_some_and(|automatic| automatic != index),
-                        }
+                        })
                     })
             } else {
-                None
+                db::TrackMemory::Forget
             };
-            let subtitle_idx = if cfg.remember_subtitle_selections {
+            let subtitle = if cfg.remember_subtitle_selections {
                 data.subtitle_stream_index
                     .or(ps.subtitle_stream_index)
-                    .map(|x| x as i64)
+                    .map_or(db::TrackMemory::Keep, |x| {
+                        db::TrackMemory::Remember(x as i64)
+                    })
             } else {
-                None
+                db::TrackMemory::Forget
             };
 
             db::UserMediaState::update_playback(
@@ -608,7 +612,7 @@ impl PlaybackSessionManager {
                 &media,
                 position_ticks,
                 audio,
-                subtitle_idx,
+                subtitle,
                 media.runtime,
             )
             .await?;
@@ -703,8 +707,8 @@ impl PlaybackSessionManager {
             user,
             &media,
             final_ticks,
-            None, // don't overwrite stream selections on stop
-            None,
+            db::TrackMemory::Keep, // don't overwrite stream selections on stop
+            db::TrackMemory::Keep,
             media.runtime, // Some(runtime) triggers watched-threshold check
         )
         .await

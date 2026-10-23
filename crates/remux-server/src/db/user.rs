@@ -466,6 +466,18 @@ pub struct AudioPick {
     pub chosen: bool,
 }
 
+/// What a playback report does to one remembered track selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrackMemory<T> {
+    /// Leave the stored pick as it is.
+    Keep,
+    /// Store this pick.
+    Remember(T),
+    /// Remembering is off: drop the stored pick, as Jellyfin does, so turning
+    /// the setting back on does not revive a pick from before it was off.
+    Forget,
+}
+
 /// A personal rating on Jellyfin's 0-10 scale. Jellyfin stores no `Likes`
 /// field, deriving it from this at [`UserRating::LIKE_THRESHOLD`].
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -1102,8 +1114,9 @@ impl UserMediaState {
     /// for a user/media pair.
     ///
     /// * `position_ticks` – current playback position in 100-nanosecond ticks.
-    /// * `audio` / `subtitle_idx` – stream selections to remember; pass
-    ///   `None` to leave existing values unchanged. See [`AudioPick`].
+    /// * `audio` / `subtitle` – what to do with the remembered stream
+    ///   selections; see [`AudioPick`]. Forgetting audio also drops the stream
+    ///   and chosen flag recorded with it.
     /// * `runtime_seconds` – when `Some`, the 90 % "mark as watched" threshold
     ///   is applied. Pass `None` for progress updates (no watched-check) and
     ///   `Some(media.runtime)` for stop events.
@@ -1116,19 +1129,28 @@ impl UserMediaState {
         user: &User,
         media: &super::Media,
         position_ticks: i64,
-        audio: Option<AudioPick>,
-        subtitle_idx: Option<i64>,
+        audio: TrackMemory<AudioPick>,
+        subtitle: TrackMemory<i64>,
         runtime_seconds: Option<i64>,
     ) -> Result<bool> {
         let mut ms = Self::get_or_new(db, user, media).await?;
         let position_seconds = position_ticks / 10_000_000;
         ms.playback_position = position_seconds;
 
-        if let Some(pick) = audio {
-            ms.remember_audio(pick);
+        match audio {
+            TrackMemory::Keep => {}
+            TrackMemory::Remember(pick) => ms.remember_audio(pick),
+            TrackMemory::Forget => {
+                ms.audio_idx = None;
+                ms.stream_id = None;
+                ms.stream_audio_idx = None;
+                ms.audio_chosen = false;
+            }
         }
-        if let Some(idx) = subtitle_idx {
-            ms.subtitle_idx = Some(idx);
+        match subtitle {
+            TrackMemory::Keep => {}
+            TrackMemory::Remember(idx) => ms.subtitle_idx = Some(idx),
+            TrackMemory::Forget => ms.subtitle_idx = None,
         }
 
         // On stop events apply resume/played thresholds from server config.
@@ -1723,8 +1745,8 @@ mod playback_threshold_tests {
             user,
             media,
             ticks(secs),
-            None,
-            None,
+            TrackMemory::Keep,
+            TrackMemory::Keep,
             media.runtime,
         )
         .await
@@ -1784,13 +1806,92 @@ mod playback_threshold_tests {
             &user,
             &media,
             ticks(RUNTIME * 99 / 100),
-            None,
-            None,
+            TrackMemory::Keep,
+            TrackMemory::Keep,
             None,
         )
         .await
         .unwrap();
         assert!(!crossed, "no runtime means no threshold was applied");
+    }
+}
+
+#[cfg(test)]
+mod track_memory_tests {
+    use super::*;
+    use crate::{db, integration_test::new_test_server};
+
+    async fn report(
+        ctx: &crate::AppContext,
+        user: &User,
+        media: &db::Media,
+        audio: TrackMemory<AudioPick>,
+        subtitle: TrackMemory<i64>,
+    ) -> UserMediaState {
+        UserMediaState::update_playback(&ctx.db, user, media, 0, audio, subtitle, None)
+            .await
+            .unwrap();
+        UserMediaState::get_or_new(&ctx.db, user, media)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn forgetting_drops_the_stored_pick_and_keeping_leaves_it() {
+        let (_s, guard) = new_test_server()
+            .await
+            .unwrap();
+        let ctx = &guard.0;
+        let user = db::User::get_by_username(&ctx.db, "test")
+            .await
+            .unwrap()
+            .unwrap();
+        let media = crate::integration_test::seed_movie(ctx).await;
+        let stream = Uuid::new_v4();
+
+        let audio = |state: &UserMediaState| {
+            (
+                state.audio_idx,
+                state.stream_id,
+                state.stream_audio_idx,
+                state.audio_chosen,
+            )
+        };
+
+        let picked = report(
+            ctx,
+            &user,
+            &media,
+            TrackMemory::Remember(AudioPick {
+                index: 2,
+                stream_id: Some(stream),
+                chosen: true,
+            }),
+            TrackMemory::Remember(3),
+        )
+        .await;
+        assert_eq!(audio(&picked), (Some(2), Some(stream), Some(2), true));
+        assert_eq!(picked.subtitle_idx, Some(3));
+
+        let kept =
+            report(ctx, &user, &media, TrackMemory::Keep, TrackMemory::Keep).await;
+        assert_eq!(
+            (audio(&kept), kept.subtitle_idx),
+            (audio(&picked), Some(3)),
+            "keeping must not touch the stored picks"
+        );
+
+        let audio_off =
+            report(ctx, &user, &media, TrackMemory::Forget, TrackMemory::Keep).await;
+        assert_eq!(
+            (audio(&audio_off), audio_off.subtitle_idx),
+            ((None, None, None, false), Some(3)),
+            "forgetting audio drops its stream and chosen flag too, and leaves the subtitle"
+        );
+
+        let subtitle_off =
+            report(ctx, &user, &media, TrackMemory::Keep, TrackMemory::Forget).await;
+        assert_eq!(subtitle_off.subtitle_idx, None);
     }
 }
 

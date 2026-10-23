@@ -4542,6 +4542,105 @@ mod tests {
         (state.audio_idx, state.audio_stream_id(), state.audio_chosen)
     }
 
+    /// Progress while remembering is off forgets the stored picks, as in
+    /// Jellyfin, so switching it back on does not revive them.
+    #[tokio::test]
+    async fn test_remembering_off_forgets_the_stored_tracks() {
+        let (server, guard, token) = authenticated_server().await;
+        let auth = HeaderValue::from_str(&auth_header_with_token(&token)).unwrap();
+        let media = insert_multilang_source(&guard.0).await;
+        let psid = "forget-tracks-test";
+
+        let me: serde_json::Value = server
+            .get("/users/me")
+            .add_header(http::header::AUTHORIZATION, auth.clone())
+            .await
+            .json();
+        let config_path = format!(
+            "/users/{}/configuration",
+            me["Id"]
+                .as_str()
+                .unwrap()
+        );
+        let remember = |on: bool| {
+            user_config_with(json!({
+                "RememberAudioSelections": on,
+                "RememberSubtitleSelections": on
+            }))
+        };
+        let progress = json!({
+            "ItemId": media.id.to_string(),
+            "PlaySessionId": psid,
+            "PositionTicks": 100_000_000i64,
+            "AudioStreamIndex": 2,
+            "SubtitleStreamIndex": 3
+        });
+
+        server
+            .post("/sessions/playing")
+            .add_header(http::header::AUTHORIZATION, auth.clone())
+            .json(&json!({
+                "ItemId": media.id.to_string(),
+                "PlaySessionId": psid,
+                "PositionTicks": 0
+            }))
+            .await;
+        server
+            .post("/sessions/playing/progress")
+            .add_header(http::header::AUTHORIZATION, auth.clone())
+            .json(&progress)
+            .await;
+
+        let db = &guard
+            .0
+            .db;
+        let user = &crate::db::User::get_by_username(db, "test")
+            .await
+            .unwrap()
+            .unwrap();
+        let media = &media;
+        let stored = || async move {
+            let state = crate::db::UserMediaState::get_or_new(db, user, media)
+                .await
+                .unwrap();
+            (state.audio_idx, state.subtitle_idx)
+        };
+        assert_eq!(stored().await, (Some(2), Some(3)), "picks are remembered");
+
+        server
+            .post(&config_path)
+            .add_header(http::header::AUTHORIZATION, auth.clone())
+            .json(&remember(false))
+            .await;
+        server
+            .post("/sessions/playing/progress")
+            .add_header(http::header::AUTHORIZATION, auth.clone())
+            .json(&progress)
+            .await;
+        assert_eq!(
+            stored().await,
+            (None, None),
+            "remembering off forgets the picks"
+        );
+
+        server
+            .post(&config_path)
+            .add_header(http::header::AUTHORIZATION, auth.clone())
+            .json(&remember(true))
+            .await;
+        let resp = server
+            .post(&format!("/items/{}/playbackinfo", media.id))
+            .add_header(http::header::AUTHORIZATION, auth)
+            .json(&json!({}))
+            .await;
+        resp.assert_status_ok();
+        let body: serde_json::Value = resp.json();
+        assert!(
+            body["MediaSources"][0]["DefaultAudioStreamIndex"].is_null(),
+            "remembering back on must not revive the pick made before it was off"
+        );
+    }
+
     /// A remembered audio index is stored with the stream PlaybackInfo
     /// selected (here ranked first by bitrate), not the item's first stream,
     /// and counts as chosen only when it differs from the track PlaybackInfo
