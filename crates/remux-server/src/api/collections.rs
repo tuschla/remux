@@ -376,10 +376,11 @@ pub async fn import_catalog(
         .context_not_found("Addon not found or has no catalog")?;
 
     let stream = addon
-        .catalog_stream(&state.ctx, &body.catalog_id)
+        .catalog_stream_tracked(&state.ctx, &body.catalog_id)
         .await
         .context_bad_request("addon catalog_stream failed")?
         .context_not_found("Catalog not found in addon")?;
+    let completeness = stream.completeness();
 
     let mut items: Vec<db::Media> = Vec::new();
     let mut stream = stream;
@@ -401,7 +402,7 @@ pub async fn import_catalog(
         &mut items,
     )
     .await;
-    let media_ids: Vec<Uuid> = items
+    let mut media_ids: Vec<Uuid> = items
         .iter()
         .map(|m| m.id)
         .collect();
@@ -438,6 +439,32 @@ pub async fn import_catalog(
             &new_items,
         )
         .await?;
+    }
+
+    // A catalog cut short by a failed page says nothing about the members it
+    // didn't return, so they stay, after the imported ones.
+    if !completeness.is_complete() {
+        tracing::warn!(
+            catalog = %body.catalog_id,
+            "catalog import was incomplete, keeping existing members"
+        );
+        let seen: std::collections::HashSet<Uuid> = media_ids
+            .iter()
+            .copied()
+            .collect();
+        let existing = db::MediaRelation::get_collection_items(
+            &state
+                .ctx
+                .db,
+            &id,
+        )
+        .await?;
+        media_ids.extend(
+            existing
+                .into_iter()
+                .map(|r| r.right_media_id)
+                .filter(|m| !seen.contains(m)),
+        );
     }
 
     db::MediaRelation::replace_collection_items(
@@ -926,5 +953,111 @@ mod tests {
             vec![stored.id],
             "the collection must point at the stored row"
         );
+    }
+
+    /// A failed catalog page still imports the items before it and keeps the
+    /// existing members.
+    #[tokio::test]
+    async fn import_catalog_keeps_members_when_a_page_fails() {
+        let (server, guard, token) = authenticated_server().await;
+        let ctx = &guard.0;
+        let auth = auth_header_with_token(&token);
+
+        let mock = httpmock::MockServer::start();
+        // Pooled httpmock servers reuse ports and manifests are cached by URL,
+        // so a unique path keeps another test's manifest (without `skip`) out.
+        let prefix = format!("/{}", uuid::Uuid::new_v4());
+        mock.mock(|when, then| {
+            when.path(format!("{prefix}/manifest.json"));
+            then.status(200)
+                .json_body(serde_json::json!({
+                    "id": "paged-catalog",
+                    "name": "Paged catalog",
+                    "version": "1.0.0",
+                    "resources": ["catalog"],
+                    "types": ["movie"],
+                    "catalogs": [{
+                        "type": "movie",
+                        "id": "paged",
+                        "name": "paged",
+                        "extra": [{"name": "skip"}]
+                    }]
+                }));
+        });
+        mock.mock(|when, then| {
+            when.path(format!("{prefix}/catalog/movie/paged.json"));
+            then.status(200)
+                .json_body(serde_json::json!({
+                    "metas": [{"id": "tt0088763", "type": "movie", "name": "Back To The Future"}]
+                }));
+        });
+        mock.mock(|when, then| {
+            when.path(format!("{prefix}/catalog/movie/paged/skip=1.json"));
+            then.status(500);
+        });
+
+        let now = Utc::now().naive_utc();
+        let addon_id = uuid::Uuid::new_v4();
+        crate::addons::Addon {
+            id: addon_id,
+            name: "paged-catalog".to_string(),
+            preset: crate::addons::AddonPresetRef {
+                kind: "stremio".to_string(),
+                config: serde_json::json!({
+                    "manifest_url": format!("{}{prefix}/manifest.json", mock.base_url())
+                })
+                .into(),
+            },
+            resources: vec![crate::addons::ResourceType::Catalog],
+            types: vec![],
+            enabled: true,
+            priority: 0,
+            system: false,
+            is_default: true,
+            http_redirect_stream: false,
+            subtitle_extraction: false,
+            probe_on_scan: false,
+            service_filter: vec![],
+            created_at: now,
+            updated_at: now,
+        }
+        .insert(&ctx.db)
+        .await
+        .unwrap();
+        ctx.addons
+            .reload(&ctx.db, &ctx.config)
+            .await
+            .unwrap();
+
+        let collection = insert_manual_collection(&ctx.db, "Paged").await;
+        let member = crate::integration_test::seed_movie(ctx).await;
+        db::MediaRelation::replace_collection_items(
+            &ctx.db,
+            &collection.id,
+            &[member.id],
+        )
+        .await
+        .unwrap();
+
+        server
+            .post(&format!(
+                "/remux/collections/{}/importcatalog",
+                collection.id
+            ))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .json(
+                &serde_json::json!({"addon_id": addon_id, "catalog_id": "movie:paged"}),
+            )
+            .await
+            .assert_status(http::StatusCode::NO_CONTENT);
+
+        let members = db::MediaRelation::get_collection_items(&ctx.db, &collection.id)
+            .await
+            .unwrap();
+        assert_eq!(members.len(), 2, "first page added, existing member kept");
+        assert_eq!(members[1].right_media_id, member.id);
     }
 }
