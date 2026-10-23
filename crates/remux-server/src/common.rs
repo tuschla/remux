@@ -40,13 +40,17 @@ use uuid::Uuid;
 
 static SERVER_ID: OnceLock<String> = OnceLock::new();
 static TMDB_RATE_LIMIT: OnceLock<sdks::SharedRateLimit> = OnceLock::new();
+static TMDB_SEARCH_FIND_RATE_LIMIT: std::sync::LazyLock<sdks::SharedRateLimit> =
+    std::sync::LazyLock::new(sdks::SharedRateLimit::new);
 static ADDON_RATE_LIMITS: OnceLock<
     std::sync::Mutex<HashMap<Uuid, sdks::SharedRateLimit>>,
 > = OnceLock::new();
 
 /// TMDB clients are built in a few independent paths. They must still share
 /// one cooldown, otherwise concurrent metadata refreshes each evade a 429 by
-/// constructing their own client.
+/// constructing their own client. The one exception is
+/// `tmdb_search_find_client`, whose best-effort lookups must not hold up the
+/// TMDB search they serve; they still wait out this cooldown before sending.
 pub(crate) fn tmdb_rate_limit() -> sdks::SharedRateLimit {
     TMDB_RATE_LIMIT
         .get_or_init(sdks::SharedRateLimit::new)
@@ -352,6 +356,28 @@ pub fn tmdb_client_from_config(
                 // depend on which client happened to see the 429 first.
                 .with_default_retry_after(std::time::Duration::from_secs(2))
                 .with_shared_rate_limit(tmdb_rate_limit())
+        })
+}
+
+/// TMDB client for the `/find` lookups that dedupe search results. They are
+/// best effort, so no retries, and a 429 cools down only these lookups: on
+/// the shared `tmdb_rate_limit` a `/find` 429 delayed the primary TMDB search
+/// by up to 3.4 s live (and retries sent each `/find` ~12 times).
+pub async fn tmdb_search_find_client(
+    db: &sqlx::SqlitePool,
+    base_url: &str,
+) -> Option<sdks::RestClient<sdks::BearerAuth>> {
+    let key = crate::db::Settings::get_config_or_default(db)
+        .await
+        .get_tmdb_key()
+        .to_string();
+    sdks::RestClient::new(base_url)
+        .ok()
+        .map(|c| {
+            c.with_auth(sdks::BearerAuth { token: key })
+                // TMDB's throttle window, as in `tmdb_client_from_config`.
+                .with_default_retry_after(Duration::from_secs(2))
+                .with_shared_rate_limit(TMDB_SEARCH_FIND_RATE_LIMIT.clone())
         })
 }
 

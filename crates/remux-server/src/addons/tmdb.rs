@@ -2271,6 +2271,7 @@ async fn tmdb_remote_images(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::integration_test::ctx_with_tmdb;
     use remux_sdks::Endpoint;
 
     #[test]
@@ -2503,22 +2504,6 @@ mod tests {
         assert_eq!(thumb_and_logo_languages(Some("en")), "en,null");
         assert_eq!(thumb_and_logo_languages(Some("nl")), "nl,en,null");
         assert_eq!(thumb_and_logo_languages(Some("nl-NL")), "nl,en,null");
-    }
-
-    /// A server whose TMDB calls go to `mock`.
-    async fn ctx_with_tmdb(
-        mock: &httpmock::MockServer,
-    ) -> crate::integration_test::TestGuard {
-        crate::integration_test::new_test_server_with_config(crate::Config {
-            database_url: Some("sqlite::memory:".into()),
-            torrent_http_port: None,
-            disable_dht: true,
-            tmdb_base_url: mock.base_url(),
-            ..Default::default()
-        })
-        .await
-        .unwrap()
-        .1
     }
 
     fn tmdb_not_found(mock: &httpmock::MockServer, path: &str) {

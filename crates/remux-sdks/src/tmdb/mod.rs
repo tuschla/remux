@@ -49,14 +49,52 @@ pub enum ExternalIdType {
     YoutubeId,
 }
 
+/// A body with none of the result keys is no `/find` answer (`{}`, or a
+/// proxy's `{"success": false}` wrapped in a 200), so it fails to parse:
+/// read as "TMDB matched nothing" it was cached as a miss.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(try_from = "FindByIdBody")]
 pub struct FindByIdResponse {
-    #[serde(default)]
     pub movie_results: Vec<Movie>,
-    #[serde(default)]
     pub tv_results: Vec<Series>,
-    #[serde(default)]
     pub tv_episode_results: Vec<series::Episode>,
+}
+
+#[derive(Deserialize)]
+struct FindByIdBody {
+    movie_results: Option<Vec<Movie>>,
+    tv_results: Option<Vec<Series>>,
+    tv_episode_results: Option<Vec<series::Episode>>,
+}
+
+impl TryFrom<FindByIdBody> for FindByIdResponse {
+    type Error = &'static str;
+
+    fn try_from(body: FindByIdBody) -> Result<Self, Self::Error> {
+        if body
+            .movie_results
+            .is_none()
+            && body
+                .tv_results
+                .is_none()
+            && body
+                .tv_episode_results
+                .is_none()
+        {
+            return Err("no /find result keys");
+        }
+        Ok(Self {
+            movie_results: body
+                .movie_results
+                .unwrap_or_default(),
+            tv_results: body
+                .tv_results
+                .unwrap_or_default(),
+            tv_episode_results: body
+                .tv_episode_results
+                .unwrap_or_default(),
+        })
+    }
 }
 
 // pub fn get_endpoint_for_media_type(t: media::MediaType) -> tmdb::MediaEndpoint {
@@ -587,3 +625,28 @@ impl Endpoint for AllMovieWatchProvidersEndpoint {
 }
 
 //https://files.tmdb.org/p/exports/movie_ids_05_15_2024.json.gz
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Only a body carrying a result key is a `/find` answer; a missing key
+    /// next to a present one is empty.
+    #[test]
+    fn find_body_without_result_keys_is_an_error() {
+        let parse =
+            |body: &str| serde_json::from_str::<FindByIdResponse>(body).map(|_| ());
+        assert!(parse("{}").is_err());
+        assert!(parse(r#"{"success": false, "status_code": 34}"#).is_err());
+        let found: FindByIdResponse =
+            serde_json::from_str(r#"{"tv_results": [{"id": 1, "name": "Show"}]}"#)
+                .unwrap();
+        assert_eq!(found.tv_results[0].id, 1);
+        assert!(
+            found
+                .movie_results
+                .is_empty()
+        );
+        assert!(parse(r#"{"movie_results": [], "tv_results": []}"#).is_ok());
+    }
+}

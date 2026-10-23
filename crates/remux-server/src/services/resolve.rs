@@ -34,6 +34,15 @@ fn find_matched_nothing(found: &sdks::tmdb::FindByIdResponse) -> bool {
             .is_empty()
 }
 
+/// How long a `/find` answer is held: long when it matched, briefly when not.
+pub(crate) fn find_cache_ttl(found: &sdks::tmdb::FindByIdResponse) -> Duration {
+    if find_matched_nothing(found) {
+        ID_MISS_CACHE_TTL
+    } else {
+        ID_CACHE_TTL
+    }
+}
+
 /// The ids the call was for are not there: no such episode, or one TMDB knows
 /// by neither. Both are "not indexed yet", so neither may inherit
 /// [`ID_CACHE_TTL`]. Either answer is still used; only how long it is held
@@ -526,6 +535,48 @@ impl MediaResolveService {
         None
     }
 
+    /// `/find` for `external_id`, cached for `find_cache_ttl`.
+    fn find_endpoint(
+        external_id: String,
+        external_source: &str,
+    ) -> sdks::Cached<sdks::tmdb::FindByIdEndpoint> {
+        sdks::tmdb::FindByIdEndpoint {
+            external_id,
+            external_source: external_source.to_string(),
+        }
+        .with_cache(ID_CACHE_TTL)
+        .should_cache(|r| Some(find_cache_ttl(r)))
+    }
+
+    /// The first `/find` result of the right kind.
+    pub(crate) fn find_first_of_kind(
+        found: &sdks::tmdb::FindByIdResponse,
+        is_tv: bool,
+    ) -> Option<i64> {
+        if is_tv {
+            found
+                .tv_results
+                .first()
+                .map(|s| s.id)
+        } else {
+            found
+                .movie_results
+                .first()
+                .map(|m| m.id)
+        }
+    }
+
+    /// TMDB's `/find` answer for `external_id`.
+    pub(crate) async fn find_by<A: sdks::Auth + Clone>(
+        external_id: String,
+        external_source: &str,
+        client: &RestClient<A>,
+    ) -> anyhow::Result<std::sync::Arc<sdks::tmdb::FindByIdResponse>> {
+        Ok(client
+            .execute_arc(Self::find_endpoint(external_id, external_source))
+            .await?)
+    }
+
     /// Takes the first `/find` result of the right kind.
     pub(crate) async fn find_tmdb_id_by<A: sdks::Auth + Clone>(
         external_id: String,
@@ -533,35 +584,18 @@ impl MediaResolveService {
         is_tv: bool,
         client: &RestClient<A>,
     ) -> anyhow::Result<Option<i64>> {
-        let found = client
-            .execute(
-                sdks::tmdb::FindByIdEndpoint {
-                    external_id,
-                    external_source: external_source.to_string(),
-                }
-                .with_cache(ID_CACHE_TTL)
-                .should_cache(|r| {
-                    Some(if find_matched_nothing(r) {
-                        ID_MISS_CACHE_TTL
-                    } else {
-                        ID_CACHE_TTL
-                    })
-                }),
-            )
-            .await?;
-        Ok(if is_tv {
-            found
-                .tv_results
-                .into_iter()
-                .next()
-                .map(|s| s.id)
-        } else {
-            found
-                .movie_results
-                .into_iter()
-                .next()
-                .map(|m| m.id)
-        })
+        let found = Self::find_by(external_id, external_source, client).await?;
+        Ok(Self::find_first_of_kind(&found, is_tv))
+    }
+
+    /// `find_by` answered from the response cache alone, a cached miss
+    /// included; `None` when only asking TMDB would tell.
+    pub(crate) fn cached_find_by<A: sdks::Auth + Clone>(
+        external_id: String,
+        external_source: &str,
+        client: &RestClient<A>,
+    ) -> Option<std::sync::Arc<sdks::tmdb::FindByIdResponse>> {
+        client.cached(&Self::find_endpoint(external_id, external_source))
     }
 
     /// Finds an episode's TMDB id and its parent series id from the episode's
@@ -1329,7 +1363,7 @@ impl FromRequestParts<AppState> for ResolvedItem {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db;
+    use crate::{db, integration_test::ctx_with_tmdb};
     use uuid::Uuid;
 
     fn tmdb_client(base_url: &str) -> remux_sdks::RestClient<remux_sdks::BearerAuth> {
@@ -1657,22 +1691,6 @@ mod tests {
             Some(7777)
         );
         assert_eq!(derived_id(&media), keyed_on);
-    }
-
-    /// A server whose TMDB calls go to `mock`.
-    async fn ctx_with_tmdb(
-        mock: &httpmock::MockServer,
-    ) -> crate::integration_test::TestGuard {
-        crate::integration_test::new_test_server_with_config(crate::Config {
-            database_url: Some("sqlite::memory:".into()),
-            torrent_http_port: None,
-            disable_dht: true,
-            tmdb_base_url: mock.base_url(),
-            ..Default::default()
-        })
-        .await
-        .unwrap()
-        .1
     }
 
     #[tokio::test]
