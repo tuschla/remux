@@ -245,11 +245,12 @@ impl Endpoint for CatalogEndpoint {
         if let Some(skip) = self.skip {
             extras.push(format!("skip={}", skip));
         }
+        // Extras share one path segment, so '/', '?', '#', '%' and '&' in values must be encoded.
         if let Some(search) = &self.search {
-            extras.push(format!("search={}", search));
+            extras.push(format!("search={}", urlencoding::encode(search)));
         }
         if let Some(genre) = &self.genre {
-            extras.push(format!("genre={}", genre));
+            extras.push(format!("genre={}", urlencoding::encode(genre)));
         }
 
         if !extras.is_empty() {
@@ -1125,7 +1126,7 @@ pub fn client(base: &str) -> Result<RestClient, url::ParseError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Endpoint, MediaType, Meta, MetaResponse, ReleaseInfo, Stream,
+        CatalogEndpoint, Endpoint, MediaType, Meta, MetaResponse, ReleaseInfo, Stream,
         SubtitlesEndpoint, parse_duration_lossy,
     };
     use std::time::Duration;
@@ -1177,6 +1178,27 @@ mod tests {
             subtitles_path(None, Some(1234)),
             "/subtitles/movie/tt0133093/videoSize=1234.json"
         );
+    }
+
+    #[test]
+    fn catalog_search_value_is_percent_encoded() {
+        for (value, encoded) in [
+            ("Face/Off", "Face%2FOff"),
+            ("what?", "what%3F"),
+            ("#1", "%231"),
+            ("100%", "100%25"),
+            ("Tom & Jerry", "Tom%20%26%20Jerry"),
+        ] {
+            let path = CatalogEndpoint {
+                kind: "movie".into(),
+                id: "top".into(),
+                search: Some(value.into()),
+                genre: None,
+                skip: None,
+            }
+            .path();
+            assert_eq!(path, format!("/catalog/movie/top/search={encoded}.json"));
+        }
     }
 
     #[test]
