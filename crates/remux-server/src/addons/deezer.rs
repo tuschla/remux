@@ -1,4 +1,4 @@
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use chrono::NaiveDateTime;
 use futures::{
@@ -21,6 +21,18 @@ use crate::{
 
 const CACHE_TTL: Duration = Duration::from_secs(60);
 const PLAYLIST_CACHE_TTL: Duration = Duration::from_secs(3600);
+/// Deezer's `DataException` code: the API's "no data" answer, not a failure.
+const DEEZER_NO_DATA: u32 = 800;
+/// Deezer's `ParameterException` code ("Wrong parameter"), returned for a
+/// query it normalises to nothing, like `+` or a lone tab.
+const DEEZER_BAD_PARAMETER: u32 = 500;
+
+/// Whether a Deezer search error just means there is nothing to find: an
+/// unsearchable query is an empty search, like the blank-query guard in
+/// `search`, not an outage the caller should fall through on.
+fn nothing_found(error: &dz::DeezerError) -> bool {
+    matches!(error.code, DEEZER_NO_DATA | DEEZER_BAD_PARAMETER)
+}
 
 fn parse_release_date(s: &str) -> Option<NaiveDateTime> {
     chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
@@ -909,14 +921,18 @@ impl DeezerAddon {
             .await
         {
             Ok(dz::DeezerResult::Ok(list)) => list.data,
+            // Errors propagate so the search caller can tell a broken addon from
+            // one with no matches and fall through to the next search addon.
+            Ok(dz::DeezerResult::Err { error }) if nothing_found(&error) => {
+                vec![]
+            }
             Ok(dz::DeezerResult::Err { error }) => {
-                warn!(query, %error, "Deezer track search returned error");
-                return Ok(vec![]);
+                return Err(anyhow!("Deezer track search error: {error}"));
             }
-            Err(e) => {
-                warn!(query, error = %e, "Deezer track search HTTP error");
-                return Ok(vec![]);
-            }
+            // Context, not a formatted string: the typed `ClientError` stays in
+            // the chain for callers that classify failures, and `{:#}` still
+            // prints its cause, e.g. "connection refused" or "timed out".
+            Err(e) => return Err(e).context("Deezer track search HTTP error"),
         };
 
         let results: Vec<_> = data
@@ -955,14 +971,13 @@ impl DeezerAddon {
             .await
         {
             Ok(dz::DeezerResult::Ok(list)) => list.data,
+            Ok(dz::DeezerResult::Err { error }) if nothing_found(&error) => {
+                vec![]
+            }
             Ok(dz::DeezerResult::Err { error }) => {
-                warn!(query, %error, "Deezer album search returned error");
-                return Ok(vec![]);
+                return Err(anyhow!("Deezer album search error: {error}"));
             }
-            Err(e) => {
-                warn!(query, error = %e, "Deezer album search HTTP error");
-                return Ok(vec![]);
-            }
+            Err(e) => return Err(e).context("Deezer album search HTTP error"),
         };
 
         let results: Vec<_> = data
@@ -999,14 +1014,13 @@ impl DeezerAddon {
             .await
         {
             Ok(dz::DeezerResult::Ok(list)) => list.data,
+            Ok(dz::DeezerResult::Err { error }) if nothing_found(&error) => {
+                vec![]
+            }
             Ok(dz::DeezerResult::Err { error }) => {
-                warn!(query, %error, "Deezer artist search returned error");
-                return Ok(vec![]);
+                return Err(anyhow!("Deezer artist search error: {error}"));
             }
-            Err(e) => {
-                warn!(query, error = %e, "Deezer artist search HTTP error");
-                return Ok(vec![]);
-            }
+            Err(e) => return Err(e).context("Deezer artist search HTTP error"),
         };
 
         let results: Vec<_> = data
@@ -1218,6 +1232,14 @@ impl SearchAddon for DeezerAddon {
         limit: usize,
         ctx: &AppContext,
     ) -> Result<Option<Vec<db::Media>>> {
+        // Deezer answers a blank `q` with an error object; that is an empty
+        // search, not an outage, so it must not be reported as a failure.
+        if query
+            .trim()
+            .is_empty()
+        {
+            return Ok(Some(vec![]));
+        }
         match kind {
             db::MediaKind::Track => Ok(Some(
                 self.search_tracks(query, limit, ctx)
@@ -1757,6 +1779,80 @@ mod tests {
             patch
                 .get_image(db::ImageKind::Primary)
                 .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn track_search_reports_failures_but_not_missing_data() {
+        let (_server, guard) = crate::integration_test::new_test_server()
+            .await
+            .unwrap();
+        let deezer = httpmock::MockServer::start();
+        let api_error = |code: u32| serde_json::json!({"error": {"code": code, "message": "message"}});
+        // Deezer reports quota and similar failures as a 200 error object.
+        for (prefix, status, body, failed) in [
+            ("/deezer-http-500", 500, serde_json::json!({}), true),
+            ("/deezer-api-error", 200, api_error(4), true),
+            ("/deezer-no-data", 200, api_error(DEEZER_NO_DATA), false),
+            // What Deezer answers for `q=+`.
+            (
+                "/deezer-bad-parameter",
+                200,
+                serde_json::json!({"error": {
+                    "type": "ParameterException",
+                    "message": "Wrong parameter",
+                    "code": DEEZER_BAD_PARAMETER,
+                }}),
+                false,
+            ),
+        ] {
+            deezer.mock(|when, then| {
+                when.path(format!("{prefix}/search"));
+                then.status(status)
+                    .json_body(body);
+            });
+            // No retry middleware: on a 5xx it only adds backoff delays.
+            let addon = DeezerAddon {
+                playlists: vec![],
+                client: sdks::RestClient::new(&deezer.url(prefix)).unwrap(),
+            };
+            let result = addon
+                .search_tracks("query", 10, &guard.0)
+                .await;
+            assert_eq!(result.is_err(), failed, "{prefix}");
+            if let Ok(tracks) = result {
+                assert!(tracks.is_empty(), "{prefix}");
+            }
+        }
+
+        // A transport failure stays a typed `ClientError` and keeps its cause
+        // in what the search caller logs (`{:#}`), not just reqwest's bare
+        // "error sending request".
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let closed = format!(
+            "http://{}/",
+            listener
+                .local_addr()
+                .unwrap()
+        );
+        drop(listener);
+        let addon = DeezerAddon {
+            playlists: vec![],
+            client: sdks::RestClient::new(&closed).unwrap(),
+        };
+        let error = addon
+            .search_tracks("query", 10, &guard.0)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<sdks::ClientError>()
+                .is_some(),
+            "{error:#}"
+        );
+        assert!(
+            format!("{error:#}").contains("tcp connect error"),
+            "{error:#}"
         );
     }
 }
