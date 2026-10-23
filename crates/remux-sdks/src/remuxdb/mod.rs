@@ -1024,7 +1024,7 @@ mod tests {
         }
         let parse = ClientError::Json {
             status: 200,
-            source: serde_json::from_str::<u8>("not json").unwrap_err(),
+            error: serde_json::from_str::<u8>("not json").unwrap_err(),
             endpoint: None,
             body: None,
         };

@@ -2,7 +2,7 @@ use crate::{
     sdks,
     sdks::{CachedEndpoint, ClientError, Endpoint, WithExtraQuery},
 };
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use futures::{
     future,
     stream::{self, Stream, StreamExt},
@@ -113,34 +113,42 @@ impl StremioService {
             .meta)
     }
 
+    /// `Ok(vec![])` when the addon has no search catalog for `media_type`
+    /// (nothing to ask, so no request) or answers the search with nothing;
+    /// `Err` only when the addon genuinely failed, so search callers can tell
+    /// a broken addon from one with no matches.
     pub async fn search(
         &self,
         media_type: sdks::stremio::MediaType,
         q: String,
     ) -> Result<Vec<sdks::stremio::Meta>> {
-        let catalog = self
+        let Some(catalog) = self
             .get_manifest()
             .await?
             .get_search_catalog(&media_type.to_string())
-            .ok_or_else(|| anyhow!("no search catalog for type {}", media_type))?;
-        Ok(self
+        else {
+            return Ok(vec![]);
+        };
+        match self
             .client
             .execute(
                 self.ep(sdks::stremio::CatalogEndpoint {
-                    kind: catalog
-                        .kind
-                        .clone(),
-                    id: catalog
-                        .id
-                        .clone(),
+                    kind: catalog.kind,
+                    id: catalog.id,
                     search: Some(q),
                     genre: None,
                     skip: None,
                 })
                 .with_cache(Duration::from_secs(60)),
             )
-            .await?
-            .metas)
+            .await
+        {
+            Ok(response) => Ok(response.metas),
+            // Same convention as catalog pages (see `is_404`): a 404 from a
+            // catalog the manifest declares searchable means "nothing found".
+            Err(e) if is_404(&e) => Ok(vec![]),
+            Err(e) => Err(e.into()),
+        }
     }
 
     pub async fn get_streams(
@@ -460,5 +468,93 @@ mod tests {
             .await;
 
         assert_eq!(names, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    /// A service rooted at `prefix` on `server`. Responses land in the
+    /// process-wide HTTP cache keyed by URL and httpmock reuses ports across
+    /// tests, so each test gets its own prefix. Retries are left off: on a 5xx
+    /// they only add backoff delays, the outcome is the same `Err`.
+    fn search_service(server: &httpmock::MockServer, prefix: &str) -> StremioService {
+        StremioService {
+            client: sdks::RestClient::new(&server.url(prefix)).unwrap(),
+            extra_query: vec![],
+        }
+    }
+
+    fn mock_manifest(server: &httpmock::MockServer, prefix: &str, search_type: &str) {
+        server.mock(|when, then| {
+            when.path(format!("{prefix}/manifest.json"));
+            then.status(200)
+                .json_body(serde_json::json!({
+                    "id": "test",
+                    "name": "Test",
+                    "version": "1.0.0",
+                    "resources": ["catalog"],
+                    "types": ["movie", "series"],
+                    "catalogs": [{
+                        "type": search_type,
+                        "id": "top",
+                        "name": "Top",
+                        "extra": [{"name": "search"}],
+                    }],
+                }));
+        });
+    }
+
+    async fn search_with_status(prefix: &str, status: u16) -> Result<Vec<String>> {
+        let server = httpmock::MockServer::start();
+        mock_manifest(&server, prefix, "movie");
+        server.mock(|when, then| {
+            when.path(format!("{prefix}/catalog/movie/top/search=matrix.json"));
+            then.status(status);
+        });
+        let metas = search_service(&server, prefix)
+            .search(sdks::stremio::MediaType::Movie, "matrix".into())
+            .await?;
+        Ok(metas
+            .into_iter()
+            .map(|m| m.id)
+            .collect())
+    }
+
+    #[tokio::test]
+    async fn search_reports_a_failing_search_catalog_as_an_error() {
+        assert!(
+            search_with_status("/search-500", 500)
+                .await
+                .is_err()
+        );
+    }
+
+    /// Same convention as catalog pages: a 404 from a declared search
+    /// catalog means nothing matched.
+    #[tokio::test]
+    async fn search_treats_a_404_as_no_matches() {
+        assert_eq!(
+            search_with_status("/search-404", 404)
+                .await
+                .unwrap(),
+            Vec::<String>::new()
+        );
+    }
+
+    #[tokio::test]
+    async fn search_without_a_search_catalog_for_the_type_asks_nothing() {
+        let server = httpmock::MockServer::start();
+        let prefix = "/search-no-catalog";
+        // Only series are searchable, so a movie search has nothing to ask.
+        mock_manifest(&server, prefix, "series");
+        let catalog = server.mock(|when, then| {
+            when.path_contains("/catalog/");
+            then.status(500);
+        });
+
+        let metas = search_service(&server, prefix)
+            .search(sdks::stremio::MediaType::Movie, "matrix".into())
+            .await
+            .unwrap();
+
+        assert!(metas.is_empty());
+        catalog.assert_hits(0);
     }
 }

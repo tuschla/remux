@@ -1,4 +1,4 @@
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use chrono::Utc;
 use futures::{Stream, StreamExt};
@@ -1649,10 +1649,14 @@ async fn stremio_search(
         _ => return Ok(vec![]),
     };
 
+    // A failure must reach the search caller so it can move on to the next
+    // search addon; "no search catalog" and "no matches" come back Ok-empty.
+    // Context keeps the typed `ClientError` in the chain for callers that
+    // classify failures.
     let results = svc
-        .search(aio_type, query.to_string())
+        .search(aio_type.clone(), query.to_string())
         .await
-        .unwrap_or_default();
+        .with_context(|| format!("Stremio {aio_type} search failed"))?;
 
     let mut media: Vec<db::Media> = results
         .into_iter()
