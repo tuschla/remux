@@ -782,7 +782,7 @@ impl FromRequestParts<AppState> for JellyfinAuthHeader {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        if let Some(auth) = parts
+        let auth = parts
             .headers
             .get(http::header::AUTHORIZATION)
             .or_else(|| {
@@ -792,6 +792,13 @@ impl FromRequestParts<AppState> for JellyfinAuthHeader {
             })
             .map(header_text_lossy)
             .and_then(|raw| JellyfinAuthHeader::from_str(&raw).ok())
+            .unwrap_or_default();
+        // Like Jellyfin, a header with only client info must not hide a
+        // token sent in X-Emby-Token or api_key.
+        if auth
+            .token
+            .as_deref()
+            .is_some_and(|t| !t.is_empty())
         {
             return Ok(auth);
         }
@@ -810,7 +817,7 @@ impl FromRequestParts<AppState> for JellyfinAuthHeader {
         if let Some(token) = token {
             return Ok(JellyfinAuthHeader {
                 token: Some(token),
-                ..Default::default()
+                ..auth
             });
         }
 
@@ -828,14 +835,14 @@ impl FromRequestParts<AppState> for JellyfinAuthHeader {
                     {
                         return Ok(JellyfinAuthHeader {
                             token: Some(val.to_string()),
-                            ..Default::default()
+                            ..auth
                         });
                     }
                 }
             }
         }
 
-        Ok(JellyfinAuthHeader::default())
+        Ok(auth)
     }
 }
 
@@ -924,6 +931,25 @@ mod tests {
                 "each key should own a session under its own device id: {device_ids:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn client_only_header_with_api_key_query_authenticates() {
+        use crate::integration_test::authenticated_server;
+        use http::header::{AUTHORIZATION, HeaderValue};
+
+        let (server, _guard, token) = authenticated_server().await;
+
+        server
+            .get(&format!("/users/me?api_key={token}"))
+            .add_header(
+                AUTHORIZATION,
+                HeaderValue::from_static(
+                    r#"MediaBrowser Client="Jellyfin Web", Device="Firefox", DeviceId="dev-1", Version="10.10.0""#,
+                ),
+            )
+            .await
+            .assert_status_ok();
     }
 
     #[tokio::test]
