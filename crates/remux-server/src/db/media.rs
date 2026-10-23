@@ -1072,12 +1072,41 @@ pub struct ExternalIds {
 }
 
 impl ExternalIds {
+    /// Accept an IMDb title id only in its canonical `tt<digits>` form, after
+    /// trimming surrounding whitespace. Ids from addons, file names and
+    /// clients are spliced into provider URL paths (TMDB `find/{id}`, Trakt,
+    /// RemuxDB), where a `/`, `?` or `#` would send the request to a
+    /// different resource or alias another title.
+    pub fn parse_imdb(id: &str) -> Option<NonEmptyString> {
+        let id = id.trim();
+        let digits = id.strip_prefix("tt")?;
+        if digits.is_empty()
+            || !digits
+                .bytes()
+                .all(|b| b.is_ascii_digit())
+        {
+            return None;
+        }
+        NonEmptyString::try_new(id.to_string()).ok()
+    }
+
+    /// The IMDb id of a Stremio meta: its `imdb_id` field when well formed,
+    /// otherwise the one carried by `meta.id`. A malformed `imdb_id` must not
+    /// discard a valid id-derived one.
+    pub fn stremio_meta_imdb(meta: &sdks::stremio::Meta) -> Option<NonEmptyString> {
+        meta.imdb_id
+            .as_deref()
+            .and_then(Self::parse_imdb)
+            .or_else(|| Self::from_stremio_id(&meta.id).imdb)
+    }
+
     /// Parse an AIO `meta.id` string into external provider IDs using the
-    /// standard Stremio/Jellyfin prefix conventions.
+    /// standard Stremio/Jellyfin prefix conventions. A malformed `tt` id is
+    /// kept as an addon-specific id rather than trusted as an IMDb id.
     pub fn from_stremio_id(id: &str) -> Self {
-        if id.starts_with("tt") {
+        if let Some(imdb) = Self::parse_imdb(id) {
             return Self {
-                imdb: NonEmptyString::try_new(id.to_string()).ok(),
+                imdb: Some(imdb),
                 ..Default::default()
             };
         }
@@ -1150,7 +1179,7 @@ impl ExternalIds {
                         .imdb
                         .is_none()
                     {
-                        result.imdb = NonEmptyString::try_new(value).ok();
+                        result.imdb = Self::parse_imdb(&value);
                     }
                 }
                 "tvdb" | "tvdbid" => {
@@ -7721,12 +7750,8 @@ impl TryFrom<sdks::stremio::Meta> for Media {
         // treat it as available now rather than leaving digital_released_at
         // unset — an unset date means "unreleased" to push_release_date_filter,
         // which would hide the item forever for addons that never report dates.
-        let has_no_imdb_id = meta
-            .imdb_id
-            .is_none()
-            && ExternalIds::from_stremio_id(&meta.id)
-                .imdb
-                .is_none();
+        let meta_imdb = ExternalIds::stremio_meta_imdb(&meta);
+        let has_no_imdb_id = meta_imdb.is_none();
 
         let digital_released_at = meta
             .app_extras
@@ -7897,9 +7922,7 @@ impl TryFrom<sdks::stremio::Meta> for Media {
                 .map(|c| normalize_country_alpha2(&c)),
             external_ids: {
                 let mut ids = ExternalIds::from_stremio_id(&meta.id);
-                if let Some(ref imdb) = meta.imdb_id {
-                    ids.imdb = NonEmptyString::try_new(imdb.clone()).ok();
-                }
+                ids.imdb = meta_imdb;
                 ids.custom_stremio_type = custom_stremio_type(&meta.media_type);
                 ids
             },
@@ -7944,10 +7967,7 @@ impl TryFrom<sdks::stremio::Meta> for Media {
 }
 
 pub fn stremio_meta_to_medias(meta: sdks::stremio::Meta) -> Result<Vec<Media>> {
-    let imdb_id: Option<NonEmptyString> = meta
-        .imdb_id
-        .as_deref()
-        .and_then(|s| NonEmptyString::try_new(s.to_string()).ok());
+    let imdb_id = ExternalIds::stremio_meta_imdb(&meta);
 
     let mut media: Media = meta
         .clone()
@@ -10338,6 +10358,109 @@ mod tests {
                 .as_ref()
                 .map(|s| s.as_str()),
             Some("tt0133093")
+        );
+    }
+
+    #[test]
+    fn parse_imdb_accepts_only_tt_digits() {
+        for (id, expected) in
+            [("tt0133093", "tt0133093"), (" tt1375666 \n", "tt1375666")]
+        {
+            assert_eq!(
+                ExternalIds::parse_imdb(id)
+                    .as_ref()
+                    .map(|s| s.as_str()),
+                Some(expected),
+                "{id:?}"
+            );
+        }
+        for junk in [
+            "",
+            "  ",
+            "tt",
+            "TT0133093",
+            "0133093",
+            "tt1/../../movie/550",
+            "tt1375666?x=1",
+            "tt1375666#f",
+            "tt1375666%2F",
+            "tt1375666:1:2",
+            "tt 1375666",
+            "tt１２３",
+        ] {
+            assert_eq!(ExternalIds::parse_imdb(junk), None, "{junk:?}");
+        }
+    }
+
+    #[test]
+    fn from_stremio_id_keeps_malformed_tt_id_as_custom() {
+        let ids = ExternalIds::from_stremio_id("tt1/../../movie/550");
+        assert_eq!(ids.imdb, None);
+        assert_eq!(
+            ids.custom_stremio_id
+                .as_deref(),
+            Some("tt1/../../movie/550")
+        );
+    }
+
+    #[test]
+    fn from_path_rejects_malformed_imdb_id() {
+        let ids = ExternalIds::from_path("[imdbid-tt1375666?x=1] Inception.mkv");
+        assert_eq!(ids.imdb, None);
+    }
+
+    #[test]
+    fn stremio_meta_to_medias_drops_malformed_imdb_id() {
+        let json = r#"{
+            "id": "tt1/../../movie/550",
+            "imdb_id": "tt1375666?x=1",
+            "type": "movie",
+            "name": "Junk"
+        }"#;
+        let meta: sdks::stremio::Meta = serde_json::from_str(json).unwrap();
+        let medias = stremio_meta_to_medias(meta).unwrap();
+
+        assert_eq!(medias.len(), 1);
+        assert_eq!(
+            medias[0]
+                .external_ids
+                .imdb,
+            None
+        );
+        assert_eq!(
+            medias[0]
+                .external_ids
+                .custom_stremio_id
+                .as_deref(),
+            Some("tt1/../../movie/550")
+        );
+    }
+
+    #[test]
+    fn stremio_meta_to_medias_keeps_id_imdb_when_imdb_id_is_malformed() {
+        let json = r#"{
+            "id": "tt1375666",
+            "imdb_id": "tt1375666?x=1",
+            "type": "movie",
+            "name": "Inception"
+        }"#;
+        let meta: sdks::stremio::Meta = serde_json::from_str(json).unwrap();
+        let medias = stremio_meta_to_medias(meta).unwrap();
+
+        assert_eq!(medias.len(), 1);
+        assert_eq!(
+            medias[0]
+                .external_ids
+                .imdb
+                .as_ref()
+                .map(|s| s.as_str()),
+            Some("tt1375666")
+        );
+        assert_eq!(
+            medias[0]
+                .external_ids
+                .custom_stremio_id,
+            None
         );
     }
 
