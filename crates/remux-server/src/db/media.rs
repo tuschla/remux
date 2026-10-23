@@ -259,6 +259,10 @@ impl TryFrom<sdks::stremio::MediaType> for MediaKind {
                 .to_lowercase()
                 .as_str()
             {
+                // Serde only matches lowercase, so addons sending `Movie` or
+                // `Series` land here.
+                "movie" => Ok(MediaKind::Movie),
+                "series" => Ok(MediaKind::Series),
                 t if is_live_tv_type_alias(t) => Ok(MediaKind::TvChannel),
                 "episode" => Ok(MediaKind::Episode),
                 "season" => Ok(MediaKind::Season),
