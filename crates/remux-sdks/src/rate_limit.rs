@@ -11,6 +11,32 @@ pub(crate) const DEFAULT_RETRY_AFTER: Duration = Duration::from_secs(60);
 
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(48 * 60 * 60);
 
+/// Longest a request inside [`interactive`] waits on a 429 or shared cooldown.
+#[cfg(not(target_arch = "wasm32"))]
+const MAX_IN_REQUEST_WAIT: Duration = Duration::from_secs(5);
+
+#[cfg(not(target_arch = "wasm32"))]
+tokio::task_local! {
+    static INTERACTIVE: ();
+}
+
+/// Runs `fut` as a request someone is waiting on, such as a search: inside
+/// it, a 429 or shared cooldown longer than [`MAX_IN_REQUEST_WAIT`] fails the
+/// request at once instead of being waited out. Tasks spawned from `fut` do
+/// not inherit the scope.
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn interactive<F: Future>(fut: F) -> F::Output {
+    INTERACTIVE
+        .scope((), fut)
+        .await
+}
+
+/// Marks a 429 returned without waiting out its cooldown, so the retry
+/// middleware doesn't retry it into the same limit.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Copy)]
+pub(crate) struct RateLimitedResponse;
+
 /// Shared 429 cooldown for one provider.
 ///
 /// Give clones of one value to every [`RestClient`](crate::RestClient) that
@@ -40,7 +66,10 @@ impl SharedRateLimit {
         *blocked_until = (*blocked_until).max(candidate);
     }
 
-    async fn wait_for_cooldown(&self) {
+    /// Waits for the cooldown to clear; returns `false` at once instead if it
+    /// lasts longer than `max_wait`.
+    async fn wait_for_cooldown(&self, max_wait: Option<Duration>) -> bool {
+        let deadline = max_wait.map(|max_wait| Instant::now() + max_wait);
         loop {
             let blocked_until = *self
                 .blocked_until
@@ -48,7 +77,10 @@ impl SharedRateLimit {
                 .await;
             let now = Instant::now();
             if blocked_until <= now {
-                return;
+                return true;
+            }
+            if deadline.is_some_and(|deadline| blocked_until > deadline) {
+                return false;
             }
             tokio::time::sleep_until(blocked_until).await;
         }
@@ -125,12 +157,23 @@ impl reqwest_middleware::Middleware for RetryAfterMiddleware {
         extensions: &mut http::Extensions,
         next: reqwest_middleware::Next<'_>,
     ) -> reqwest_middleware::Result<reqwest::Response> {
-        if let Some(limit) = &self.shared_rate_limit {
-            limit
-                .wait_for_cooldown()
-                .await;
+        let max_wait = INTERACTIVE
+            .try_with(|_| MAX_IN_REQUEST_WAIT)
+            .ok();
+        if let Some(limit) = &self.shared_rate_limit
+            && !limit
+                .wait_for_cooldown(max_wait)
+                .await
+        {
+            // Refused unsent, as a final 429 so callers still get `RateLimited`.
+            return Ok(http::Response::builder()
+                .status(http::StatusCode::TOO_MANY_REQUESTS)
+                .extension(RateLimitedResponse)
+                .body("")
+                .expect("a bare 429 is a valid response")
+                .into());
         }
-        let response = next
+        let mut response = next
             .run(req, extensions)
             .await?;
         if response.status() != http::StatusCode::TOO_MANY_REQUESTS {
@@ -145,21 +188,38 @@ impl reqwest_middleware::Middleware for RetryAfterMiddleware {
         if delay.is_zero() {
             return Ok(response);
         }
+        // Host only: addon URLs carry credentials in the path and query.
         tracing::warn!(
-            url = %response.url(),
+            host = response
+                .url()
+                .host_str()
+                .unwrap_or_default(),
             retry_after_secs = delay.as_secs(),
-            shared = self.shared_rate_limit.is_some(),
-            "upstream returned 429; backing off before this request returns"
+            shared = self
+                .shared_rate_limit
+                .is_some(),
+            "upstream returned 429"
         );
-        if let Some(limit) = &self.shared_rate_limit {
-            limit
-                .block_for(delay)
-                .await;
-            limit
-                .wait_for_cooldown()
-                .await;
-        } else {
-            tokio::time::sleep(delay).await;
+        let waited = match &self.shared_rate_limit {
+            Some(limit) => {
+                limit
+                    .block_for(delay)
+                    .await;
+                // Also waits out a longer cooldown another request recorded.
+                limit
+                    .wait_for_cooldown(max_wait)
+                    .await
+            }
+            None if max_wait.is_some_and(|max_wait| delay > max_wait) => false,
+            None => {
+                tokio::time::sleep(delay).await;
+                true
+            }
+        };
+        if !waited {
+            response
+                .extensions_mut()
+                .insert(RateLimitedResponse);
         }
         Ok(response)
     }
@@ -283,7 +343,7 @@ mod tests {
             let limit = SharedRateLimit::new();
             let started = Instant::now();
             limit
-                .wait_for_cooldown()
+                .wait_for_cooldown(None)
                 .await;
             assert_eq!(
                 started.elapsed(),
@@ -331,7 +391,7 @@ mod tests {
 
             let started = Instant::now();
             limit
-                .wait_for_cooldown()
+                .wait_for_cooldown(None)
                 .await;
             assert_eq!(started.elapsed(), Duration::from_secs(5));
         }
@@ -351,7 +411,7 @@ mod tests {
 
             let started = Instant::now();
             limit
-                .wait_for_cooldown()
+                .wait_for_cooldown(None)
                 .await;
             assert_eq!(
                 started.elapsed(),
@@ -372,7 +432,7 @@ mod tests {
 
             let started = Instant::now();
             limit
-                .wait_for_cooldown()
+                .wait_for_cooldown(None)
                 .await;
             assert_eq!(started.elapsed(), Duration::from_secs(10));
         }
@@ -385,9 +445,11 @@ mod tests {
                 .await;
 
             let started = Instant::now();
-            let (a, b) =
-                tokio::join!(limit.wait_for_cooldown(), limit.wait_for_cooldown());
-            let _: ((), ()) = (a, b);
+            let (a, b) = tokio::join!(
+                limit.wait_for_cooldown(None),
+                limit.wait_for_cooldown(None)
+            );
+            assert!(a && b);
             assert_eq!(started.elapsed(), Duration::from_secs(3));
         }
     }
@@ -559,6 +621,82 @@ mod tests {
             limited
                 .await
                 .unwrap();
+        }
+
+        #[tokio::test(flavor = "current_thread", start_paused = true)]
+        async fn an_interactive_request_during_a_long_cooldown_is_refused_unsent() {
+            use crate::{SharedRateLimit, interactive};
+
+            let server = httpmock::MockServer::start();
+            let upstream = server.mock(|when, then| {
+                when.path("/search");
+                then.status(200)
+                    .json_body(serde_json::json!([]));
+            });
+            let shared = SharedRateLimit::new();
+            shared
+                .block_for(Duration::from_secs(60))
+                .await;
+            let client = RestClient::new(&server.base_url())
+                .unwrap()
+                .with_shared_rate_limit(shared.clone());
+
+            let started = tokio::time::Instant::now();
+            let error = interactive(client.execute(Probe("/search")))
+                .await
+                .unwrap_err();
+
+            assert!(matches!(error, ClientError::RateLimited { .. }), "{error}");
+            assert_eq!(started.elapsed(), Duration::ZERO);
+            assert_eq!(upstream.hits(), 0);
+            // A refusal must not re-arm the cooldown.
+            assert_eq!(
+                shared
+                    .remaining_cooldown()
+                    .await,
+                Duration::from_secs(60)
+            );
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn an_interactive_request_gets_a_long_429_at_once_and_unretried() {
+            use crate::{ExponentialBackoff, SharedRateLimit, interactive};
+
+            let server = httpmock::MockServer::start();
+            let limited = server.mock(|when, then| {
+                when.path("/search");
+                then.status(429);
+            });
+            let shared = SharedRateLimit::new();
+            let client = RestClient::new(&server.base_url())
+                .unwrap()
+                .with_retry(
+                    ExponentialBackoff::builder()
+                        .jitter(reqwest_retry::Jitter::None)
+                        .build_with_max_retries(1),
+                )
+                .with_shared_rate_limit(shared.clone());
+
+            let started = Instant::now();
+            let error = tokio::time::timeout(
+                Duration::from_secs(5),
+                interactive(client.execute(Probe("/search"))),
+            )
+            .await
+            .expect("must not wait out the 60 s cooldown")
+            .unwrap_err();
+
+            assert!(matches!(error, ClientError::RateLimited { .. }), "{error}");
+            // A retry would first back off for 1 s.
+            assert!(started.elapsed() < Duration::from_millis(500));
+            assert_eq!(limited.hits(), 1);
+            // Later requests still wait out the full cooldown.
+            assert!(
+                shared
+                    .remaining_cooldown()
+                    .await
+                    > Duration::from_secs(55)
+            );
         }
     }
 }

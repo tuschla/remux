@@ -13,7 +13,7 @@ pub mod tmdb;
 mod rate_limit;
 
 #[cfg(not(target_arch = "wasm32"))]
-pub use rate_limit::SharedRateLimit;
+pub use rate_limit::{SharedRateLimit, interactive};
 
 use http::{Extensions, HeaderMap, HeaderValue, Method, header};
 use itertools::Itertools;
@@ -327,8 +327,9 @@ impl RetryPolicy for DynRetryPolicy {
 }
 
 /// Keeps retrying transient upstream failures, but never retries a request
-/// that already exceeded the client's deadline. A retry after a timeout turns
-/// one bounded request into several consecutive timeout windows.
+/// that already exceeded the client's deadline, or a 429 that
+/// `RetryAfterMiddleware` marked final. A retry after a timeout turns one
+/// bounded request into several consecutive timeout windows.
 struct NoTimeoutRetryStrategy;
 
 impl RetryableStrategy for NoTimeoutRetryStrategy {
@@ -338,6 +339,15 @@ impl RetryableStrategy for NoTimeoutRetryStrategy {
     ) -> Option<Retryable> {
         match result {
             Err(MiddlewareError::Reqwest(error)) if error.is_timeout() => {
+                Some(Retryable::Fatal)
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            Ok(response)
+                if response
+                    .extensions()
+                    .get::<rate_limit::RateLimitedResponse>()
+                    .is_some() =>
+            {
                 Some(Retryable::Fatal)
             }
             Ok(response) => default_on_request_success(response),
