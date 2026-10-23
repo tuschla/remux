@@ -2133,6 +2133,7 @@ async fn run_probe_jobs(ctx: &AppContext, addon: &Addon, jobs: Vec<ProbeJob>) {
                     job.headers
                         .as_deref(),
                     Some(probe_timeout),
+                    false,
                 )
             });
             let probed = match tokio::time::timeout(probe_timeout, handle).await {

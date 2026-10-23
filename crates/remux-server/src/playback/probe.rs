@@ -26,6 +26,7 @@ fn ffprobe_args(
     url: &str,
     allow_nonstandard_hls_extensions: bool,
     headers: Option<&str>,
+    live: bool,
 ) -> Vec<String> {
     let mut args = vec![
         "-v".into(),
@@ -49,8 +50,75 @@ fn ffprobe_args(
     if let Some(headers) = headers {
         args.extend(["-headers".into(), headers.into()]);
     }
+    if live && reads_live_input_unseekable(url) {
+        args.extend(["-seekable".into(), "0".into()]);
+    }
     args.push(url.into());
     args
+}
+
+/// Containers whose index can sit at the end of the file (an MP4 `moov` atom,
+/// MKV cues): probing them without seeking would read the whole file.
+const SEEK_NEEDING_EXTENSIONS: [&str; 6] = ["mp4", "m4v", "mov", "mkv", "webm", "avi"];
+
+/// Whether a live input is first probed with `-seekable 0`. A live HTTP
+/// upstream may still answer `Accept-Ranges: bytes` with a bogus huge
+/// Content-Length; ffprobe then seeks to the claimed end and times out, so
+/// live streams are read from the start instead. A file listed as a channel
+/// (e.g. an M3U entry pointing at an MP4 with its `moov` at the end) goes
+/// straight to a seeking probe; one behind an extensionless URL reaches it
+/// through the fallback in `next_probe_attempt`. `-seekable` is an HTTP
+/// protocol option, so other schemes (rtsp, files) never get it.
+fn reads_live_input_unseekable(url: &str) -> bool {
+    let Ok(url) = url::Url::parse(url) else {
+        return false;
+    };
+    if !matches!(url.scheme(), "http" | "https") {
+        return false;
+    }
+    let file = url
+        .path()
+        .rsplit('/')
+        .next()
+        .unwrap_or_default();
+    !file
+        .rsplit_once('.')
+        .is_some_and(|(_, ext)| {
+            SEEK_NEEDING_EXTENSIONS
+                .iter()
+                .any(|known| ext.eq_ignore_ascii_case(known))
+        })
+}
+
+/// The ffprobe options one probe run uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProbeAttempt {
+    relaxed_hls_extensions: bool,
+    unseekable: bool,
+}
+
+/// The run to try after `attempt` failed (an error exit or a timeout), or
+/// `None` to give up. An HLS extension rejection retries with relaxed
+/// extensions; any other failure of an unseekable live probe retries once with
+/// default seeking, keeping the extension setting. Each option only ever flips
+/// one way, so a probe runs ffprobe at most three times.
+fn next_probe_attempt(
+    attempt: ProbeAttempt,
+    hls_extension_error: bool,
+) -> Option<ProbeAttempt> {
+    if hls_extension_error && !attempt.relaxed_hls_extensions {
+        return Some(ProbeAttempt {
+            relaxed_hls_extensions: true,
+            ..attempt
+        });
+    }
+    if attempt.unseekable {
+        return Some(ProbeAttempt {
+            unseekable: false,
+            ..attempt
+        });
+    }
+    None
 }
 
 #[cfg(test)]
@@ -72,8 +140,12 @@ mod extension_retry_tests {
 
     #[test]
     fn retry_uses_hls_extension_compatibility_options() {
-        let args =
-            super::ffprobe_args("https://relay.example/hls?url=playlist", true, None);
+        let args = super::ffprobe_args(
+            "https://relay.example/hls?url=playlist",
+            true,
+            None,
+            false,
+        );
 
         assert!(
             args.windows(2)
@@ -87,6 +159,136 @@ mod extension_retry_tests {
             args.windows(2)
                 .any(|pair| { pair == ["-extension_picky", "0"] })
         );
+    }
+
+    fn has_unseekable(args: &[String]) -> bool {
+        args.windows(2)
+            .any(|pair| pair == ["-seekable", "0"])
+    }
+
+    #[test]
+    fn live_http_probe_reads_without_seeking() {
+        for url in [
+            "http://provider.example/live/user/pass/1.ts",
+            "https://provider.example/channel.m3u8",
+        ] {
+            let args = super::ffprobe_args(url, false, None, true);
+            assert!(has_unseekable(&args), "{url}: {args:?}");
+            // An input option: it must come before the URL it applies to.
+            assert_eq!(
+                args.last()
+                    .map(String::as_str),
+                Some(url)
+            );
+        }
+    }
+
+    #[test]
+    fn vod_and_non_http_probes_keep_default_seeking() {
+        assert!(!has_unseekable(&super::ffprobe_args(
+            "https://cdn.example/movie.mkv",
+            false,
+            None,
+            false,
+        )));
+        assert!(!has_unseekable(&super::ffprobe_args(
+            "rtsp://camera.example/stream",
+            false,
+            None,
+            true,
+        )));
+        assert!(!has_unseekable(&super::ffprobe_args(
+            "/media/movie.mkv",
+            false,
+            None,
+            true,
+        )));
+    }
+
+    #[test]
+    fn live_files_needing_a_seek_keep_seeking() {
+        for url in [
+            "http://provider.example/vod/movie.mp4",
+            "https://provider.example/clip.MP4?token=abc",
+            "http://provider.example/a.m4v",
+            "http://provider.example/a.Mov",
+            "http://provider.example/a.mkv",
+            "http://provider.example/a.webm",
+            "http://provider.example/a.avi#frag",
+        ] {
+            assert!(!super::reads_live_input_unseekable(url), "{url}");
+            assert!(!has_unseekable(&super::ffprobe_args(
+                url, false, None, true
+            )));
+        }
+    }
+
+    #[test]
+    fn live_streams_are_read_unseekable() {
+        for url in [
+            "http://provider.example/live/user/pass/1.ts",
+            "http://provider.example/live/user/pass/1",
+            "http://provider.example/stream.php?file=movie.mp4",
+            "http://provider.example/mp4/",
+            "https://provider.example/channel.m3u8",
+            "http://provider.example/channel.flv",
+        ] {
+            assert!(super::reads_live_input_unseekable(url), "{url}");
+        }
+    }
+
+    #[test]
+    fn failed_unseekable_live_probe_falls_back_to_seeking_once() {
+        use super::{ProbeAttempt, next_probe_attempt};
+        let unseekable = ProbeAttempt {
+            relaxed_hls_extensions: false,
+            unseekable: true,
+        };
+        let seeking = ProbeAttempt {
+            relaxed_hls_extensions: false,
+            unseekable: false,
+        };
+        // A timeout or plain error of the unseekable probe retries seeking.
+        assert_eq!(next_probe_attempt(unseekable, false), Some(seeking));
+        // A seeking probe that fails gives up.
+        assert_eq!(next_probe_attempt(seeking, false), None);
+    }
+
+    #[test]
+    fn hls_extension_retry_and_seek_fallback_run_at_most_three_times() {
+        use super::{ProbeAttempt, next_probe_attempt};
+        let first = ProbeAttempt {
+            relaxed_hls_extensions: false,
+            unseekable: true,
+        };
+        // Every run fails with an extension rejection: unseekable,
+        // unseekable+relaxed, seeking+relaxed, then give up.
+        let mut attempt = first;
+        let mut runs = 1;
+        while let Some(next) = next_probe_attempt(attempt, true) {
+            attempt = next;
+            runs += 1;
+        }
+        assert_eq!(runs, 3);
+        assert_eq!(
+            attempt,
+            ProbeAttempt {
+                relaxed_hls_extensions: true,
+                unseekable: false,
+            }
+        );
+        // The rejection only shows up on the seeking run.
+        let seeking = next_probe_attempt(first, false).unwrap();
+        let relaxed = next_probe_attempt(seeking, true).unwrap();
+        assert!(relaxed.relaxed_hls_extensions && !relaxed.unseekable);
+        assert_eq!(next_probe_attempt(relaxed, true), None);
+        // VOD keeps its single extension retry.
+        let vod = ProbeAttempt {
+            relaxed_hls_extensions: false,
+            unseekable: false,
+        };
+        let vod_retry = next_probe_attempt(vod, true).unwrap();
+        assert_eq!(next_probe_attempt(vod_retry, true), None);
     }
 }
 
@@ -632,11 +834,12 @@ pub(crate) fn redact_url(url: &str) -> String {
 }
 
 /// Runs ffprobe to completion, killing the process once `deadline` passes so a
-/// hung source can't leave it running after the caller has given up.
+/// hung source can't leave it running after the caller has given up. `None`
+/// means it timed out.
 fn run_ffprobe(
     args: &[String],
     deadline: Option<std::time::Instant>,
-) -> Result<std::process::Output> {
+) -> Result<Option<std::process::Output>> {
     use std::{io::Read, process::Stdio};
 
     let mut child = std::process::Command::new(ffprobe_bin())
@@ -687,53 +890,83 @@ fn run_ffprobe(
     let stderr = stderr
         .join()
         .unwrap_or_default();
-    match status {
-        Some(status) => Ok(std::process::Output {
-            status,
-            stdout,
-            stderr,
-        }),
-        None => Err(anyhow!("ffprobe timed out")),
-    }
+    Ok(status.map(|status| std::process::Output {
+        status,
+        stdout,
+        stderr,
+    }))
 }
 
 /// Probe a media URL with ffprobe and return a Jellyfin `MediaSourceInfo`
 /// alongside any chapter-derived `MediaSegments`.
 pub fn probe_media(url: &str) -> Result<(api::MediaSourceInfo, MediaSegments)> {
-    probe_media_with(url, None, None)
+    probe_media_with(url, None, None, false)
 }
 
 /// `headers` is an ffmpeg `-headers` value (`"Name: value\r\n"` lines) sent with
 /// HTTP requests, e.g. for a WebDAV source that needs basic auth. `timeout`
-/// bounds the whole probe; ffprobe is killed when it expires.
+/// bounds the whole probe; ffprobe is killed when it expires. `live` marks a
+/// live TV source, which is read from the start without seeking (see
+/// `reads_live_input_unseekable`), falling back to a seeking probe.
 pub fn probe_media_with(
     url: &str,
     headers: Option<&str>,
     timeout: Option<std::time::Duration>,
+    live: bool,
 ) -> Result<(api::MediaSourceInfo, MediaSegments)> {
     let shown = redact_url(url);
     debug!(url = %shown, "probing media");
-    let deadline = timeout.map(|t| std::time::Instant::now() + t);
+    let started = std::time::Instant::now();
+    let deadline = timeout.map(|t| started + t);
+    // The unseekable live probe gets half the budget, so its seeking fallback
+    // (a moov-at-end MP4 behind an extensionless URL) still fits in it.
+    let unseekable_deadline = timeout.map(|t| started + t / 2);
 
-    let mut output = run_ffprobe(&ffprobe_args(url, false, headers), deadline)?;
-
-    if !output
-        .status
-        .success()
-        && should_retry_with_relaxed_hls_extensions(&String::from_utf8_lossy(
-            &output.stderr,
-        ))
-    {
-        output = run_ffprobe(&ffprobe_args(url, true, headers), deadline)?;
-    }
-
-    if !output
-        .status
-        .success()
-    {
-        let stderr = String::from_utf8_lossy(&output.stderr).replace(url, &shown);
-        return Err(anyhow!("ffprobe failed for {}: {}", shown, stderr));
-    }
+    let mut attempt = ProbeAttempt {
+        relaxed_hls_extensions: false,
+        unseekable: live && reads_live_input_unseekable(url),
+    };
+    let output = loop {
+        let args = ffprobe_args(
+            url,
+            attempt.relaxed_hls_extensions,
+            headers,
+            attempt.unseekable,
+        );
+        let run_deadline = if attempt.unseekable {
+            unseekable_deadline
+        } else {
+            deadline
+        };
+        let (error, hls_extension_error) = match run_ffprobe(&args, run_deadline)? {
+            Some(output)
+                if output
+                    .status
+                    .success() =>
+            {
+                break output;
+            }
+            Some(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                (
+                    anyhow!(
+                        "ffprobe failed for {}: {}",
+                        shown,
+                        stderr.replace(url, &shown)
+                    ),
+                    should_retry_with_relaxed_hls_extensions(&stderr),
+                )
+            }
+            None => (anyhow!("ffprobe timed out"), false),
+        };
+        match next_probe_attempt(attempt, hls_extension_error) {
+            Some(next) => {
+                debug!(url = %shown, error = %error, ?next, "retrying probe");
+                attempt = next;
+            }
+            None => return Err(error),
+        }
+    };
 
     let probe: FfprobeOutput = serde_json::from_slice(&output.stdout)
         .map_err(|e| anyhow!("Failed to parse ffprobe output: {}", e))?;
@@ -1288,10 +1521,12 @@ pub(crate) enum ProbeOutcome {
 }
 
 /// Resolve probe data for a single source: cache hit → skip → live probe with fallback.
+/// `live` marks a live TV source (see `probe_media_with`).
 pub(crate) async fn probe_stream(
     stream: &db::Media,
     url_opt: Option<String>,
     skip_probe: bool,
+    live: bool,
     timeout_secs: u64,
     auto_next_stream: bool,
     max_retries: usize,
@@ -1365,6 +1600,7 @@ pub(crate) async fn probe_stream(
                 &url,
                 None,
                 Some(std::time::Duration::from_secs(timeout_secs)),
+                live,
             )
         },
     )
@@ -2434,8 +2670,12 @@ mod timeout_tests {
                 .unwrap()
         );
         let started = std::time::Instant::now();
-        let result =
-            probe_media_with(&url, None, Some(std::time::Duration::from_millis(700)));
+        let result = probe_media_with(
+            &url,
+            None,
+            Some(std::time::Duration::from_millis(700)),
+            false,
+        );
         let err = result
             .unwrap_err()
             .to_string();
@@ -2469,10 +2709,14 @@ mod redact_tests {
     #[test]
     fn failure_error_does_not_contain_the_url() {
         let url = "http://127.0.0.1:1/secret-path/f.mkv?token=s3cret";
-        let err =
-            super::probe_media_with(url, None, Some(std::time::Duration::from_secs(5)))
-                .unwrap_err()
-                .to_string();
+        let err = super::probe_media_with(
+            url,
+            None,
+            Some(std::time::Duration::from_secs(5)),
+            false,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(
             !err.contains("s3cret") && !err.contains("secret-path"),
             "{err}"
