@@ -259,6 +259,14 @@ impl TryFrom<sdks::stremio::MediaType> for MediaKind {
                 .to_lowercase()
                 .as_str()
             {
+                // Serde only matches the lowercase spellings, so a capitalised
+                // standard type (`Movie`, `Series`) some addons send lands here.
+                "movie" => Ok(MediaKind::Movie),
+                "series" => Ok(MediaKind::Series),
+                "tv" | "channel" | "events" => Ok(MediaKind::TvChannel),
+                "album" => Ok(MediaKind::Album),
+                "artist" => Ok(MediaKind::Artist),
+                "track" => Ok(MediaKind::Track),
                 t if is_live_tv_type_alias(t) => Ok(MediaKind::TvChannel),
                 "episode" => Ok(MediaKind::Episode),
                 "season" => Ok(MediaKind::Season),
@@ -9845,6 +9853,22 @@ mod tests {
             )),
             None
         );
+    }
+
+    /// Serde parses only the lowercase spellings into the named variants;
+    /// `Movie`/`Series` from some addons arrive as `Other` and must still map
+    /// to their kind rather than count as unknown.
+    #[test]
+    fn capitalised_standard_stremio_types_map_to_their_kind() {
+        let kind = |t: &str| {
+            let media_type: sdks::stremio::MediaType =
+                serde_json::from_value(serde_json::json!(t)).unwrap();
+            MediaKind::try_from(media_type)
+        };
+        assert_eq!(kind("Movie"), Ok(MediaKind::Movie));
+        assert_eq!(kind("SERIES"), Ok(MediaKind::Series));
+        assert_eq!(kind("Track"), Ok(MediaKind::Track));
+        assert_eq!(kind("anime"), Err(()));
     }
 
     fn track(

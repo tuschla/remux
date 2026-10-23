@@ -605,8 +605,7 @@ impl SearchAddon for StremioAddon {
         ctx: &AppContext,
     ) -> Result<Option<Vec<db::Media>>> {
         let svc = self.service()?;
-        let results = stremio_search(&svc, kind, query, limit, ctx).await?;
-        Ok(Some(results))
+        stremio_search(&svc, kind, query, limit, ctx).await
     }
 }
 
@@ -1634,29 +1633,34 @@ fn build_person_relations(
 // Search helpers
 // ---------------------------------------------------------------------------
 
+/// `Ok(None)` when the addon can't search `kind` (no search catalog for it),
+/// so the search loop moves on to the next addon instead of stopping on an
+/// empty answer.
 async fn stremio_search(
     svc: &stremio_service::StremioService,
     kind: &db::MediaKind,
     query: &str,
     limit: usize,
     ctx: &AppContext,
-) -> Result<Vec<db::Media>> {
+) -> Result<Option<Vec<db::Media>>> {
     use itertools::Itertools;
 
     let aio_type = match kind {
         db::MediaKind::Movie => sdks::stremio::MediaType::Movie,
         db::MediaKind::Series => sdks::stremio::MediaType::Series,
-        _ => return Ok(vec![]),
+        _ => return Ok(None),
     };
 
     // A failure must reach the search caller so it can move on to the next
-    // search addon; "no search catalog" and "no matches" come back Ok-empty.
-    // Context keeps the typed `ClientError` in the chain for callers that
-    // classify failures.
-    let results = svc
+    // search addon; "no matches" comes back Ok-empty. Context keeps the
+    // typed `ClientError` in the chain for callers that classify failures.
+    let Some(results) = svc
         .search(aio_type.clone(), query.to_string())
         .await
-        .with_context(|| format!("Stremio {aio_type} search failed"))?;
+        .with_context(|| format!("Stremio {aio_type} search failed"))?
+    else {
+        return Ok(None);
+    };
 
     let mut media: Vec<db::Media> = results
         .into_iter()
@@ -1667,19 +1671,41 @@ async fn stremio_search(
                 .map(|id| format!("imdb:{}", id))
                 .unwrap_or_else(|| format!("{}:{}", m.media_type, m.id))
         })
-        .take(limit)
         .filter(|meta| !meta.is_error())
+        // `Media::try_from` turns an unknown `type` (`anime`, `weirdtype`)
+        // into a Movie, or a Series when it has episodes. Episodes do say
+        // what the item is (anime addons use custom types for their shows);
+        // without them the Movie is a guess, so drop it.
+        .filter(|meta| {
+            db::MediaKind::try_from(
+                meta.media_type
+                    .clone(),
+            )
+            .is_ok()
+                || meta
+                    .videos
+                    .as_ref()
+                    .is_some_and(|v| !v.is_empty())
+        })
         .filter_map(|meta| {
             let mut m = db::Media::try_from(meta.clone()).ok()?;
+            // Search catalogs can mix types: only the requested kind honours
+            // `IncludeItemTypes`. Compared after conversion so an item with
+            // episodes counts as the Series `Media::try_from` makes it.
+            if m.kind != *kind {
+                return None;
+            }
             let rels = build_relations(&m, &meta);
             m.relations = Some(rels);
             Some(m)
         })
+        // After the kind filter, so dropped items don't eat into the limit.
+        .take(limit)
         .collect();
 
     db::Media::preload_parents(&ctx.db, &mut media).await;
 
-    Ok(media)
+    Ok(Some(media))
 }
 
 // ---------------------------------------------------------------------------
@@ -2821,5 +2847,127 @@ mod tests {
             Vec::<TrackerUrl>::new()
         );
         assert_eq!(extract_trackers(&[]), Vec::<TrackerUrl>::new());
+    }
+
+    /// A search addon at `prefix` declaring movie+series, with one search
+    /// catalog of `search_type` answering `matrix` with `metas`. Own prefix
+    /// per call: manifests and searches land in the process-wide HTTP cache
+    /// keyed by URL, and httpmock reuses ports across tests.
+    fn mock_search_addon(
+        server: &httpmock::MockServer,
+        prefix: &str,
+        search_type: &str,
+        metas: serde_json::Value,
+    ) -> stremio_service::StremioService {
+        server.mock(|when, then| {
+            when.path(format!("{prefix}/manifest.json"));
+            then.status(200)
+                .json_body(serde_json::json!({
+                    "id": "test", "name": "Test", "version": "1.0.0",
+                    "resources": ["catalog"],
+                    "types": ["movie", "series"],
+                    "catalogs": [{
+                        "type": search_type, "id": "top", "name": "Top",
+                        "extra": [{"name": "search"}],
+                    }],
+                }));
+        });
+        server.mock(|when, then| {
+            when.path(format!(
+                "{prefix}/catalog/{search_type}/top/search=matrix.json"
+            ));
+            then.status(200)
+                .json_body(serde_json::json!({ "metas": metas }));
+        });
+        stremio_service::StremioService::from_url(&server.url(prefix)).unwrap()
+    }
+
+    fn kinds_and_titles(media: &[db::Media]) -> Vec<(db::MediaKind, &str)> {
+        media
+            .iter()
+            .map(|m| {
+                (
+                    m.kind
+                        .clone(),
+                    m.title
+                        .as_str(),
+                )
+            })
+            .collect()
+    }
+
+    /// Search catalogs mix types. A search keeps only items of the requested
+    /// kind: unknown and custom types (`weirdtype`, `anime`) without episodes
+    /// are dropped instead of passing as the Movie `Media::try_from` would
+    /// make them, and any item with episodes (a `movie`, an `anime` show)
+    /// counts as the Series it converts to. Standard types match regardless
+    /// of case (`Movie`, `Series`).
+    /// Without a search catalog for the kind the addon answers `None`, so
+    /// the search loop falls through to the next addon.
+    #[tokio::test]
+    async fn stremio_search_skips_catalogs_and_results_of_other_kinds() {
+        let (_server, guard) = crate::integration_test::new_test_server()
+            .await
+            .unwrap();
+        let ctx = &guard.0;
+        let addon = httpmock::MockServer::start();
+        let metas = serde_json::json!([
+            {"id": "tt0000001", "type": "series", "name": "Matrix Show"},
+            {"id": "tt0000002", "type": "movie", "name": "Matrix Movie"},
+            {"id": "x:3", "type": "weirdtype", "name": "Matrix Thing"},
+            {"id": "x:4", "type": "anime", "name": "Matrix Anime"},
+            {
+                "id": "tt0000005", "type": "movie", "name": "Matrix Miniseries",
+                "videos": [{"id": "tt0000005:1:1", "season": 1, "episode": 1}],
+            },
+            {
+                "id": "x:6", "type": "anime", "name": "Matrix Anime Show",
+                "videos": [{"id": "x:6:1:1", "season": 1, "episode": 1}],
+            },
+            {"id": "tt0000007", "type": "Movie", "name": "Matrix Capital Movie"},
+            {"id": "tt0000008", "type": "Series", "name": "Matrix Capital Show"},
+        ]);
+
+        let series_only = mock_search_addon(
+            &addon,
+            "/stremio-search-kind-series",
+            "series",
+            metas.clone(),
+        );
+        let movies =
+            stremio_search(&series_only, &db::MediaKind::Movie, "matrix", 10, ctx)
+                .await
+                .unwrap();
+        assert!(movies.is_none());
+
+        let series =
+            stremio_search(&series_only, &db::MediaKind::Series, "matrix", 10, ctx)
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            kinds_and_titles(&series),
+            vec![
+                (db::MediaKind::Series, "Matrix Show"),
+                (db::MediaKind::Series, "Matrix Miniseries"),
+                (db::MediaKind::Series, "Matrix Anime Show"),
+                (db::MediaKind::Series, "Matrix Capital Show"),
+            ]
+        );
+
+        let movie_only =
+            mock_search_addon(&addon, "/stremio-search-kind-movie", "movie", metas);
+        let movies =
+            stremio_search(&movie_only, &db::MediaKind::Movie, "matrix", 10, ctx)
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            kinds_and_titles(&movies),
+            vec![
+                (db::MediaKind::Movie, "Matrix Movie"),
+                (db::MediaKind::Movie, "Matrix Capital Movie"),
+            ]
+        );
     }
 }
