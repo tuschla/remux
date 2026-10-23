@@ -387,7 +387,9 @@ pub async fn import_catalog(
         .next()
         .await
     {
-        items.push(item);
+        // A cut-short catalog would replace the collection with only the items
+        // before the failed page; leave the collection as it is.
+        items.push(item.context_bad_gateway("catalog fetch failed partway")?);
     }
     // Catalog items are stubs (an opendal title comes from the filename) and
     // their id can differ from the stored row for the same external id.
@@ -925,6 +927,144 @@ mod tests {
             members,
             vec![stored.id],
             "the collection must point at the stored row"
+        );
+    }
+
+    /// A failed catalog page answers 502 and leaves the collection unchanged.
+    #[tokio::test]
+    async fn import_catalog_keeps_collection_when_a_page_fails() {
+        let (server, guard, token) = authenticated_server().await;
+        let ctx = &guard.0;
+        let auth = auth_header_with_token(&token);
+
+        let mock = httpmock::MockServer::start();
+        // Pooled httpmock servers reuse ports and manifests are cached by URL,
+        // so a unique path keeps another test's manifest (without `skip`) out.
+        let prefix = format!("/{}", uuid::Uuid::new_v4());
+        mock.mock(|when, then| {
+            when.path(format!("{prefix}/manifest.json"));
+            then.status(200)
+                .json_body(serde_json::json!({
+                    "id": "paged-catalog",
+                    "name": "Paged catalog",
+                    "version": "1.0.0",
+                    "resources": ["catalog"],
+                    "types": ["movie"],
+                    "catalogs": [{
+                        "type": "movie",
+                        "id": "paged",
+                        "name": "paged",
+                        "extra": [{"name": "skip"}]
+                    }]
+                }));
+        });
+        mock.mock(|when, then| {
+            when.path(format!("{prefix}/catalog/movie/paged.json"));
+            then.status(200)
+                .json_body(serde_json::json!({
+                    "metas": [
+                        {"id": "tt0088763", "type": "movie", "name": "Back To The Future"},
+                        {"id": "tt0096874", "type": "movie", "name": "Back To The Future II"}
+                    ]
+                }));
+        });
+        let failing_page = mock.mock(|when, then| {
+            when.path(format!("{prefix}/catalog/movie/paged/skip=2.json"));
+            then.status(500);
+        });
+
+        let now = Utc::now().naive_utc();
+        let addon_id = uuid::Uuid::new_v4();
+        crate::addons::Addon {
+            id: addon_id,
+            name: "paged-catalog".to_string(),
+            preset: crate::addons::AddonPresetRef {
+                kind: "stremio".to_string(),
+                config: serde_json::json!({
+                    "manifest_url": format!("{}{prefix}/manifest.json", mock.base_url())
+                })
+                .into(),
+            },
+            resources: vec![crate::addons::ResourceType::Catalog],
+            types: vec![],
+            enabled: true,
+            priority: 0,
+            system: false,
+            is_default: true,
+            http_redirect_stream: false,
+            subtitle_extraction: false,
+            probe_on_scan: false,
+            service_filter: vec![],
+            created_at: now,
+            updated_at: now,
+        }
+        .insert(&ctx.db)
+        .await
+        .unwrap();
+        ctx.addons
+            .reload(&ctx.db, &ctx.config)
+            .await
+            .unwrap();
+
+        let collection = insert_manual_collection(&ctx.db, "Paged").await;
+        let mut kept = Vec::new();
+        for i in 0..3 {
+            let tmdb = 4_100_000 + i;
+            let mut movie = db::Media {
+                id: crate::common::stable_media_uuid(
+                    &db::MediaKind::Movie,
+                    &format!("tmdb:{tmdb}"),
+                ),
+                title: format!("Kept {i}"),
+                kind: db::MediaKind::Movie,
+                external_ids: ExternalIds {
+                    tmdb: Some(tmdb),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            movie
+                .save(&ctx.db)
+                .await
+                .unwrap();
+            kept.push(movie.id);
+        }
+        db::MediaRelation::replace_collection_items(&ctx.db, &collection.id, &kept)
+            .await
+            .unwrap();
+
+        let resp = server
+            .post(&format!(
+                "/remux/collections/{}/importcatalog",
+                collection.id
+            ))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .expect_failure()
+            .json(
+                &serde_json::json!({"addon_id": addon_id, "catalog_id": "movie:paged"}),
+            )
+            .await;
+        assert!(
+            failing_page.hits() >= 1,
+            "the import must request the failing second page"
+        );
+        resp.assert_status(http::StatusCode::BAD_GATEWAY);
+
+        let mut members: Vec<uuid::Uuid> = sqlx::query_scalar(
+            "SELECT right_media_id FROM media_relations WHERE left_media_id = ? AND role = 'collection'",
+        )
+        .bind(collection.id)
+        .fetch_all(&ctx.db)
+        .await
+        .unwrap();
+        members.sort();
+        kept.sort();
+        assert_eq!(
+            members, kept,
+            "a failed page must not shrink the collection"
         );
     }
 }

@@ -1,7 +1,7 @@
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use chrono::Utc;
-use futures::{Stream, StreamExt};
+use futures::{Stream, StreamExt, TryStreamExt};
 use nutype::nutype;
 
 use serde::{Deserialize, Deserializer};
@@ -348,7 +348,7 @@ impl CatalogAddon for StremioAddon {
         &self,
         ctx: &AppContext,
         local_id: &str,
-    ) -> Result<Option<Pin<Box<dyn Stream<Item = db::Media> + Send>>>> {
+    ) -> Result<Option<Pin<Box<dyn Stream<Item = Result<db::Media>> + Send>>>> {
         let svc = self.service()?;
 
         let (kind, id) = local_id
@@ -398,17 +398,18 @@ impl CatalogAddon for StremioAddon {
         .await;
 
         let stream = stream
-            .map(move |mut meta| {
+            .map(move |meta| {
                 let svc = svc.clone();
                 let tmdb = tmdb_client.clone();
                 async move {
+                    let mut meta = meta?;
                     if meta.is_error() {
                         debug!(id = %meta.id, "catalog item is an error stub, skipping");
-                        return vec![];
+                        return Ok(vec![]);
                     }
                     if !resolve_imdb_id(&mut meta, Some(&svc), tmdb.as_ref()).await {
                         debug!(id = %meta.id, "could not resolve imdb_id, skipping");
-                        return vec![];
+                        return Ok(vec![]);
                     }
                     match db::stremio_meta_to_medias(meta) {
                         Ok(mut items) => {
@@ -422,17 +423,18 @@ impl CatalogAddon for StremioAddon {
                             if let Some(top) = items.first_mut() {
                                 top.parent_id = None;
                             }
-                            items
+                            anyhow::Ok(items)
                         }
                         Err(e) => {
                             warn!(error = %e, "failed to convert stremio metadata, skipping");
-                            vec![]
+                            Ok(vec![])
                         }
                     }
                 }
             })
             .buffer_unordered(10)
-            .flat_map(futures::stream::iter);
+            .map_ok(|items| futures::stream::iter(items).map(anyhow::Ok))
+            .try_flatten();
 
         Ok(Some(Box::pin(stream)))
     }
