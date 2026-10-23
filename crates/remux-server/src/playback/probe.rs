@@ -26,6 +26,7 @@ fn ffprobe_args(
     url: &str,
     allow_nonstandard_hls_extensions: bool,
     headers: Option<&str>,
+    live: bool,
 ) -> Vec<String> {
     let mut args = vec![
         "-v".into(),
@@ -48,6 +49,13 @@ fn ffprobe_args(
     }
     if let Some(headers) = headers {
         args.extend(["-headers".into(), headers.into()]);
+    }
+    if live {
+        // A live HTTP upstream may claim a huge length and answer the range
+        // request for that end from the start. The duration ffprobe estimates
+        // from the PTS there is seconds, so the channel is rejected as too
+        // short. Only MPEG-TS/PS use this estimate; files keep their duration.
+        args.extend(["-skip_estimate_duration_from_pts".into(), "1".into()]);
     }
     args.push(url.into());
     args
@@ -72,8 +80,12 @@ mod extension_retry_tests {
 
     #[test]
     fn retry_uses_hls_extension_compatibility_options() {
-        let args =
-            super::ffprobe_args("https://relay.example/hls?url=playlist", true, None);
+        let args = super::ffprobe_args(
+            "https://relay.example/hls?url=playlist",
+            true,
+            None,
+            false,
+        );
 
         assert!(
             args.windows(2)
@@ -700,22 +712,24 @@ fn run_ffprobe(
 /// Probe a media URL with ffprobe and return a Jellyfin `MediaSourceInfo`
 /// alongside any chapter-derived `MediaSegments`.
 pub fn probe_media(url: &str) -> Result<(api::MediaSourceInfo, MediaSegments)> {
-    probe_media_with(url, None, None)
+    probe_media_with(url, None, None, false)
 }
 
 /// `headers` is an ffmpeg `-headers` value (`"Name: value\r\n"` lines) sent with
 /// HTTP requests, e.g. for a WebDAV source that needs basic auth. `timeout`
-/// bounds the whole probe; ffprobe is killed when it expires.
+/// bounds the whole probe; ffprobe is killed when it expires. `live` marks a
+/// live TV source.
 pub fn probe_media_with(
     url: &str,
     headers: Option<&str>,
     timeout: Option<std::time::Duration>,
+    live: bool,
 ) -> Result<(api::MediaSourceInfo, MediaSegments)> {
     let shown = redact_url(url);
     debug!(url = %shown, "probing media");
     let deadline = timeout.map(|t| std::time::Instant::now() + t);
 
-    let mut output = run_ffprobe(&ffprobe_args(url, false, headers), deadline)?;
+    let mut output = run_ffprobe(&ffprobe_args(url, false, headers, live), deadline)?;
 
     if !output
         .status
@@ -724,7 +738,7 @@ pub fn probe_media_with(
             &output.stderr,
         ))
     {
-        output = run_ffprobe(&ffprobe_args(url, true, headers), deadline)?;
+        output = run_ffprobe(&ffprobe_args(url, true, headers, live), deadline)?;
     }
 
     if !output
@@ -1292,6 +1306,7 @@ pub(crate) async fn probe_stream(
     stream: &db::Media,
     url_opt: Option<String>,
     skip_probe: bool,
+    live: bool,
     timeout_secs: u64,
     auto_next_stream: bool,
     max_retries: usize,
@@ -1365,6 +1380,7 @@ pub(crate) async fn probe_stream(
                 &url,
                 None,
                 Some(std::time::Duration::from_secs(timeout_secs)),
+                live,
             )
         },
     )
@@ -2434,8 +2450,12 @@ mod timeout_tests {
                 .unwrap()
         );
         let started = std::time::Instant::now();
-        let result =
-            probe_media_with(&url, None, Some(std::time::Duration::from_millis(700)));
+        let result = probe_media_with(
+            &url,
+            None,
+            Some(std::time::Duration::from_millis(700)),
+            false,
+        );
         let err = result
             .unwrap_err()
             .to_string();
@@ -2445,6 +2465,73 @@ mod timeout_tests {
         }
         assert!(err.contains("timed out"), "unexpected error: {err}");
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+}
+
+#[cfg(test)]
+mod live_tests {
+    use std::io::{Read, Write};
+
+    /// An IPTV upstream (e.g. an Xtream panel) that claims a 20 GiB length and
+    /// answers every range request from the start.
+    #[test]
+    fn live_ts_with_a_bogus_length_gets_no_made_up_duration() {
+        let dir = tempfile::tempdir().unwrap();
+        let ts = dir
+            .path()
+            .join("live.ts");
+        let generated = std::process::Command::new(
+            std::env::var("FFMPEG_PATH").unwrap_or_else(|_| "ffmpeg".into()),
+        )
+        .args([
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=duration=10:size=64x64:rate=25",
+            "-f",
+            "mpegts",
+        ])
+        .arg(&ts)
+        .status()
+        .is_ok_and(|s| s.success());
+        if !generated {
+            eprintln!("ffmpeg unavailable, skipping");
+            return;
+        }
+        let body = std::fs::read(&ts).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!(
+            "http://{}/live/user/pass/1",
+            listener
+                .local_addr()
+                .unwrap()
+        );
+        std::thread::spawn(move || {
+            for mut conn in listener
+                .incoming()
+                .flatten()
+            {
+                let body = body.clone();
+                std::thread::spawn(move || {
+                    let _ = conn.read(&mut [0; 4096]);
+                    let _ = conn.write_all(
+                        b"HTTP/1.1 200 OK\r\nAccept-Ranges: bytes\r\nContent-Length: 21474836480\r\n\r\n",
+                    );
+                    let _ = conn.write_all(&body);
+                });
+            }
+        });
+
+        let (info, _) = super::probe_media_with(
+            &url,
+            None,
+            Some(std::time::Duration::from_secs(10)),
+            true,
+        )
+        .unwrap();
+        assert_eq!(info.run_time_ticks, None);
     }
 }
 
@@ -2469,10 +2556,14 @@ mod redact_tests {
     #[test]
     fn failure_error_does_not_contain_the_url() {
         let url = "http://127.0.0.1:1/secret-path/f.mkv?token=s3cret";
-        let err =
-            super::probe_media_with(url, None, Some(std::time::Duration::from_secs(5)))
-                .unwrap_err()
-                .to_string();
+        let err = super::probe_media_with(
+            url,
+            None,
+            Some(std::time::Duration::from_secs(5)),
+            false,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(
             !err.contains("s3cret") && !err.contains("secret-path"),
             "{err}"
