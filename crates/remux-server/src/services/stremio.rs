@@ -644,9 +644,10 @@ mod tests {
             .get_catalog_stream("movie".to_string(), "test".to_string(), false, 1)
             .await
             .unwrap()
-            .map(|m| m.id)
-            .collect()
-            .await;
+            .map(|m| m.map(|m| m.id))
+            .try_collect()
+            .await
+            .unwrap();
 
         catalog.assert();
         assert_eq!(names, vec!["a".to_string()]);

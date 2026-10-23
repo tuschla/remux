@@ -3071,13 +3071,14 @@ mod tests {
         let addon = Uuid::from_u128(1);
         // Custom type with episodes: converts to a series as well, so the
         // same id.
-        let anime_show: sdks::stremio::Meta = serde_json::from_value(serde_json::json!({
-            "id": "mediathek:42",
-            "type": "anime",
-            "name": "Tatort",
-            "videos": [{"id": "mediathek:42:1:1", "season": 1, "episode": 1}],
-        }))
-        .unwrap();
+        let anime_show: sdks::stremio::Meta =
+            serde_json::from_value(serde_json::json!({
+                "id": "mediathek:42",
+                "type": "anime",
+                "name": "Tatort",
+                "videos": [{"id": "mediathek:42:1:1", "season": 1, "episode": 1}],
+            }))
+            .unwrap();
         let metas = vec![
             search_meta("mediathek:42", "series"),
             anime_show,
