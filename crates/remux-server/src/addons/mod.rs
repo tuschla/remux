@@ -5169,8 +5169,8 @@ mod tests {
         );
     }
 
-    /// Remote search mints a fresh id (and fresh, possibly-drifted data) per
-    /// request. A result that already exists locally must be replaced with
+    /// Remote search returns store-only ids and fresh, possibly-drifted data
+    /// per request. A result that already exists locally must be replaced with
     /// the stored row wholesale — not just its id — or a client that keeps
     /// the id (next episode, continue watching) gets 404 on it once the
     /// store entry is gone, and in the meantime sees data that can differ

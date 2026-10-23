@@ -605,7 +605,8 @@ impl SearchAddon for StremioAddon {
         ctx: &AppContext,
     ) -> Result<Option<Vec<db::Media>>> {
         let svc = self.service()?;
-        let results = stremio_search(&svc, kind, query, limit, ctx).await?;
+        let results =
+            stremio_search(&svc, self.addon_id, kind, query, limit, ctx).await?;
         Ok(Some(results))
     }
 }
@@ -1636,6 +1637,7 @@ fn build_person_relations(
 
 async fn stremio_search(
     svc: &stremio_service::StremioService,
+    addon_id: Uuid,
     kind: &db::MediaKind,
     query: &str,
     limit: usize,
@@ -1667,6 +1669,11 @@ async fn stremio_search(
         .filter(|meta| !meta.is_error())
         .filter_map(|meta| {
             let mut m = db::Media::try_from(meta.clone()).ok()?;
+            // Meta ids are only unique per addon and kind. A stable id makes
+            // repeated searches return the same Ids; it is set before the
+            // relations, which are keyed on it.
+            let key = format!("{}:{}", m.kind, meta.id);
+            m.id = Uuid::new_v5(&addon_id, key.as_bytes());
             let rels = build_relations(&m, &meta);
             m.relations = Some(rels);
             Some(m)
@@ -2817,5 +2824,93 @@ mod tests {
             Vec::<TrackerUrl>::new()
         );
         assert_eq!(extract_trackers(&[]), Vec::<TrackerUrl>::new());
+    }
+
+    /// Repeated searches return the same Ids, distinct per addon, meta id and
+    /// kind.
+    #[tokio::test]
+    async fn search_result_ids_are_stable_per_addon_and_meta() {
+        let (_server, guard) = crate::integration_test::new_test_server()
+            .await
+            .unwrap();
+        let ctx = &guard.0;
+        let addon = httpmock::MockServer::start();
+        // The manifest is cached per URL and mock servers are pooled, so give
+        // this addon a path of its own.
+        let prefix = format!("/{}", Uuid::new_v4().simple());
+        addon.mock(|when, then| {
+            when.path(format!("{prefix}/manifest.json"));
+            then.status(200)
+                .json_body(serde_json::json!({
+                    "id": "stub-search",
+                    "name": "Stub search",
+                    "version": "1.0.0",
+                    "resources": ["catalog"],
+                    "types": ["movie", "series"],
+                    "catalogs": [
+                        {"type": "movie", "id": "top", "name": "Top", "extra": [{"name": "search"}]},
+                        {"type": "series", "id": "top", "name": "Top", "extra": [{"name": "search"}]}
+                    ]
+                }));
+        });
+        for kind in ["movie", "series"] {
+            addon.mock(|when, then| {
+                when.path(format!("{prefix}/catalog/{kind}/top/search=Tatort.json"));
+                then.status(200)
+                    .json_body(serde_json::json!({"metas": [
+                        {"id": "mediathek:42", "type": kind, "name": "Tatort", "genres": ["Krimi"]},
+                        {"id": "mediathek:43", "type": kind, "name": "Tatort", "genres": ["Krimi"]}
+                    ]}));
+            });
+        }
+        let svc = stremio_service::StremioService::from_url(&format!(
+            "{}{prefix}",
+            addon.base_url()
+        ))
+        .unwrap();
+        let series = db::MediaKind::Series;
+        let addon_one = Uuid::from_u128(1);
+        let ids = |media: &[db::Media]| {
+            media
+                .iter()
+                .map(|m| m.id)
+                .collect::<Vec<_>>()
+        };
+
+        let first = stremio_search(&svc, addon_one, &series, "Tatort", 10, ctx)
+            .await
+            .unwrap();
+        let again = stremio_search(&svc, addon_one, &series, "Tatort", 10, ctx)
+            .await
+            .unwrap();
+        assert_eq!(first.len(), 2);
+        assert_eq!(
+            ids(&first),
+            ids(&again),
+            "the same search returns the same Ids"
+        );
+        assert_ne!(first[0].id, first[1].id, "each meta gets its own Id");
+        let relations = first[0]
+            .relations
+            .as_ref()
+            .unwrap();
+        assert!(!relations.is_empty());
+        assert!(
+            relations
+                .iter()
+                .all(|(rel, _)| rel.left_media_id == first[0].id),
+            "relations point at the final id"
+        );
+
+        let other_addon =
+            stremio_search(&svc, Uuid::from_u128(2), &series, "Tatort", 10, ctx)
+                .await
+                .unwrap();
+        let movies =
+            stremio_search(&svc, addon_one, &db::MediaKind::Movie, "Tatort", 10, ctx)
+                .await
+                .unwrap();
+        assert_ne!(ids(&first), ids(&other_addon), "Ids are per addon");
+        assert_ne!(first[0].id, movies[0].id, "the kind is part of the Id");
     }
 }
