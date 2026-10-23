@@ -1342,6 +1342,101 @@ fn apply_manifest_info(
 // AddonService
 // ---------------------------------------------------------------------------
 
+/// How long a search waits on TMDB's `/find` to link its results.
+const SEARCH_FIND_DEADLINE: Duration = Duration::from_millis(500);
+
+/// Gives imdb-only search results (Cinemeta's) the tmdb id TMDB's `/find`
+/// has for them, so the dedupe merges them with the tmdb-only copies (the
+/// TMDB addon's) of the same title. A lookup that fails or misses
+/// `SEARCH_FIND_DEADLINE` leaves its result unmerged.
+async fn link_imdb_only_results(
+    kind: &db::MediaKind,
+    results: &mut [db::Media],
+    limit: usize,
+    config: &crate::api::ServerConfiguration,
+    ctx: &AppContext,
+) {
+    use futures::StreamExt;
+
+    let is_tv = match kind {
+        db::MediaKind::Movie => false,
+        db::MediaKind::Series => true,
+        _ => return,
+    };
+    let mut tmdb_only = false;
+    let mut seen = std::collections::HashSet::new();
+    let mut wanted: Vec<String> = Vec::new();
+    // `/find` answers with the searched kind's tmdb id, which on a result of
+    // another kind names a different title.
+    for ids in results
+        .iter()
+        .filter(|m| m.kind == *kind)
+        .map(|m| &m.external_ids)
+    {
+        match (ids.tmdb, &ids.imdb) {
+            (Some(_), None) => tmdb_only = true,
+            (None, Some(imdb)) if seen.insert(imdb) => wanted.push(imdb.to_string()),
+            _ => {}
+        }
+    }
+    // Each is a separate result, so ones past the first `limit` can't make
+    // the returned list.
+    wanted.truncate(limit);
+    // Nothing to merge into.
+    if !tmdb_only || wanted.is_empty() {
+        return;
+    }
+    let Some(client) = crate::common::tmdb_client_from_config(
+        config,
+        &ctx.config
+            .tmdb_base_url,
+    ) else {
+        return;
+    };
+    let lookups = async {
+        let mut answers = futures::stream::iter(wanted)
+            .map(|imdb| {
+                let client = &client;
+                async move {
+                    let tmdb = MediaResolveService::find_tmdb_id_by(
+                        imdb.clone(),
+                        "imdb_id",
+                        is_tv,
+                        client,
+                    )
+                    .await;
+                    (imdb, tmdb)
+                }
+            })
+            .buffer_unordered(8);
+        while let Some((imdb, tmdb)) = answers
+            .next()
+            .await
+        {
+            let Ok(Some(tmdb)) = tmdb else {
+                continue;
+            };
+            for m in results
+                .iter_mut()
+                .filter(|m| m.kind == *kind)
+            {
+                if m.external_ids
+                    .tmdb
+                    .is_none()
+                    && m.external_ids
+                        .imdb
+                        .as_ref()
+                        .is_some_and(|i| i.as_str() == imdb)
+                {
+                    m.external_ids
+                        .tmdb = Some(tmdb);
+                }
+            }
+        }
+    };
+    let _ = tokio::time::timeout(SEARCH_FIND_DEADLINE, lookups).await;
+}
+
 #[derive(Clone)]
 pub struct AddonService {
     inner: Arc<ArcSwap<Vec<AddonRuntime>>>,
@@ -2981,6 +3076,7 @@ impl AddonService {
         // Adopt before deduping: two addons' copies of a stored item end up
         // with the same id even when they carry different external ids.
         db::Media::adopt_existing_rows(&ctx.db, &mut results).await;
+        link_imdb_only_results(kind, &mut results, limit, &config, ctx).await;
         // Dedupe before truncating, so duplicates don't eat into the limit.
         let mut merged = db::Media::dedupe_by_identity(results);
         merged.truncate(limit);
@@ -5649,5 +5745,81 @@ mod tests {
         )
         .await;
         assert_eq!(titles, ["Inception (TMDB)"]);
+    }
+
+    /// A movie search over a TMDB copy (tmdb id alone) and a Cinemeta copy
+    /// (`imdb` alone) of Interstellar, with TMDB's `/find` linking the two
+    /// after `find_delay`: the titles listed, and how long the search took.
+    /// TMDB answers are cached process-wide by URL, so each test needs its
+    /// own `imdb`.
+    async fn search_both_copies(
+        imdb: &str,
+        find_delay: Duration,
+    ) -> (Vec<String>, Duration) {
+        let tmdb = httpmock::MockServer::start();
+        tmdb.mock(|when, then| {
+            when.path(format!("/find/{imdb}"))
+                .query_param("external_source", "imdb_id");
+            then.status(200)
+                .delay(find_delay)
+                .json_body(serde_json::json!({
+                    "movie_results": [{
+                        "id": 157336,
+                        "title": "Interstellar",
+                        "adult": false,
+                        "original_language": "en",
+                    }],
+                }));
+        });
+        let tmdb_copy = db::Media {
+            id: Uuid::new_v4(),
+            title: "Interstellar (TMDB)".into(),
+            kind: db::MediaKind::Movie,
+            external_ids: db::ExternalIds {
+                tmdb: Some(157336),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let cinemeta_copy = search_hit("Interstellar (Cinemeta)", imdb);
+        let service = AddonService {
+            inner: Arc::new(ArcSwap::from_pointee(vec![
+                search_runtime(vec![tmdb_copy]),
+                search_runtime(vec![cinemeta_copy]),
+            ])),
+        };
+        let (_, guard) =
+            crate::integration_test::new_test_server_with_config(crate::Config {
+                database_url: Some("sqlite::memory:".into()),
+                torrent_http_port: None,
+                torrent_peer_port: None,
+                disable_dht: true,
+                disable_startup_tasks: true,
+                tmdb_base_url: tmdb.base_url(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let started = tokio::time::Instant::now();
+        let titles = search_titles(&service, &guard.0, "query", 20).await;
+        (titles, started.elapsed())
+    }
+
+    /// The Cinemeta copy is linked to the TMDB copy through TMDB's `/find`
+    /// and the title is listed once.
+    #[tokio::test]
+    async fn search_links_imdb_only_copy_through_tmdb_find() {
+        let (titles, _) = search_both_copies("tt0816692", Duration::ZERO).await;
+        assert_eq!(titles, ["Interstellar (TMDB)"]);
+    }
+
+    /// A `/find` that doesn't answer holds the search up for no longer than
+    /// `SEARCH_FIND_DEADLINE`; the copies it would have linked both stay.
+    #[tokio::test]
+    async fn search_does_not_wait_out_a_slow_tmdb_find() {
+        let (titles, took) =
+            search_both_copies("tt0816693", Duration::from_secs(30)).await;
+        assert!(took < Duration::from_secs(10));
+        assert_eq!(titles, ["Interstellar (TMDB)", "Interstellar (Cinemeta)"]);
     }
 }
