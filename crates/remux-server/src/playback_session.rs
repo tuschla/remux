@@ -738,6 +738,7 @@ impl PlaybackSessionManager {
         // Remove any previous session for this device (different play_session_id).
         // Unreported transcode stubs are left alone: a start report without
         // (or with another) PlaySessionId must not kill the stream it reports.
+        // Another user signed in with the same DeviceId keeps their playback.
         if !session
             .device_id
             .is_empty()
@@ -751,6 +752,9 @@ impl PlaybackSessionManager {
                         == session.device_id
                         && e.value()
                             .is_reported()
+                        && e.value()
+                            .user_id
+                            == session.user_id
                         && e.key() != &session.play_session_id
                 })
                 .map(|e| {
@@ -862,17 +866,22 @@ impl PlaybackSessionManager {
             .collect()
     }
 
-    /// Return the most recently active reported session for a device.
+    /// Return the most recently active reported session for a device, of
+    /// `user_id` if known: another user signed in with the same DeviceId has
+    /// sessions of their own.
     /// Used as a fallback when the client omits PlaySessionId (e.g. DirectPlay).
-    pub fn get_by_device(&self, device_id: &str) -> Option<PlaybackSession> {
+    pub fn get_by_device(
+        &self,
+        device_id: &str,
+        user_id: Option<Uuid>,
+    ) -> Option<PlaybackSession> {
         self.sessions
             .iter()
             .filter(|e| {
-                e.value()
-                    .device_id
-                    == device_id
-                    && e.value()
-                        .is_reported()
+                let s = e.value();
+                s.device_id == device_id
+                    && s.is_reported()
+                    && user_id.is_none_or(|user_id| s.user_id == user_id)
             })
             .max_by_key(|e| {
                 e.value()
@@ -1067,6 +1076,94 @@ impl PlaybackSessionManager {
         })
         .await;
         true
+    }
+
+    /// End `user_id`'s sessions of `item_id` on `device_id`, other than the
+    /// stopped `play_session_id`, whose transcode was stopped (superseded, or
+    /// DELETE ActiveEncodings): the client switched streams under a new play
+    /// session and stopped that one. A session with a live transcode, or
+    /// never transcoded, may be another tab's.
+    pub async fn stop_switched_from(
+        &self,
+        device_id: &str,
+        user_id: Uuid,
+        item_id: Uuid,
+        play_session_id: &str,
+    ) {
+        let switched_from: Vec<String> = self
+            .sessions
+            .iter()
+            .filter(|e| {
+                let s = e.value();
+                e.key() != play_session_id
+                    && s.device_id == device_id
+                    && s.user_id == user_id
+                    && s.item_id == item_id
+                    && matches!(s.served, Some(ServedPlayback::Ffmpeg { .. }))
+                    && s.transcode
+                        .is_none()
+            })
+            .map(|e| {
+                e.key()
+                    .clone()
+            })
+            .collect();
+        for id in switched_from {
+            info!(
+                play_session_id = %id,
+                "Ending play session the device switched streams away from"
+            );
+            self.stop(&id)
+                .await;
+        }
+    }
+
+    /// Stop `user_id`'s transcodes of `item_id` on `device_id` that no report
+    /// claimed, for a stop report without PlaySessionId: its client's reports
+    /// went to a generated play session, not to the transcode it played.
+    pub async fn stop_unclaimed_transcodes(
+        &self,
+        device_id: &str,
+        user_id: Uuid,
+        item_id: Uuid,
+    ) {
+        let stubs: Vec<_> = self
+            .sessions
+            .iter()
+            .filter(|e| {
+                e.value()
+                    .device_id
+                    == device_id
+                    && !e
+                        .value()
+                        .is_reported()
+            })
+            .filter_map(|e| {
+                Some((
+                    e.key()
+                        .clone(),
+                    e.value()
+                        .transcode
+                        .clone()?,
+                ))
+            })
+            .collect();
+        for (id, ts) in stubs {
+            let of_item = {
+                let t = ts
+                    .read()
+                    .await;
+                t.user_id == user_id && t.item_id == item_id
+            };
+            if of_item {
+                info!(
+                    play_session_id = %id,
+                    "Stopping unclaimed transcode of the stopped item"
+                );
+                self.stop(&id)
+                    .await;
+            }
+        }
     }
 
     /// Stop and remove the transcode from a session (e.g. on seek or client stop),

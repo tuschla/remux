@@ -1487,6 +1487,7 @@ async fn videos_stream_inner(
                 .get_by_device(
                     q.device_id
                         .as_deref()?,
+                    user_id,
                 )
                 .filter(|session| session.item_id == id)
                 .map(|session| session.play_session_id)
