@@ -5502,6 +5502,51 @@ mod tests {
         }
     }
 
+    /// Results linked through one wrong id (a Stremio copy of Inception
+    /// carrying Interstellar's imdb id) stay apart when the groups they would
+    /// join carry different tmdb ids; whichever comes last.
+    #[tokio::test]
+    async fn search_keeps_apart_results_linked_by_a_conflicting_id() {
+        let hit = |title: &str, tmdb: i64, imdb: Option<&str>| db::Media {
+            id: Uuid::new_v4(),
+            title: title.into(),
+            kind: db::MediaKind::Movie,
+            external_ids: db::ExternalIds {
+                tmdb: Some(tmdb),
+                imdb: imdb
+                    .and_then(|i| db::NonEmptyString::try_new(i.to_string()).ok()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let inception = hit("Inception", 27205, None);
+        let wrong = hit("Inception (wrong imdb)", 27205, Some("tt0816692"));
+        let interstellar = hit("Interstellar", 157336, Some("tt0816692"));
+        assert_eq!(
+            search_with(
+                vec![
+                    search_runtime(vec![inception.clone()]),
+                    search_runtime(vec![wrong.clone(), interstellar.clone()]),
+                ],
+                20,
+            )
+            .await,
+            ["Inception", "Interstellar"]
+        );
+        assert_eq!(
+            search_with(
+                vec![
+                    search_runtime(vec![inception]),
+                    search_runtime(vec![interstellar]),
+                    search_runtime(vec![wrong]),
+                ],
+                20,
+            )
+            .await,
+            ["Inception", "Interstellar"]
+        );
+    }
+
     /// An addon whose search failed doesn't hide the others' results.
     #[tokio::test]
     async fn failed_search_addon_does_not_hide_other_results() {

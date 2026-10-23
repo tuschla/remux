@@ -3202,10 +3202,11 @@ impl Media {
     /// same id, or same kind and any external id `adopt_existing_rows`
     /// matches stored rows on. Transitive: `{tmdb}`, `{tmdb, imdb}`, `{imdb}`
     /// is one group although the first and last share nothing, because they
-    /// would all resolve to one stored item. Kept items stay in input order.
+    /// would all resolve to one stored item. Groups carrying different values
+    /// for one id type (two tmdb ids) are different media linked by a wrong id
+    /// and stay apart. Kept items stay in input order.
     pub fn dedupe_by_identity(items: Vec<Media>) -> Vec<Media> {
-        // Union-find over indices. A union always hangs the higher root under
-        // the lower one, so every group's root is its first item.
+        type Ids = Vec<(&'static str, IdValue)>;
         fn root(parent: &mut [usize], mut i: usize) -> usize {
             while parent[i] != i {
                 parent[i] = parent[parent[i]];
@@ -3213,11 +3214,47 @@ impl Media {
             }
             i
         }
-        fn union(parent: &mut [usize], a: usize, b: usize) {
+        // Union-find over indices; `ids[root]` holds the group's ids. A union
+        // always hangs the higher root under the lower one, so every group's
+        // root is its first item. Only `force` (same item id) joins groups
+        // whose ids conflict; the lower root's values win then.
+        fn union(
+            parent: &mut [usize],
+            ids: &mut [Ids],
+            a: usize,
+            b: usize,
+            force: bool,
+        ) {
             let (a, b) = (root(parent, a), root(parent, b));
-            parent[a.max(b)] = a.min(b);
+            let (keep, gone) = (a.min(b), a.max(b));
+            if keep == gone {
+                return;
+            }
+            let conflict = ids[gone]
+                .iter()
+                .any(|(path, value)| {
+                    ids[keep]
+                        .iter()
+                        .any(|(p, v)| p == path && v != value)
+                });
+            if conflict && !force {
+                return;
+            }
+            for (path, value) in std::mem::take(&mut ids[gone]) {
+                if !ids[keep]
+                    .iter()
+                    .any(|(p, _)| *p == path)
+                {
+                    ids[keep].push((path, value));
+                }
+            }
+            parent[gone] = keep;
         }
         let mut parent: Vec<usize> = (0..items.len()).collect();
+        let mut ids: Vec<Ids> = items
+            .iter()
+            .map(|m| Self::external_id_fields(&m.kind, &m.external_ids))
+            .collect();
         let mut by_id: HashMap<Uuid, usize> = HashMap::with_capacity(items.len());
         let mut by_ext: HashMap<
             (std::mem::Discriminant<MediaKind>, &'static str, IdValue),
@@ -3227,13 +3264,22 @@ impl Media {
             .iter()
             .enumerate()
         {
+            // Taken before any union can move it into another root.
+            let own = ids[i].clone();
             if let Some(j) = by_id.insert(m.id, i) {
-                union(&mut parent, i, j);
+                union(&mut parent, &mut ids, i, j, true);
             }
             let kind = std::mem::discriminant(&m.kind);
-            for (path, value) in Self::external_id_fields(&m.kind, &m.external_ids) {
-                if let Some(j) = by_ext.insert((kind, path, value), i) {
-                    union(&mut parent, i, j);
+            for (path, value) in own {
+                // The first item with an id keeps it, so a later item that
+                // conflicts with its group doesn't capture the id.
+                match by_ext.entry((kind, path, value)) {
+                    std::collections::hash_map::Entry::Occupied(e) => {
+                        union(&mut parent, &mut ids, i, *e.get(), false)
+                    }
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        e.insert(i);
+                    }
                 }
             }
         }
