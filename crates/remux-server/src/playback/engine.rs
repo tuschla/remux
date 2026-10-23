@@ -268,6 +268,14 @@ fn live_cleanup_cutoff(highest: u32, segment_length: u32) -> u32 {
     )
 }
 
+/// Seconds of output a live run that started writing at segment `first` has
+/// written when its highest segment is `highest`.
+fn produced_secs(first: u32, highest: Option<u32>, segment_length: u32) -> u64 {
+    highest
+        .filter(|&h| h >= first)
+        .map_or(0, |h| u64::from(h - first + 1) * u64::from(segment_length))
+}
+
 /// Whether a live run that started writing at segment `first` and reached
 /// `highest` in `elapsed` got more than `LIVE_THROTTLE_SECS` ahead of the wall
 /// clock, which a live source can't, even with a backlog sent on connect.
@@ -277,10 +285,61 @@ fn outran_the_clock(
     segment_length: u32,
     elapsed: Duration,
 ) -> bool {
-    let produced_secs = highest
-        .filter(|&h| h >= first)
-        .map_or(0, |h| u64::from(h - first + 1) * u64::from(segment_length));
-    produced_secs > elapsed.as_secs() + u64::from(LIVE_THROTTLE_SECS)
+    produced_secs(first, highest, segment_length)
+        > elapsed.as_secs() + u64::from(LIVE_THROTTLE_SECS)
+}
+
+/// Whether a live run that wrote `produced_secs` of output was healthy. Its
+/// exit is then a new upstream blip, not part of a crash loop, so it starts a
+/// new restart budget: otherwise a long session ends at the
+/// `MAX_LIVE_RESTARTS`th blip, even with hours between them.
+///
+/// A run that read its source to the end (`live_source_ended`) is no blip.
+/// Neither is a run of a source read faster than real time (`LiveRun`) that
+/// exited without an input error: every restart replays such a source from
+/// the start (no `-ss` on live inputs), so a reset budget would replay it
+/// forever. A live source that bursts its backlog on connect gets marked too,
+/// and its real upstream drops are still blips: so a marked run that ran for
+/// `LIVE_HEALTHY_MARKED_RUN` (`elapsed`, wall clock, paused time included)
+/// and then failed on its input (`input_error`) is one. A source that fails
+/// sooner still exhausts the budget, and a marked file that keeps failing
+/// late stays bounded by the throttle and the window. Drops the throttle
+/// caused aren't counted at all (`dropped_by_throttle_pause`).
+fn live_run_was_healthy(
+    produced_secs: u64,
+    faster_than_realtime: bool,
+    source_ended: bool,
+    input_error: bool,
+    elapsed: Duration,
+) -> bool {
+    if source_ended {
+        return false;
+    }
+    if faster_than_realtime {
+        input_error && elapsed >= LIVE_HEALTHY_MARKED_RUN
+    } else {
+        produced_secs >= LIVE_HEALTHY_RUN.as_secs()
+    }
+}
+
+/// Whether a run that failed on its input (`input_error`) was dropped because
+/// the throttle had paused it: an upstream times out a reader that stopped
+/// reading, and ffmpeg only sees it once resumed. That is our pause, not an
+/// upstream fault, so the restart doesn't count toward `MAX_LIVE_RESTARTS`.
+/// Each such restart waits for the client to catch up with a pause first, so
+/// it can't loop faster than the client plays. `resumed_at` is when the
+/// throttle last resumed ffmpeg; a resume of an earlier run doesn't count.
+fn dropped_by_throttle_pause(
+    input_error: bool,
+    run_started: std::time::Instant,
+    resumed_at: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> bool {
+    input_error
+        && resumed_at.is_some_and(|resumed| {
+            resumed >= run_started
+                && now.saturating_duration_since(resumed) <= LIVE_THROTTLE_DROP_GRACE
+        })
 }
 
 /// The ffmpeg runs of a live session, shared by the transcode loop and
@@ -300,6 +359,8 @@ struct LiveRun {
     faster_than_realtime: AtomicBool,
     /// The maintenance task stopped ffmpeg because the client went away.
     idle_stopped: AtomicBool,
+    /// When the throttle last resumed ffmpeg (`dropped_by_throttle_pause`).
+    throttle_resumed_at: std::sync::Mutex<Option<std::time::Instant>>,
 }
 
 impl Default for LiveRun {
@@ -308,6 +369,7 @@ impl Default for LiveRun {
             current: std::sync::Mutex::new((0, std::time::Instant::now())),
             faster_than_realtime: AtomicBool::new(false),
             idle_stopped: AtomicBool::new(false),
+            throttle_resumed_at: std::sync::Mutex::new(None),
         }
     }
 }
@@ -342,6 +404,52 @@ impl LiveRun {
                 .store(true, Ordering::Relaxed);
         }
         outran
+    }
+
+    /// Seconds of output the current run wrote, given the highest segment on
+    /// disk.
+    fn produced_secs(&self, highest: Option<u32>, segment_length: u32) -> u64 {
+        let (first, _) = *self
+            .current
+            .lock()
+            .expect("live run lock is not poisoned");
+        produced_secs(first, highest, segment_length)
+    }
+
+    /// Wall-clock time since the current run started.
+    fn elapsed(&self) -> Duration {
+        let (_, started) = *self
+            .current
+            .lock()
+            .expect("live run lock is not poisoned");
+        started.elapsed()
+    }
+
+    /// The throttle resumed ffmpeg. A paused ffmpeg can't exit by itself, so
+    /// an input error that ends a paused run shows up right after this.
+    fn throttle_resumed(&self) {
+        *self
+            .throttle_resumed_at
+            .lock()
+            .expect("live run lock is not poisoned") = Some(std::time::Instant::now());
+    }
+
+    /// See `dropped_by_throttle_pause`.
+    fn dropped_by_throttle_pause(&self, input_error: bool) -> bool {
+        let (_, started) = *self
+            .current
+            .lock()
+            .expect("live run lock is not poisoned");
+        let resumed_at = *self
+            .throttle_resumed_at
+            .lock()
+            .expect("live run lock is not poisoned");
+        dropped_by_throttle_pause(
+            input_error,
+            started,
+            resumed_at,
+            std::time::Instant::now(),
+        )
     }
 }
 
@@ -696,6 +804,95 @@ fn end_live_playlist(playlist: &std::path::Path) -> std::io::Result<()> {
         .write_all(format!("{separator}#EXT-X-ENDLIST\n").as_bytes())
 }
 
+/// Live ffmpeg restarts allowed since the last healthy run.
+const MAX_LIVE_RESTARTS: u32 = 10;
+/// Output a live run has to write to count as healthy.
+const LIVE_HEALTHY_RUN: Duration = Duration::from_secs(60);
+/// Wall-clock time a run of a source read faster than real time has to last
+/// before an input error ends it to count as healthy (`live_run_was_healthy`).
+const LIVE_HEALTHY_MARKED_RUN: Duration = Duration::from_secs(120);
+/// How soon after the throttle resumed ffmpeg an input error still counts as
+/// a drop the pause caused (`dropped_by_throttle_pause`): ffmpeg first works
+/// through what it had buffered.
+const LIVE_THROTTLE_DROP_GRACE: Duration = Duration::from_secs(10);
+/// Failed HW live runs since the last healthy run whose stderr names neither
+/// the hardware nor the input before the session falls back to software.
+const LIVE_HW_FAILURES_BEFORE_SW: u32 = 3;
+
+/// What a failed ffmpeg run's stderr (`-v error`) points at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailureCause {
+    Hardware,
+    Input,
+    Unknown,
+}
+
+fn classify_ffmpeg_failure(stderr: &str) -> FailureCause {
+    // Checked first: a failing encoder can also log a generic I/O error.
+    const HARDWARE: &[&str] = &[
+        "nvenc",
+        "cuda",
+        "cuvid",
+        "vaapi",
+        "qsv",
+        "mfx",
+        "videotoolbox",
+        "rkmpp",
+        "v4l2",
+        "opencl",
+        "hwaccel",
+        "hwdevice",
+        "hwupload",
+        "hwdownload",
+        "hwmap",
+        "hw_frames",
+        "device creation failed",
+        "error while opening encoder",
+        "error initializing output stream",
+    ];
+    // Opening the input failed; ffmpeg 7 logs `Error opening input: …`, older
+    // releases `<url>: Server returned 404 Not Found`. Failures while reading
+    // are `stderr_reports_input_error`'s.
+    const INPUT_OPEN: &[&str] = &["error opening input", "server returned"];
+    let lowercase = stderr.to_ascii_lowercase();
+    let mentions = |patterns: &[&str]| {
+        patterns
+            .iter()
+            .any(|pattern| lowercase.contains(pattern))
+    };
+    if mentions(HARDWARE) {
+        FailureCause::Hardware
+    } else if mentions(INPUT_OPEN) || stderr_reports_input_error(stderr) {
+        FailureCause::Input
+    } else {
+        FailureCause::Unknown
+    }
+}
+
+/// Whether a failed HW-accelerated run is retried with software encoding.
+///
+/// A failed VOD run isn't restarted, so it retries on any failure. Live
+/// restarts ffmpeg anyway, its failures are usually the upstream (a 404 or a
+/// dropped connection while the channel restarts), and the fallback sticks
+/// for the rest of the session. So live falls back only when stderr points at
+/// the encoder or hardware, or when `unexplained_failures` (failed runs since
+/// the last healthy one pointing at neither, this one included) reaches
+/// `LIVE_HW_FAILURES_BEFORE_SW`.
+fn hw_failure_falls_back(
+    is_live: bool,
+    cause: FailureCause,
+    unexplained_failures: u32,
+) -> bool {
+    if !is_live {
+        return true;
+    }
+    match cause {
+        FailureCause::Hardware => true,
+        FailureCause::Input => false,
+        FailureCause::Unknown => unexplained_failures >= LIVE_HW_FAILURES_BEFORE_SW,
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum ThrottleSignal {
     Pause { ahead: u32 },
@@ -900,6 +1097,7 @@ fn spawn_live_maintenance(
                     #[cfg(unix)]
                     send_signal(pid, libc::SIGCONT);
                     paused_pid = 0;
+                    run.throttle_resumed();
                 }
                 _ => {}
             }
@@ -1345,7 +1543,16 @@ fn is_hls_input_url(input_url: &str) -> bool {
 /// demuxer opens the playlists and segments itself, while `-reconnect_streamed`
 /// can leave proxied master playlists waiting indefinitely before the first
 /// rendition is opened.
-pub(crate) fn ffmpeg_http_input_args(input_url: &str) -> &'static [&'static str] {
+///
+/// `reconnect_streamed` lets FFmpeg reconnect non-seekable (live) inputs in
+/// place. The live HLS transcode turns it off: with `-copyts` the reconnected
+/// stream's timestamps start over, the segmenter never cuts another segment
+/// and FFmpeg never exits. Without it FFmpeg exits on the drop and the live
+/// restart loop in `start_transcode` takes over.
+pub(crate) fn ffmpeg_http_input_args(
+    input_url: &str,
+    reconnect_streamed: bool,
+) -> &'static [&'static str] {
     match url::Url::parse(input_url) {
         Ok(url)
             if matches!(url.scheme(), "http" | "https")
@@ -1353,7 +1560,7 @@ pub(crate) fn ffmpeg_http_input_args(input_url: &str) -> &'static [&'static str]
         {
             &["-http_persistent", "0"]
         }
-        Ok(url) if matches!(url.scheme(), "http" | "https") => &[
+        Ok(url) if matches!(url.scheme(), "http" | "https") && reconnect_streamed => &[
             "-reconnect",
             "1",
             "-reconnect_streamed",
@@ -1361,6 +1568,9 @@ pub(crate) fn ffmpeg_http_input_args(input_url: &str) -> &'static [&'static str]
             "-reconnect_delay_max",
             "5",
         ],
+        Ok(url) if matches!(url.scheme(), "http" | "https") => {
+            &["-reconnect", "1", "-reconnect_delay_max", "5"]
+        }
         _ => &[],
     }
 }
@@ -1513,7 +1723,7 @@ pub(crate) fn build_hls_args(params: &TranscodeParams) -> Vec<String> {
     add_hls_extension_compat_args(&mut args, &params.input_url);
 
     args.extend(
-        ffmpeg_http_input_args(&params.input_url)
+        ffmpeg_http_input_args(&params.input_url, !params.is_live)
             .iter()
             .map(|s| (*s).into()),
     );
@@ -1992,7 +2202,9 @@ async fn run_ffmpeg(
 
 /// Start an HLS transcode job by spawning ffmpeg.
 /// If hardware-accelerated encoding fails, automatically retries once with
-/// software encoding so a broken HW driver doesn't permanently block playback.
+/// software encoding so a broken HW driver doesn't permanently block playback
+/// (live only when the failure points at the hardware, see
+/// `hw_failure_falls_back`).
 pub async fn start_transcode(
     session: Arc<RwLock<TranscodeSession>>,
     params: TranscodeParams,
@@ -2014,8 +2226,9 @@ pub async fn start_transcode(
     tokio::spawn(async move {
         let mut params = params;
         let mut sw_fallback = false;
+        // Both count live runs since the last healthy one.
         let mut live_restarts = 0u32;
-        const MAX_LIVE_RESTARTS: u32 = 10;
+        let mut unexplained_hw_failures = 0u32;
         let (stopped, live_activity) = {
             let s = session_clone
                 .read()
@@ -2106,14 +2319,54 @@ pub async fn start_transcode(
             .await;
             ffmpeg_pid.store(0, Ordering::Relaxed);
 
+            // Decided before taking the session lock: it may ask the upstream.
+            let source_ended = params.is_live
+                && !stopped.is_cancelled()
+                && live_source_ended(
+                    result
+                        .as_ref()
+                        .and_then(|r| {
+                            r.as_ref()
+                                .ok()
+                        }),
+                    &stderr_out,
+                    &params.input_url,
+                )
+                .await;
+
+            let input_error = stderr_reports_input_error(&stderr_out);
+            let throttle_drop =
+                params.is_live && live_run.dropped_by_throttle_pause(input_error);
+            if params.is_live {
+                let highest = highest_segment_index(&params.output_dir);
+                if live_run_was_healthy(
+                    live_run.produced_secs(highest, params.segment_length),
+                    live_run.faster_than_realtime(highest, params.segment_length),
+                    source_ended,
+                    input_error,
+                    live_run.elapsed(),
+                ) {
+                    live_restarts = 0;
+                    unexplained_hw_failures = 0;
+                }
+            }
+
             let using_hw = params
                 .accelerator
                 .is_hw();
 
-            // If HW accel caused the failure, retry once with software encoding.
-            if !sw_fallback
+            let hw_failure_cause = (!sw_fallback
+                && !throttle_drop
                 && using_hw
-                && matches!(&result, Some(Ok(s)) if !s.success())
+                && matches!(&result, Some(Ok(s)) if !s.success()))
+            .then(|| classify_ffmpeg_failure(&stderr_out));
+            if hw_failure_cause == Some(FailureCause::Unknown) {
+                unexplained_hw_failures += 1;
+            }
+
+            // If HW accel caused the failure, retry once with software encoding.
+            if let Some(cause) = hw_failure_cause
+                && hw_failure_falls_back(params.is_live, cause, unexplained_hw_failures)
             {
                 warn!(
                     accel = ?params.accelerator.as_type(),
@@ -2135,21 +2388,6 @@ pub async fn start_transcode(
                 sw_fallback = true;
                 continue;
             }
-
-            // Decided before taking the session lock: it may ask the upstream.
-            let source_ended = params.is_live
-                && !stopped.is_cancelled()
-                && live_source_ended(
-                    result
-                        .as_ref()
-                        .and_then(|r| {
-                            r.as_ref()
-                                .ok()
-                        }),
-                    &stderr_out,
-                    &params.input_url,
-                )
-                .await;
 
             let mut s = session_clone
                 .write()
@@ -2209,12 +2447,15 @@ pub async fn start_transcode(
                             ),
                             None => ("killed".to_string(), String::new()),
                         };
-                        if live_restarts < MAX_LIVE_RESTARTS {
-                            live_restarts += 1;
+                        if throttle_drop || live_restarts < MAX_LIVE_RESTARTS {
+                            if !throttle_drop {
+                                live_restarts += 1;
+                            }
                             warn!(
                                 session_id = %s.id,
                                 status = %status_str,
                                 restart = live_restarts,
+                                throttle_drop,
                                 stderr = %stderr_str,
                                 "live stream ffmpeg exited unexpectedly, restarting"
                             );
@@ -2227,7 +2468,7 @@ pub async fn start_transcode(
                         } else {
                             let err_msg = format!(
                                 "live stream ffmpeg exited after {MAX_LIVE_RESTARTS} restarts \
-                                 (status {status_str}): {stderr_str}"
+                                 without a healthy run (status {status_str}): {stderr_str}"
                             );
                             error!(session_id = %s.id, error = %err_msg, "Live stream failed");
                             s.state = TranscodeState::Error(err_msg.clone());
@@ -2454,7 +2695,7 @@ pub(crate) fn build_progressive_args(
         "5000000".into(),
     ];
     args.extend(
-        ffmpeg_http_input_args(&params.input_url)
+        ffmpeg_http_input_args(&params.input_url, true)
             .iter()
             .map(|s| (*s).into()),
     );
@@ -3735,6 +3976,162 @@ mod tests {
         // Early in the session nothing is old enough.
         assert_eq!(live_cleanup_cutoff(54, 6), 0);
         assert_eq!(live_cleanup_cutoff(0, 6), 0);
+    }
+
+    #[test]
+    fn live_run_is_healthy_once_it_wrote_a_minute_at_live_pace() {
+        let secs = Duration::from_secs;
+        // A minute of segments: a new blip, not a crash loop.
+        assert!(live_run_was_healthy(60, false, false, false, secs(60)));
+        assert!(live_run_was_healthy(60, false, false, true, secs(60)));
+        // Died after a few segments, or wrote nothing.
+        assert!(!live_run_was_healthy(12, false, false, true, secs(12)));
+        assert!(!live_run_was_healthy(0, false, false, false, secs(600)));
+        // A file read at or below real time that ended: no blip, so its end
+        // doesn't buy it another replay.
+        assert!(!live_run_was_healthy(600, false, true, false, secs(630)));
+        // Read faster than real time and exited without an input error:
+        // every restart replays it, so never healthy, however much it wrote.
+        assert!(!live_run_was_healthy(600, true, false, false, secs(600)));
+        // Marked (a live source that burst its backlog), dropped by the
+        // upstream after a long run: a blip.
+        assert!(live_run_was_healthy(
+            200,
+            true,
+            false,
+            true,
+            LIVE_HEALTHY_MARKED_RUN
+        ));
+        // Marked and failing fast: still exhausts the budget.
+        assert!(!live_run_was_healthy(
+            200,
+            true,
+            false,
+            true,
+            LIVE_HEALTHY_MARKED_RUN - secs(1)
+        ));
+
+        // Output counts from the run's first segment (append_list continues
+        // the previous run's numbering).
+        let run = LiveRun::default();
+        run.start(30);
+        assert_eq!(run.produced_secs(Some(39), 6), 60);
+        assert_eq!(run.produced_secs(Some(29), 6), 0);
+        assert_eq!(run.produced_secs(None, 6), 0);
+        assert!(run.elapsed() < LIVE_HEALTHY_MARKED_RUN);
+        // A run that outran the clock is marked; a quick drop doesn't make
+        // it healthy.
+        let faster = run.faster_than_realtime(Some(84), 6);
+        assert!(faster);
+        assert!(!live_run_was_healthy(
+            run.produced_secs(Some(84), 6),
+            faster,
+            false,
+            true,
+            run.elapsed()
+        ));
+    }
+
+    #[test]
+    fn a_drop_right_after_a_throttle_pause_is_ours() {
+        let started = std::time::Instant::now();
+        let resumed = started + Duration::from_secs(300);
+        // The upstream dropped the paused reader; ffmpeg failed once resumed.
+        assert!(dropped_by_throttle_pause(
+            true,
+            started,
+            Some(resumed),
+            resumed + LIVE_THROTTLE_DROP_GRACE
+        ));
+        // Long after the resume: an upstream fault again.
+        assert!(!dropped_by_throttle_pause(
+            true,
+            started,
+            Some(resumed),
+            resumed + LIVE_THROTTLE_DROP_GRACE + Duration::from_secs(1)
+        ));
+        // No input error, or never paused.
+        assert!(!dropped_by_throttle_pause(
+            false,
+            started,
+            Some(resumed),
+            resumed
+        ));
+        assert!(!dropped_by_throttle_pause(true, started, None, resumed));
+        // A resume of the previous run doesn't cover a new run that fails fast.
+        assert!(!dropped_by_throttle_pause(
+            true,
+            resumed + Duration::from_secs(3),
+            Some(resumed),
+            resumed + Duration::from_secs(5)
+        ));
+
+        let run = LiveRun::default();
+        run.start(0);
+        assert!(!run.dropped_by_throttle_pause(true));
+        run.throttle_resumed();
+        assert!(run.dropped_by_throttle_pause(true));
+        assert!(!run.dropped_by_throttle_pause(false));
+    }
+
+    #[test]
+    fn ffmpeg_failures_are_told_apart_by_stderr() {
+        for stderr in [
+            "[h264_nvenc @ 0x5581] OpenEncodeSessionEx failed: out of memory (10)\n\
+             [vost#0:0/h264_nvenc @ 0x5582] Error while opening encoder - maybe incorrect parameters\n\
+             Error opening output files: Input/output error",
+            "[AVHWDeviceContext @ 0x55] Failed to initialise VAAPI connection: -1 (unknown libva error).\n\
+             Device creation failed: -5.",
+        ] {
+            assert_eq!(
+                classify_ffmpeg_failure(stderr),
+                FailureCause::Hardware,
+                "{stderr}"
+            );
+        }
+        for stderr in [
+            "[in#0 @ 0x55] Error opening input: Server returned 404 Not Found",
+            "http://10.0.0.5:8080/live/1.ts: Server returned 404 Not Found",
+            // Read failures (`stderr_reports_input_error`).
+            "[http @ 0x55] Stream ends prematurely at 1048576, should be 18446744073709551615",
+            "[tcp @ 0x55] Connection to tcp://10.0.0.5:8080 failed: Connection refused",
+            "[in#0/mpegts @ 0x55] Error during demuxing: Input/output error",
+        ] {
+            assert_eq!(
+                classify_ffmpeg_failure(stderr),
+                FailureCause::Input,
+                "{stderr}"
+            );
+        }
+        assert_eq!(classify_ffmpeg_failure(""), FailureCause::Unknown);
+        assert_eq!(
+            classify_ffmpeg_failure("Conversion failed!"),
+            FailureCause::Unknown
+        );
+    }
+
+    #[test]
+    fn live_hw_failure_falls_back_only_for_hardware_or_repeated_unknown_errors() {
+        // VOD retries in software on any failure: nothing else restarts it.
+        assert!(hw_failure_falls_back(false, FailureCause::Input, 0));
+        // Live: an upstream error never switches the session to software.
+        assert!(!hw_failure_falls_back(true, FailureCause::Input, 0));
+        assert!(!hw_failure_falls_back(
+            true,
+            FailureCause::Input,
+            LIVE_HW_FAILURES_BEFORE_SW
+        ));
+        assert!(hw_failure_falls_back(true, FailureCause::Hardware, 0));
+        assert!(!hw_failure_falls_back(
+            true,
+            FailureCause::Unknown,
+            LIVE_HW_FAILURES_BEFORE_SW - 1
+        ));
+        assert!(hw_failure_falls_back(
+            true,
+            FailureCause::Unknown,
+            LIVE_HW_FAILURES_BEFORE_SW
+        ));
     }
 
     #[test]
@@ -5675,14 +6072,18 @@ mod tests {
             "http://127.0.0.1:8080/torrents/1/stream/0",
             "https://cdn.example.com/video.mkv",
         ] {
-            assert!(
-                !ffmpeg_http_input_args(url).is_empty(),
-                "expected reconnect args for {url}"
-            );
-            assert!(
-                !ffmpeg_http_input_args(url).contains(&"-http_persistent"),
-                "-http_persistent is an HLS-demuxer-only option, rejected for {url}"
-            );
+            for reconnect_streamed in [true, false] {
+                let args = ffmpeg_http_input_args(url, reconnect_streamed);
+                assert!(
+                    args.contains(&"-reconnect"),
+                    "expected reconnect args for {url}"
+                );
+                assert!(
+                    !args.contains(&"-http_persistent"),
+                    "-http_persistent is an HLS-demuxer-only option, rejected for {url}"
+                );
+                assert_eq!(args.contains(&"-reconnect_streamed"), reconnect_streamed);
+            }
         }
         for url in [
             "/media/tv/show/episode.mkv",
@@ -5691,21 +6092,27 @@ mod tests {
             "file:///media/tv/show/episode.mkv",
             "rtsp://camera.example.com/live",
         ] {
-            assert!(
-                ffmpeg_http_input_args(url).is_empty(),
-                "expected no reconnect args for {url}"
-            );
+            for reconnect_streamed in [true, false] {
+                assert!(
+                    ffmpeg_http_input_args(url, reconnect_streamed).is_empty(),
+                    "expected no reconnect args for {url}"
+                );
+            }
         }
 
-        let hls = ffmpeg_http_input_args(
-            "https://relay.example/api/manifest?url=https%3A%2F%2Forigin.example%2Flive.m3u8",
-        );
-        assert_eq!(hls, ["-http_persistent", "0"]);
+        for reconnect_streamed in [true, false] {
+            let hls = ffmpeg_http_input_args(
+                "https://relay.example/api/manifest?url=https%3A%2F%2Forigin.example%2Flive.m3u8",
+                reconnect_streamed,
+            );
+            assert_eq!(hls, ["-http_persistent", "0"]);
+        }
 
         // A generic relay endpoint is not necessarily HLS. DASH inputs still
         // need the normal reconnect options.
         let dash = ffmpeg_http_input_args(
             "https://relay.example/hls?url=https%3A%2F%2Forigin.example%2Flive.mpd",
+            true,
         );
         assert!(dash.contains(&"-reconnect"));
     }
@@ -5729,6 +6136,19 @@ mod tests {
         assert!(args_contains(&args, "-reconnect_streamed"));
         assert!(args_contains(&args, "-reconnect_delay_max"));
         assert!(!args_contains(&args, "-reconnect_at_eof"));
+    }
+
+    #[test]
+    fn live_hls_http_input_exits_on_upstream_drop() {
+        // An in-place reconnect resets the timestamps under -copyts and the
+        // segmenter stalls without ffmpeg exiting; the live restart loop
+        // handles the drop instead.
+        let args = build_hls_args(&TranscodeParams {
+            is_live: true,
+            ..default_hls(PathBuf::from("/tmp/test_live_session"))
+        });
+        assert!(args_contains(&args, "-copyts"));
+        assert!(!args_contains(&args, "-reconnect_streamed"));
     }
 
     #[test]
