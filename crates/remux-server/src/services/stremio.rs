@@ -34,9 +34,20 @@ pub struct StremioService {
 impl StremioService {
     pub fn from_url(url: &str) -> Result<Self> {
         let parsed = url::Url::parse(url).map_err(|e| anyhow::anyhow!("{e}"))?;
+        // Keep the pairs exactly as the manifest URL encodes them: the request
+        // builder joins `query()` pairs verbatim, so decoding here (as
+        // `query_pairs()` does) would turn `a%26b` into a second parameter.
         let extra_query: Vec<(String, String)> = parsed
-            .query_pairs()
-            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .query()
+            .unwrap_or_default()
+            .split('&')
+            .filter(|pair| !pair.is_empty())
+            .map(|pair| {
+                let (k, v) = pair
+                    .split_once('=')
+                    .unwrap_or((pair, ""));
+                (k.to_string(), v.to_string())
+            })
             .collect();
         let mut clean = parsed.clone();
         clean.set_query(None);
@@ -460,5 +471,56 @@ mod tests {
             .await;
 
         assert_eq!(names, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    /// Manifest-URL query values must go out exactly as encoded: decoding them
+    /// turned `tag=a%26b` into `tag=a&b`, splitting one value into two params.
+    #[test]
+    fn manifest_query_values_stay_encoded() {
+        let svc = StremioService::from_url(
+            "https://addon.example/cat/TOKEN/manifest.json?lang=de&tag=a%26b%20c&eq=x%3Dy",
+        )
+        .unwrap();
+        let query = svc
+            .ep(sdks::stremio::ManifestEndpoint)
+            .query();
+        assert_eq!(
+            query,
+            vec![
+                ("lang".to_string(), "de".to_string()),
+                ("tag".to_string(), "a%26b%20c".to_string()),
+                ("eq".to_string(), "x%3Dy".to_string()),
+            ]
+        );
+    }
+
+    /// On the wire, the addon must receive `tag` as one value `a&b c`; the
+    /// decoded form would arrive as `tag=a` plus a stray `b c` parameter.
+    #[tokio::test]
+    async fn catalog_request_carries_manifest_query_encoded() {
+        let server = httpmock::MockServer::start();
+        let catalog = server.mock(|when, then| {
+            when.path("/catalog/movie/test.json")
+                .query_param("lang", "de")
+                .query_param("tag", "a&b c")
+                .query_param("eq", "x=y");
+            then.status(200)
+                .json_body(serde_json::json!({"metas": [
+                    {"id": "a", "type": "movie", "name": "a"}
+                ]}));
+        });
+
+        let url = server.url("/?lang=de&tag=a%26b%20c&eq=x%3Dy");
+        let svc = StremioService::from_url(&url).unwrap();
+        let names: Vec<String> = svc
+            .get_catalog_stream("movie".to_string(), "test".to_string(), false, 1)
+            .await
+            .unwrap()
+            .map(|m| m.id)
+            .collect()
+            .await;
+
+        catalog.assert();
+        assert_eq!(names, vec!["a".to_string()]);
     }
 }
