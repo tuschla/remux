@@ -113,21 +113,22 @@ impl StremioService {
             .meta)
     }
 
-    /// `Ok(vec![])` when the addon has no search catalog for `media_type`
-    /// (nothing to ask, so no request) or answers the search with nothing;
-    /// `Err` only when the addon genuinely failed, so search callers can tell
-    /// a broken addon from one with no matches.
+    /// `Ok(None)` when the addon has no search catalog for `media_type`
+    /// (nothing to ask, so no request), letting search callers fall through
+    /// to the next addon; `Ok(Some(vec![]))` when the addon answers the
+    /// search with nothing; `Err` only when the addon genuinely failed, so
+    /// search callers can tell a broken addon from one with no matches.
     pub async fn search(
         &self,
         media_type: sdks::stremio::MediaType,
         q: String,
-    ) -> Result<Vec<sdks::stremio::Meta>> {
+    ) -> Result<Option<Vec<sdks::stremio::Meta>>> {
         let Some(catalog) = self
             .get_manifest()
             .await?
             .get_search_catalog(&media_type.to_string())
         else {
-            return Ok(vec![]);
+            return Ok(None);
         };
         match self
             .client
@@ -143,10 +144,10 @@ impl StremioService {
             )
             .await
         {
-            Ok(response) => Ok(response.metas),
+            Ok(response) => Ok(Some(response.metas)),
             // Same convention as catalog pages (see `is_404`): a 404 from a
             // catalog the manifest declares searchable means "nothing found".
-            Err(e) if is_404(&e) => Ok(vec![]),
+            Err(e) if is_404(&e) => Ok(Some(vec![])),
             Err(e) => Err(e.into()),
         }
     }
@@ -510,7 +511,8 @@ mod tests {
         });
         let metas = search_service(&server, prefix)
             .search(sdks::stremio::MediaType::Movie, "matrix".into())
-            .await?;
+            .await?
+            .expect("movie search catalog is declared");
         Ok(metas
             .into_iter()
             .map(|m| m.id)
@@ -538,6 +540,9 @@ mod tests {
         );
     }
 
+    /// No search catalog for the type means the addon can't search it at
+    /// all: `None`, so the search loop asks the next addon instead of
+    /// stopping on an empty answer.
     #[tokio::test]
     async fn search_without_a_search_catalog_for_the_type_asks_nothing() {
         let server = httpmock::MockServer::start();
@@ -554,7 +559,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(metas.is_empty());
+        assert!(metas.is_none());
         catalog.assert_hits(0);
     }
 }
