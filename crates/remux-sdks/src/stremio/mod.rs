@@ -245,11 +245,14 @@ impl Endpoint for CatalogEndpoint {
         if let Some(skip) = self.skip {
             extras.push(format!("skip={}", skip));
         }
+        // Extras live in a path segment, so `/`, `?`, `#`, `%` and `&` in a value would split the
+        // segment, end the path or start another extra. Percent-encode each value, as stremio-core
+        // does; addons decode the segment before parsing the extras.
         if let Some(search) = &self.search {
-            extras.push(format!("search={}", search));
+            extras.push(format!("search={}", urlencoding::encode(search)));
         }
         if let Some(genre) = &self.genre {
-            extras.push(format!("genre={}", genre));
+            extras.push(format!("genre={}", urlencoding::encode(genre)));
         }
 
         if !extras.is_empty() {
@@ -1125,7 +1128,7 @@ pub fn client(base: &str) -> Result<RestClient, url::ParseError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Endpoint, MediaType, Meta, MetaResponse, ReleaseInfo, Stream,
+        CatalogEndpoint, Endpoint, MediaType, Meta, MetaResponse, ReleaseInfo, Stream,
         SubtitlesEndpoint, parse_duration_lossy,
     };
     use std::time::Duration;
@@ -1177,6 +1180,68 @@ mod tests {
             subtitles_path(None, Some(1234)),
             "/subtitles/movie/tt0133093/videoSize=1234.json"
         );
+    }
+
+    fn catalog_path(
+        search: Option<&str>,
+        genre: Option<&str>,
+        skip: Option<u32>,
+    ) -> String {
+        CatalogEndpoint {
+            kind: "movie".into(),
+            id: "top".into(),
+            search: search.map(String::from),
+            genre: genre.map(String::from),
+            skip,
+        }
+        .path()
+    }
+
+    #[test]
+    fn catalog_path_percent_encodes_search_values() {
+        for (search, encoded) in [
+            ("Face/Off", "Face%2FOff"),
+            ("AC/DC", "AC%2FDC"),
+            ("Fate/stay night", "Fate%2Fstay%20night"),
+            ("what?", "what%3F"),
+            ("#1", "%231"),
+            ("100%", "100%25"),
+            ("Tom & Jerry", "Tom%20%26%20Jerry"),
+            ("a=b", "a%3Db"),
+            ("Amélie", "Am%C3%A9lie"),
+        ] {
+            assert_eq!(
+                catalog_path(Some(search), None, None),
+                format!("/catalog/movie/top/search={encoded}.json"),
+                "{search}"
+            );
+        }
+    }
+
+    #[test]
+    fn catalog_path_percent_encodes_genre_and_keeps_extra_order() {
+        assert_eq!(catalog_path(None, None, None), "/catalog/movie/top.json");
+        assert_eq!(
+            catalog_path(Some("AC/DC"), Some("Action & Adventure"), Some(100)),
+            "/catalog/movie/top/skip=100&search=AC%2FDC&genre=Action%20%26%20Adventure.json"
+        );
+    }
+
+    #[test]
+    fn catalog_search_survives_joining_onto_the_addon_base() {
+        // The client joins the trimmed path onto the manifest base; reserved characters in the
+        // query must stay inside the last path segment instead of becoming a query or fragment.
+        let base = url::Url::parse("https://addon.example/token/").unwrap();
+        let path = catalog_path(Some("what?#1/x"), None, None);
+        let url = base
+            .join(path.trim_matches('/'))
+            .unwrap();
+        assert_eq!(
+            url.path(),
+            "/token/catalog/movie/top/search=what%3F%231%2Fx.json"
+        );
+        assert_eq!(url.query(), None);
+        assert_eq!(url.fragment(), None);
     }
 
     #[test]
