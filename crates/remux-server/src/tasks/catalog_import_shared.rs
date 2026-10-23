@@ -29,7 +29,7 @@ pub async fn import_catalog_items<S>(
     progress: &ProgressReporter,
 ) -> Result<(HashMap<String, usize>, HashMap<String, usize>)>
 where
-    S: futures::Stream<Item = db::Media> + Unpin,
+    S: futures::Stream<Item = Result<db::Media>> + Unpin,
 {
     // Stop pulling from the underlying paginated stream once we have enough items.
     // Without this, the stream fetches ALL pages until empty even when max=50.
@@ -49,6 +49,7 @@ where
     let mut total = 0usize;
     let mut catalog_position = 0i64;
     let mut imported_ids: HashSet<Uuid> = HashSet::new();
+    let mut failure = None;
     let membership = catalog_membership(media_id);
 
     let collection_id: Uuid = match membership {
@@ -78,6 +79,13 @@ where
 
         let mut items: Vec<db::Media> = items
             .into_iter()
+            .filter_map(|item| match item {
+                Ok(item) => Some(item),
+                Err(e) => {
+                    failure = Some(e);
+                    None
+                }
+            })
             .take(remaining)
             .collect();
         if items.is_empty() {
@@ -481,8 +489,15 @@ where
         }
     }
 
-    // Remove items that were in this catalog before but weren't returned this run.
-    if collection_id != Uuid::nil() && !imported_ids.is_empty() {
+    // Remove items that were in this catalog before but weren't returned this
+    // run, unless a page failed and the catalog is incomplete.
+    if let Some(error) = &failure {
+        warn!(
+            catalog = media_id,
+            error = %error,
+            "catalog incomplete: a page failed, keeping existing members"
+        );
+    } else if collection_id != Uuid::nil() && !imported_ids.is_empty() {
         let existing_members: Vec<Uuid> = sqlx::query_scalar(
             "SELECT right_media_id FROM media_relations WHERE left_media_id = ? AND role = 'catalog'",
         )
@@ -759,7 +774,7 @@ mod tests {
                 &catalog,
                 &catalog.catalog_id,
                 10,
-                futures::stream::iter([stub]),
+                futures::stream::iter([Ok(stub)]),
                 &progress,
             )
             .await
@@ -803,7 +818,7 @@ mod tests {
             &catalog,
             &catalog.catalog_id,
             10,
-            futures::stream::iter([fresh]),
+            futures::stream::iter([Ok(fresh)]),
             &progress,
         )
         .await
@@ -896,7 +911,11 @@ mod tests {
             &catalog,
             &catalog.catalog_id,
             100,
-            futures::stream::iter(items),
+            futures::stream::iter(
+                items
+                    .into_iter()
+                    .map(Ok),
+            ),
             &progress,
         )
         .await

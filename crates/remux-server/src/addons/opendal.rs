@@ -416,7 +416,7 @@ impl CatalogAddon for OpendalAddon {
         &self,
         ctx: &AppContext,
         local_id: &str,
-    ) -> Result<Option<Pin<Box<dyn Stream<Item = db::Media> + Send>>>> {
+    ) -> Result<Option<Pin<Box<dyn Stream<Item = Result<db::Media>> + Send>>>> {
         if local_id != "files" {
             return Ok(None);
         }
@@ -578,7 +578,11 @@ impl CatalogAddon for OpendalAddon {
             }
         };
 
-        Ok(Some(Box::pin(futures::stream::iter(items))))
+        Ok(Some(Box::pin(futures::stream::iter(
+            items
+                .into_iter()
+                .map(anyhow::Ok),
+        ))))
     }
 }
 
@@ -3234,6 +3238,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let mut series_items: Vec<db::Media> = stream
+            .map(|item| item.unwrap())
             .collect()
             .await;
         series_items.sort_by(|a, b| {
@@ -3425,6 +3430,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let series_items: Vec<db::Media> = stream
+            .map(|item| item.unwrap())
             .collect()
             .await;
         assert_eq!(series_items.len(), 1);
@@ -4660,6 +4666,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap()
+            .map(|item| item.unwrap())
             .collect()
             .await;
         assert_eq!(catalog.len(), 3);
@@ -5429,6 +5436,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap()
+            .map(|item| item.unwrap())
             .collect()
             .await;
 
@@ -5502,6 +5510,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap()
+            .map(|item| item.unwrap())
             .collect()
             .await;
 
@@ -5592,6 +5601,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap()
+            .map(|item| item.unwrap())
             .collect()
             .await;
         let albums = catalog
@@ -5632,6 +5642,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap()
+            .map(|item| item.unwrap())
             .collect()
             .await;
         let track = catalog

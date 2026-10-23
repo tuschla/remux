@@ -478,6 +478,161 @@ mod tests {
         assert!(CatalogScope::IndexedAddons.includes(true));
         assert!(!CatalogScope::IndexedAddons.includes(false));
     }
+
+    /// A failed catalog page keeps every member of the catalog's collection.
+    #[tokio::test]
+    async fn refresh_catalogs_keeps_members_when_a_page_fails() {
+        async fn members(db: &sqlx::SqlitePool, collection_id: Uuid) -> HashSet<Uuid> {
+            sqlx::query_scalar::<_, Uuid>(
+                "SELECT right_media_id FROM media_relations WHERE left_media_id = ? AND role = 'catalog'",
+            )
+            .bind(collection_id)
+            .fetch_all(db)
+            .await
+            .unwrap()
+            .into_iter()
+            .collect()
+        }
+
+        let (_server, guard) = crate::integration_test::new_test_server()
+            .await
+            .unwrap();
+        let ctx = &guard.0;
+        // The seeded TMDB, Deezer and Monochrome catalogs would hit the network.
+        sqlx::query("UPDATE addons SET enabled = 0")
+            .execute(&ctx.db)
+            .await
+            .unwrap();
+
+        let addon = httpmock::MockServer::start();
+        // Pooled httpmock servers reuse ports and manifests are cached by URL,
+        // so a unique path keeps another test's manifest out.
+        let prefix = format!("/{}", Uuid::new_v4());
+        addon.mock(|when, then| {
+            when.path(format!("{prefix}/manifest.json"));
+            then.status(200)
+                .json_body(serde_json::json!({
+                    "id": "paged-catalog",
+                    "name": "Paged catalog",
+                    "version": "1.0.0",
+                    "resources": ["catalog"],
+                    "types": ["movie"],
+                    "catalogs": [{
+                        "type": "movie",
+                        "id": "paged",
+                        "name": "paged",
+                        "extra": [{"name": "skip"}]
+                    }]
+                }));
+        });
+        let imdb_ids = ["tt0088763", "tt0096874"];
+        addon.mock(|when, then| {
+            when.path(format!("{prefix}/catalog/movie/paged.json"));
+            then.status(200)
+                .json_body(serde_json::json!({
+                    "metas": [{"id": imdb_ids[0], "type": "movie", "name": "Back To The Future"}]
+                }));
+        });
+        let mut second_page = addon.mock(|when, then| {
+            when.path(format!("{prefix}/catalog/movie/paged/skip=1.json"));
+            then.status(200)
+                .json_body(serde_json::json!({
+                    "metas": [{"id": imdb_ids[1], "type": "movie", "name": "Back To The Future II"}]
+                }));
+        });
+
+        let now = chrono::Utc::now().naive_utc();
+        let addon_id = Uuid::new_v4();
+        crate::addons::Addon {
+            id: addon_id,
+            name: "paged-catalog".to_string(),
+            preset: crate::addons::AddonPresetRef {
+                kind: "stremio".to_string(),
+                config: serde_json::json!({
+                    "manifest_url": format!("{}{prefix}/manifest.json", addon.base_url()),
+                    "catalogs": {"movie:paged": {"enabled": true}}
+                })
+                .into(),
+            },
+            resources: vec![ResourceType::Catalog],
+            types: vec![],
+            enabled: true,
+            priority: 0,
+            system: false,
+            is_default: true,
+            http_redirect_stream: false,
+            subtitle_extraction: false,
+            probe_on_scan: false,
+            service_filter: vec![],
+            created_at: now,
+            updated_at: now,
+        }
+        .insert(&ctx.db)
+        .await
+        .unwrap();
+        ctx.addons
+            .reload(&ctx.db, &ctx.config)
+            .await
+            .unwrap();
+
+        // Already in the library, so the import fetches no metadata for them.
+        let mut movie_ids = Vec::new();
+        for imdb in imdb_ids {
+            let mut movie = db::Media {
+                id: Uuid::new_v4(),
+                kind: db::MediaKind::Movie,
+                title: imdb.to_string(),
+                external_ids: db::ExternalIds {
+                    imdb: db::NonEmptyString::try_new(imdb).ok(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            movie
+                .save(&ctx.db)
+                .await
+                .unwrap();
+            movie_ids.push(movie.id);
+        }
+        let collection_id = Uuid::new_v5(&addon_id, b"movie:paged");
+        let tasks = Arc::new(
+            TaskService::new(ctx.clone())
+                .await
+                .unwrap(),
+        );
+
+        RefreshCatalogsTask
+            .run(
+                ctx.clone(),
+                tasks.clone(),
+                ProgressReporter::new(Default::default()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            members(&ctx.db, collection_id).await,
+            HashSet::from([movie_ids[0], movie_ids[1]])
+        );
+
+        second_page.delete();
+        addon.mock(|when, then| {
+            when.path(format!("{prefix}/catalog/movie/paged/skip=1.json"));
+            then.status(500);
+        });
+        RefreshCatalogsTask
+            .run(
+                ctx.clone(),
+                tasks,
+                ProgressReporter::new(Default::default()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            members(&ctx.db, collection_id).await,
+            HashSet::from([movie_ids[0], movie_ids[1]]),
+            "a failed page must not drop the members after it"
+        );
+    }
 }
 
 /// Page size for `invalidate_collection_images`'s scan. Without an explicit

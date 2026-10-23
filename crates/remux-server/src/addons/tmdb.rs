@@ -245,7 +245,7 @@ impl CatalogAddon for TmdbAddon {
         &self,
         ctx: &AppContext,
         local_id: &str,
-    ) -> Result<Option<Pin<Box<dyn Stream<Item = db::Media> + Send>>>> {
+    ) -> Result<Option<Pin<Box<dyn Stream<Item = Result<db::Media>> + Send>>>> {
         let config = crate::db::Settings::get_config(&ctx.db).await?;
         let client = tmdb_client(
             config.get_tmdb_key(),
@@ -253,46 +253,48 @@ impl CatalogAddon for TmdbAddon {
                 .tmdb_base_url,
         )?;
 
-        let stream: Pin<Box<dyn Stream<Item = db::Media> + Send>> = match local_id {
-            "popular_movies" => Box::pin(discover_movie_stream(
-                client,
-                sdks::tmdb::DiscoverQuery {
-                    sort_by: Some("popularity.desc".into()),
-                    ..Default::default()
-                },
-            )),
-            "popular_tv" => Box::pin(discover_tv_stream(
-                client,
-                sdks::tmdb::DiscoverQuery {
-                    sort_by: Some("popularity.desc".into()),
-                    ..Default::default()
-                },
-            )),
-            "top_rated_movies" => Box::pin(discover_movie_stream(
-                client,
-                sdks::tmdb::DiscoverQuery {
-                    sort_by: Some("vote_average.desc".into()),
-                    vote_count_gte: Some(300),
-                    ..Default::default()
-                },
-            )),
-            "top_rated_tv" => Box::pin(discover_tv_stream(
-                client,
-                sdks::tmdb::DiscoverQuery {
-                    sort_by: Some("vote_average.desc".into()),
-                    vote_count_gte: Some(300),
-                    ..Default::default()
-                },
-            )),
-            "trending_movies_week" => Box::pin(trending_movie_stream(
-                client,
-                sdks::tmdb::TrendingWindow::Week,
-            )),
-            "trending_tv_week" => {
-                Box::pin(trending_tv_stream(client, sdks::tmdb::TrendingWindow::Week))
-            }
-            _ => return Ok(None),
-        };
+        let stream: Pin<Box<dyn Stream<Item = Result<db::Media>> + Send>> =
+            match local_id {
+                "popular_movies" => Box::pin(discover_movie_stream(
+                    client,
+                    sdks::tmdb::DiscoverQuery {
+                        sort_by: Some("popularity.desc".into()),
+                        ..Default::default()
+                    },
+                )),
+                "popular_tv" => Box::pin(discover_tv_stream(
+                    client,
+                    sdks::tmdb::DiscoverQuery {
+                        sort_by: Some("popularity.desc".into()),
+                        ..Default::default()
+                    },
+                )),
+                "top_rated_movies" => Box::pin(discover_movie_stream(
+                    client,
+                    sdks::tmdb::DiscoverQuery {
+                        sort_by: Some("vote_average.desc".into()),
+                        vote_count_gte: Some(300),
+                        ..Default::default()
+                    },
+                )),
+                "top_rated_tv" => Box::pin(discover_tv_stream(
+                    client,
+                    sdks::tmdb::DiscoverQuery {
+                        sort_by: Some("vote_average.desc".into()),
+                        vote_count_gte: Some(300),
+                        ..Default::default()
+                    },
+                )),
+                "trending_movies_week" => Box::pin(trending_movie_stream(
+                    client,
+                    sdks::tmdb::TrendingWindow::Week,
+                )),
+                "trending_tv_week" => Box::pin(trending_tv_stream(
+                    client,
+                    sdks::tmdb::TrendingWindow::Week,
+                )),
+                _ => return Ok(None),
+            };
 
         Ok(Some(stream))
     }
@@ -350,10 +352,20 @@ fn series_result_to_stub(s: sdks::tmdb::SeriesSearchResult) -> db::Media {
     media
 }
 
+fn page_error(
+    error: ClientError,
+) -> futures::stream::Iter<std::vec::IntoIter<Result<db::Media>>> {
+    futures::stream::iter(vec![Err(anyhow::Error::from(error))])
+}
+
+/// TMDB rejects discover and trending pages past 500, so a bigger catalog
+/// stops there instead of ending on that error.
+const MAX_PAGE: u32 = 500;
+
 fn discover_movie_stream(
     client: sdks::RestClient<sdks::BearerAuth>,
     query: sdks::tmdb::DiscoverQuery,
-) -> impl Stream<Item = db::Media> + Send {
+) -> impl Stream<Item = Result<db::Media>> + Send {
     futures::stream::unfold(
         (client, query, Some(1u32)),
         |(client, query, maybe_page)| async move {
@@ -362,22 +374,29 @@ fn discover_movie_stream(
                 page: Some(page),
                 ..query.clone()
             };
-            let resp = client
+            let resp = match client
                 .execute(sdks::tmdb::DiscoverMovieEndpoint { query: page_query })
                 .await
-                .ok()?;
+            {
+                Ok(resp) => resp,
+                Err(e) => return Some((page_error(e), (client, query, None))),
+            };
             if resp
                 .results
                 .is_empty()
             {
                 return None;
             }
-            let items: Vec<db::Media> = resp
+            let items: Vec<Result<db::Media>> = resp
                 .results
                 .into_iter()
-                .map(movie_result_to_stub)
+                .map(|m| Ok(movie_result_to_stub(m)))
                 .collect();
-            let next = (page < resp.total_pages).then_some(page + 1);
+            let next = (page
+                < resp
+                    .total_pages
+                    .min(MAX_PAGE))
+            .then_some(page + 1);
             Some((futures::stream::iter(items), (client, query, next)))
         },
     )
@@ -387,7 +406,7 @@ fn discover_movie_stream(
 fn discover_tv_stream(
     client: sdks::RestClient<sdks::BearerAuth>,
     query: sdks::tmdb::DiscoverQuery,
-) -> impl Stream<Item = db::Media> + Send {
+) -> impl Stream<Item = Result<db::Media>> + Send {
     futures::stream::unfold(
         (client, query, Some(1u32)),
         |(client, query, maybe_page)| async move {
@@ -396,22 +415,29 @@ fn discover_tv_stream(
                 page: Some(page),
                 ..query.clone()
             };
-            let resp = client
+            let resp = match client
                 .execute(sdks::tmdb::DiscoverTvEndpoint { query: page_query })
                 .await
-                .ok()?;
+            {
+                Ok(resp) => resp,
+                Err(e) => return Some((page_error(e), (client, query, None))),
+            };
             if resp
                 .results
                 .is_empty()
             {
                 return None;
             }
-            let items: Vec<db::Media> = resp
+            let items: Vec<Result<db::Media>> = resp
                 .results
                 .into_iter()
-                .map(series_result_to_stub)
+                .map(|s| Ok(series_result_to_stub(s)))
                 .collect();
-            let next = (page < resp.total_pages).then_some(page + 1);
+            let next = (page
+                < resp
+                    .total_pages
+                    .min(MAX_PAGE))
+            .then_some(page + 1);
             Some((futures::stream::iter(items), (client, query, next)))
         },
     )
@@ -421,30 +447,37 @@ fn discover_tv_stream(
 fn trending_movie_stream(
     client: sdks::RestClient<sdks::BearerAuth>,
     window: sdks::tmdb::TrendingWindow,
-) -> impl Stream<Item = db::Media> + Send {
+) -> impl Stream<Item = Result<db::Media>> + Send {
     futures::stream::unfold(
         (client, Some(1u32)),
         move |(client, maybe_page)| async move {
             let page = maybe_page?;
-            let resp = client
+            let resp = match client
                 .execute(sdks::tmdb::TrendingMovieEndpoint {
                     window,
                     page: Some(page),
                 })
                 .await
-                .ok()?;
+            {
+                Ok(resp) => resp,
+                Err(e) => return Some((page_error(e), (client, None))),
+            };
             if resp
                 .results
                 .is_empty()
             {
                 return None;
             }
-            let items: Vec<db::Media> = resp
+            let items: Vec<Result<db::Media>> = resp
                 .results
                 .into_iter()
-                .map(movie_result_to_stub)
+                .map(|m| Ok(movie_result_to_stub(m)))
                 .collect();
-            let next = (page < resp.total_pages).then_some(page + 1);
+            let next = (page
+                < resp
+                    .total_pages
+                    .min(MAX_PAGE))
+            .then_some(page + 1);
             Some((futures::stream::iter(items), (client, next)))
         },
     )
@@ -454,30 +487,37 @@ fn trending_movie_stream(
 fn trending_tv_stream(
     client: sdks::RestClient<sdks::BearerAuth>,
     window: sdks::tmdb::TrendingWindow,
-) -> impl Stream<Item = db::Media> + Send {
+) -> impl Stream<Item = Result<db::Media>> + Send {
     futures::stream::unfold(
         (client, Some(1u32)),
         move |(client, maybe_page)| async move {
             let page = maybe_page?;
-            let resp = client
+            let resp = match client
                 .execute(sdks::tmdb::TrendingTvEndpoint {
                     window,
                     page: Some(page),
                 })
                 .await
-                .ok()?;
+            {
+                Ok(resp) => resp,
+                Err(e) => return Some((page_error(e), (client, None))),
+            };
             if resp
                 .results
                 .is_empty()
             {
                 return None;
             }
-            let items: Vec<db::Media> = resp
+            let items: Vec<Result<db::Media>> = resp
                 .results
                 .into_iter()
-                .map(series_result_to_stub)
+                .map(|s| Ok(series_result_to_stub(s)))
                 .collect();
-            let next = (page < resp.total_pages).then_some(page + 1);
+            let next = (page
+                < resp
+                    .total_pages
+                    .min(MAX_PAGE))
+            .then_some(page + 1);
             Some((futures::stream::iter(items), (client, next)))
         },
     )
@@ -2695,5 +2735,29 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    /// TMDB rejects pages past 500, so a bigger catalog stops at page 500
+    /// instead of ending on that error.
+    #[tokio::test]
+    async fn catalog_stops_at_page_500() {
+        let tmdb = httpmock::MockServer::start();
+        let pages = tmdb.mock(|when, then| {
+            when.path("/discover/movie");
+            then.status(200)
+                .json_body(serde_json::json!({
+                    "page": 1,
+                    "total_pages": 600,
+                    "total_results": 600,
+                    "results": [{ "id": 1, "title": "Film" }]
+                }));
+        });
+        let client = tmdb_client("key", &tmdb.base_url()).unwrap();
+
+        discover_movie_stream(client, Default::default())
+            .count()
+            .await;
+
+        assert_eq!(pages.hits(), 500);
     }
 }
