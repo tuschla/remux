@@ -1663,14 +1663,33 @@ async fn stremio_search(
                 .map(|id| format!("imdb:{}", id))
                 .unwrap_or_else(|| format!("{}:{}", m.media_type, m.id))
         })
-        .take(limit)
         .filter(|meta| !meta.is_error())
+        // An unknown `type` without episodes only becomes a Movie through
+        // `Media::try_from`'s fallback; that guess is no evidence of either kind.
+        .filter(|meta| {
+            db::MediaKind::try_from(
+                meta.media_type
+                    .clone(),
+            )
+            .is_ok()
+                || meta
+                    .videos
+                    .as_ref()
+                    .is_some_and(|v| !v.is_empty())
+        })
         .filter_map(|meta| {
             let mut m = db::Media::try_from(meta.clone()).ok()?;
+            // Search catalogs mix types; compared after conversion so an item
+            // with episodes counts as the Series it becomes.
+            if m.kind != *kind {
+                return None;
+            }
             let rels = build_relations(&m, &meta);
             m.relations = Some(rels);
             Some(m)
         })
+        // After filtering, so dropped items don't eat into the limit.
+        .take(limit)
         .collect();
 
     db::Media::preload_parents(&ctx.db, &mut media).await;
@@ -2817,5 +2836,68 @@ mod tests {
             Vec::<TrackerUrl>::new()
         );
         assert_eq!(extract_trackers(&[]), Vec::<TrackerUrl>::new());
+    }
+
+    #[tokio::test]
+    async fn stremio_search_keeps_only_the_requested_kind() {
+        let (_server, guard) = crate::integration_test::new_test_server()
+            .await
+            .unwrap();
+        let ctx = &guard.0;
+        let addon = httpmock::MockServer::start();
+        let prefix = "/stremio-search-kind";
+        let search_catalog = |kind: &str| {
+            serde_json::json!({
+                "type": kind, "id": "top", "name": "Top",
+                "extra": [{"name": "search"}],
+            })
+        };
+        addon.mock(|when, then| {
+            when.path(format!("{prefix}/manifest.json"));
+            then.status(200)
+                .json_body(serde_json::json!({
+                    "id": "test", "name": "Test", "version": "1.0.0",
+                    "resources": ["catalog"],
+                    "types": ["movie", "series"],
+                    "catalogs": [search_catalog("movie"), search_catalog("series")],
+                }));
+        });
+        // Both search catalogs answer with the same mix of types.
+        addon.mock(|when, then| {
+            when.path_contains("/top/search=matrix.json");
+            then.status(200)
+                .json_body(serde_json::json!({ "metas": [
+                    {"id": "tt0000001", "type": "series", "name": "Matrix Show"},
+                    {"id": "x:2", "type": "weirdtype", "name": "Matrix Thing"},
+                    {"id": "tt0000003", "type": "movie", "name": "Matrix Movie"},
+                    {"id": "tt0000004", "type": "Movie", "name": "Matrix Capital Movie"},
+                    {
+                        "id": "x:5", "type": "anime", "name": "Matrix Anime Show",
+                        "videos": [{"id": "x:5:1:1", "season": 1, "episode": 1}],
+                    },
+                    {"id": "tt0000006", "type": "Series", "name": "Matrix Capital Show"},
+                ]}));
+        });
+        let svc =
+            stremio_service::StremioService::from_url(&addon.url(prefix)).unwrap();
+        let titles = |media: Vec<db::Media>| {
+            media
+                .into_iter()
+                .map(|m| m.title)
+                .collect::<Vec<_>>()
+        };
+
+        // Limit 2: the other kinds ahead of the movies must not use it up.
+        let movies = stremio_search(&svc, &db::MediaKind::Movie, "matrix", 2, ctx)
+            .await
+            .unwrap();
+        assert_eq!(titles(movies), ["Matrix Movie", "Matrix Capital Movie"]);
+        let series = stremio_search(&svc, &db::MediaKind::Series, "matrix", 10, ctx)
+            .await
+            .unwrap();
+        assert_eq!(
+            titles(series),
+            ["Matrix Show", "Matrix Anime Show", "Matrix Capital Show"]
+        );
     }
 }
