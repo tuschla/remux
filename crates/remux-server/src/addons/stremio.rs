@@ -1651,8 +1651,7 @@ async fn stremio_search(
 
     let results = svc
         .search(aio_type, query.to_string())
-        .await
-        .unwrap_or_default();
+        .await?;
 
     let mut media: Vec<db::Media> = results
         .into_iter()
@@ -2817,5 +2816,59 @@ mod tests {
             Vec::<TrackerUrl>::new()
         );
         assert_eq!(extract_trackers(&[]), Vec::<TrackerUrl>::new());
+    }
+
+    #[tokio::test]
+    async fn stremio_search_reports_failures_but_not_missing_matches() {
+        let (_server, guard) = crate::integration_test::new_test_server()
+            .await
+            .unwrap();
+        let ctx = &guard.0;
+        let addon = httpmock::MockServer::start();
+        // Responses are cached by URL, so this test gets its own prefix.
+        let prefix = "/stremio-search-errors";
+        addon.mock(|when, then| {
+            when.path(format!("{prefix}/manifest.json"));
+            then.status(200)
+                .json_body(serde_json::json!({
+                    "id": "test",
+                    "name": "Test",
+                    "version": "1.0.0",
+                    "resources": ["catalog"],
+                    "types": ["movie", "series"],
+                    "catalogs": [{
+                        "type": "movie",
+                        "id": "top",
+                        "name": "Top",
+                        "extra": [{"name": "search"}],
+                    }],
+                }));
+        });
+        addon.mock(|when, then| {
+            when.path(format!("{prefix}/catalog/movie/top/search=broken.json"));
+            then.status(400);
+        });
+        let svc =
+            stremio_service::StremioService::from_url(&addon.url(prefix)).unwrap();
+
+        assert!(
+            stremio_search(&svc, &db::MediaKind::Movie, "broken", 10, ctx)
+                .await
+                .is_err()
+        );
+        // httpmock answers 404 for any other search.
+        assert!(
+            stremio_search(&svc, &db::MediaKind::Movie, "missing", 10, ctx)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        // The manifest has no series search catalog.
+        assert!(
+            stremio_search(&svc, &db::MediaKind::Series, "missing", 10, ctx)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 }
