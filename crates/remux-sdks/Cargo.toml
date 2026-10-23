@@ -39,7 +39,8 @@ nutype = { version = "0.6", features = ["serde", "regex"] }
 regex = "1"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-tokio = { version = "1", features = ["time"] }
+# `rt` for `task_local!`, which scopes interactive requests.
+tokio = { version = "1", features = ["rt", "time"] }
 
 # uuid has no randomness source on wasm32-unknown-unknown unless one is picked.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
