@@ -28,7 +28,8 @@ impl Endpoint for FindByIdEndpoint {
     type Output = FindByIdResponse;
 
     fn path(&self) -> String {
-        format!("find/{}", self.external_id)
+        // Keep the id one path segment.
+        format!("find/{}", urlencoding::encode(&self.external_id))
     }
 
     fn query_params(&self) -> impl serde::Serialize + '_ {

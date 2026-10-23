@@ -723,7 +723,7 @@ pub(crate) async fn resolve_imdb_id<A: sdks::Auth + Clone>(
         ids.imdb = meta
             .imdb_id
             .as_deref()
-            .and_then(|s| db::NonEmptyString::try_new(s.to_string()).ok());
+            .and_then(db::ExternalIds::parse_imdb);
     }
     // AIO resolve: the addon may map its own ID to an IMDB ID.
     if ids
@@ -742,7 +742,7 @@ pub(crate) async fn resolve_imdb_id<A: sdks::Auth + Clone>(
             ids.imdb = meta
                 .imdb_id
                 .as_deref()
-                .and_then(|s| db::NonEmptyString::try_new(s.to_string()).ok());
+                .and_then(db::ExternalIds::parse_imdb);
         }
     }
 
@@ -1090,16 +1090,10 @@ async fn stremio_meta_fetch(
             // it unconditionally deep-copies every entry in `videos`, which is
             // ruinous for series with thousands of episodes.
             let mut meta_patched = (*meta_arc).clone();
-            if meta_patched
-                .imdb_id
-                .is_none()
-                && !is_custom
+            // With no well-formed IMDb id in the meta, keep the stored one.
+            if db::ExternalIds::stremio_meta_imdb(&meta_patched).is_none() && !is_custom
             {
-                meta_patched.imdb_id =
-                    db::ExternalIds::from_stremio_id(&meta_patched.id)
-                        .imdb
-                        .map(Into::into)
-                        .or_else(|| imdb_id.map(Into::into));
+                meta_patched.imdb_id = imdb_id.map(Into::into);
             }
             // No `is_error()` check needed here: `fetch_and_cache_meta` never
             // returns (or caches) an error-shaped meta — it converts those to
