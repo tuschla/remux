@@ -52,6 +52,9 @@ pub struct PlaybackSession {
     pub now_playing_queue: Option<Vec<QueueItem>>,
     pub playlist_item_id: Option<String>,
     pub started_at: DateTime<Utc>,
+    /// When the start report came, on the clock transcode requests are
+    /// timed with (see `end_left_playbacks`).
+    reported_at: std::time::Instant,
     pub last_activity: DateTime<Utc>,
     /// When the client last reported this play session (start, progress,
     /// pause, resume, ping); `None` for a transcode stub.
@@ -90,7 +93,7 @@ impl PlaybackSession {
     }
 
     /// False for a transcode stub no playback report has claimed yet.
-    fn is_reported(&self) -> bool {
+    pub(crate) fn is_reported(&self) -> bool {
         !self
             .user_id
             .is_nil()
@@ -247,6 +250,10 @@ pub struct PlaybackSessionManager {
     // while playback-start inserts its session. Its value is `closed`: set by
     // `stop_all` (shutdown), after which no transcode is attached.
     handoff: Arc<std::sync::Mutex<bool>>,
+    /// The latest start report of each (device, user), kept after its
+    /// playback stopped: `end_left_playbacks` measures the older playbacks
+    /// against it. Pruned once the owner has no older playback left.
+    latest_starts: Arc<DashMap<(String, Uuid), std::time::Instant>>,
     base_dir: PathBuf,
 }
 
@@ -259,6 +266,7 @@ impl PlaybackSessionManager {
             pending_torrents: Arc::new(DashMap::new()),
             pending_play_methods: Arc::new(DashMap::new()),
             handoff: Arc::new(std::sync::Mutex::new(false)),
+            latest_starts: Arc::new(DashMap::new()),
             base_dir,
         }
     }
@@ -302,8 +310,8 @@ impl PlaybackSessionManager {
             .map(|p| p.max_active_sessions)
             .unwrap_or(0);
         if max_sessions > 0 {
-            // Exclude the caller's own device: insert() will replace any existing
-            // session for that device, so it doesn't consume an extra slot.
+            // Exclude the caller's own device: it counts as one stream, the
+            // one starting now, whatever else it still has in flight.
             let current = self.count_for_user(
                 auth_session
                     .user
@@ -413,6 +421,7 @@ impl PlaybackSessionManager {
                 .playlist_item_id
                 .clone(),
             started_at: Utc::now(),
+            reported_at: std::time::Instant::now(),
             last_activity: Utc::now(),
             last_report: Some(std::time::Instant::now()),
             transcode: None,
@@ -693,7 +702,8 @@ impl PlaybackSessionManager {
 
     /// Handle a `POST /sessions/playing/stopped` report.
     ///
-    /// Removes the playback session (stopping any active transcode), persists
+    /// Removes the playback session (stopping any active transcode) and what
+    /// the report leaves behind on `device_id` (`stop_left_behind`), persists
     /// the final position to the DB (with the 90 % watched-mark check), and
     /// emits an info log line.
     ///
@@ -702,6 +712,7 @@ impl PlaybackSessionManager {
         &self,
         db: &sqlx::SqlitePool,
         user: &db::User,
+        device_id: &str,
         psid: &str,
         data: &PlaybackInfo,
     ) -> anyhow::Result<bool> {
@@ -720,6 +731,17 @@ impl PlaybackSessionManager {
                 ps.as_ref()
                     .map(|s| s.item_id)
             });
+        if let Some(item_id) = item_id {
+            self.stop_left_behind(
+                device_id,
+                user.id,
+                item_id,
+                psid,
+                data.play_session_id
+                    .is_none(),
+            )
+            .await;
+        }
         let final_ticks = data
             .position_ticks
             .or_else(|| {
@@ -812,25 +834,43 @@ impl PlaybackSessionManager {
 
     /// Insert (or replace) a playback session, preserving any transcode that was
     /// pre-attached before `report_playback_start` fired.
-    /// Removes stale sessions for the same device so `get_sessions` always
-    /// finds the most recent playback.
+    /// Ends the user's earlier sessions of the same item on the device that
+    /// have no transcode: the client restarted that playback under a new play
+    /// session. The others, whatever their item, are ended by
+    /// `end_left_playbacks` once their client has left them.
     pub async fn insert(&self, mut session: PlaybackSession) {
-        // Remove any previous session for this device (different play_session_id).
+        // Only the same user's: another user signed in on the device has a
+        // playback of their own. Without a transcode there are no requests
+        // to tell a playback left behind from another tab's (jellyfin-web
+        // tabs share their DeviceId), so only the same item's is replaced.
         // Unreported transcode stubs are left alone: a start report without
         // (or with another) PlaySessionId must not kill the stream it reports.
         if !session
             .device_id
             .is_empty()
         {
+            if session.is_reported() {
+                self.latest_starts
+                    .entry((
+                        session
+                            .device_id
+                            .clone(),
+                        session.user_id,
+                    ))
+                    .and_modify(|at| *at = (*at).max(session.reported_at))
+                    .or_insert(session.reported_at);
+            }
             let stale: Vec<String> = self
                 .sessions
                 .iter()
                 .filter(|e| {
-                    e.value()
-                        .device_id
-                        == session.device_id
-                        && e.value()
-                            .is_reported()
+                    let s = e.value();
+                    s.device_id == session.device_id
+                        && s.is_reported()
+                        && s.user_id == session.user_id
+                        && s.item_id == session.item_id
+                        && s.transcode
+                            .is_none()
                         && e.key() != &session.play_session_id
                 })
                 .map(|e| {
@@ -946,17 +986,19 @@ impl PlaybackSessionManager {
             .collect()
     }
 
-    /// Return the most recently active reported session for a device.
+    /// Return `user_id`'s most recently active reported session on a device.
     /// Used as a fallback when the client omits PlaySessionId (e.g. DirectPlay).
-    pub fn get_by_device(&self, device_id: &str) -> Option<PlaybackSession> {
+    /// Another user signed in with the same DeviceId has sessions of their own.
+    pub fn get_by_device(
+        &self,
+        device_id: &str,
+        user_id: Uuid,
+    ) -> Option<PlaybackSession> {
         self.sessions
             .iter()
             .filter(|e| {
-                e.value()
-                    .device_id
-                    == device_id
-                    && e.value()
-                        .is_reported()
+                let s = e.value();
+                s.device_id == device_id && s.user_id == user_id && s.is_reported()
             })
             .max_by_key(|e| {
                 e.value()
@@ -968,10 +1010,40 @@ impl PlaybackSessionManager {
             })
     }
 
+    /// `get_by_device` for a request whose user isn't known (no token): the
+    /// device's session, if only one user has reported sessions on it.
+    pub fn get_by_device_of_its_only_user(
+        &self,
+        device_id: &str,
+    ) -> Option<PlaybackSession> {
+        let user_id = {
+            let mut users = self
+                .sessions
+                .iter()
+                .filter(|e| {
+                    e.value()
+                        .device_id
+                        == device_id
+                        && e.value()
+                            .is_reported()
+                })
+                .map(|e| {
+                    e.value()
+                        .user_id
+                });
+            let user_id = users.next()?;
+            if users.any(|other| other != user_id) {
+                return None;
+            }
+            user_id
+        };
+        self.get_by_device(device_id, user_id)
+    }
+
     /// Count active sessions for a user, optionally excluding sessions from a
     /// specific device. Excluding the caller's device is correct when checking
-    /// before `insert()`, since insert() replaces any existing session for that
-    /// device and it shouldn't count toward the limit.
+    /// before `insert()`: as with a Jellyfin session, a device counts as one
+    /// stream, the one it starts now.
     pub fn count_for_user(&self, user_id: Uuid, exclude_device: Option<&str>) -> usize {
         self.sessions
             .iter()
@@ -1095,6 +1167,7 @@ impl PlaybackSessionManager {
                         now_playing_queue: None,
                         playlist_item_id: None,
                         started_at: Utc::now(),
+                        reported_at: std::time::Instant::now(),
                         last_activity: Utc::now(),
                         last_report: None,
                         group_id: None,
@@ -1264,6 +1337,262 @@ impl PlaybackSessionManager {
         }
     }
 
+    /// End the reported playbacks their client left for a newer one of its
+    /// user on the device without a stop report: a closed tab, then a new
+    /// one; a channel zap of a client that skips Stopped. Whatever its item,
+    /// a playback is left once its client sent no report on it since the
+    /// newer one's start report (which may have stopped since), nor for
+    /// `REPORTS_LEFT_AFTER`, and, with a transcode, made no request of it
+    /// since then, nor for two of the segments ffmpeg cut (see
+    /// `left_for_playback`). Another tab playing on the shared DeviceId
+    /// reports after that start, paused too, so it is kept. The session
+    /// goes too: it would show as now playing after the newer playback
+    /// stops, and count as a stream, until the idle reaper.
+    pub async fn end_left_playbacks(&self, now: std::time::Instant) {
+        let reported: Vec<_> = self
+            .sessions
+            .iter()
+            .filter(|e| {
+                e.value()
+                    .is_reported()
+                    && !e
+                        .value()
+                        .device_id
+                        .is_empty()
+            })
+            .map(|e| {
+                let s = e.value();
+                (
+                    e.key()
+                        .clone(),
+                    (
+                        s.device_id
+                            .clone(),
+                        s.user_id,
+                    ),
+                    s.reported_at,
+                    s.last_report,
+                    s.transcode
+                        .clone(),
+                )
+            })
+            .collect();
+        // A start is only needed while an older playback of its owner is left.
+        self.latest_starts
+            .retain(|owner, latest| {
+                reported
+                    .iter()
+                    .any(|(_, other_owner, reported_at, _, _)| {
+                        other_owner == owner && reported_at < latest
+                    })
+            });
+        for (id, owner, reported_at, last_report, ts) in &reported {
+            let newer: Vec<_> = reported
+                .iter()
+                .filter(|(other, other_owner, other_reported_at, _, _)| {
+                    other != id
+                        && other_owner == owner
+                        && other_reported_at > reported_at
+                })
+                .map(|(_, _, other_reported_at, _, _)| *other_reported_at)
+                .chain(
+                    // Kept after the playback it started stopped.
+                    self.latest_starts
+                        .get(owner)
+                        .map(|latest| *latest)
+                        .filter(|latest| latest > reported_at),
+                )
+                .collect();
+            // A paused player stops requesting segments, so a transcode is
+            // measured from the first playback started after it: a tab that
+            // requested since then is still there. Reports go on while
+            // paused, so without a transcode the latest start will do.
+            let since = if ts.is_some() {
+                newer
+                    .iter()
+                    .min()
+            } else {
+                newer
+                    .iter()
+                    .max()
+            };
+            let Some(&since) = since else {
+                continue;
+            };
+            // Its client also stops reporting it: a paused player requests
+            // no segments, but goes on reporting.
+            if !reports_left(*last_report, since, now) {
+                continue;
+            }
+            if let Some(ts) = ts
+                && !left_for_playback(ts, since, now).await
+            {
+                continue;
+            }
+            // A seek restarts the session's transcode under this lock; a
+            // report, or a transcode, may have come in meanwhile.
+            let _create = TRANSCODE_CREATE_LOCKS
+                .lock_if_exists(id)
+                .await;
+            let still_left = self
+                .sessions
+                .get(id)
+                .is_some_and(|s| {
+                    let same_transcode = match (&s.transcode, ts) {
+                        (Some(current), Some(ts)) => Arc::ptr_eq(current, ts),
+                        (None, None) => true,
+                        _ => false,
+                    };
+                    same_transcode && reports_left(s.last_report, since, now)
+                });
+            if still_left {
+                self.end_left_playback(id)
+                    .await;
+            }
+        }
+    }
+
+    async fn end_left_playback(&self, id: &str) {
+        info!(
+            play_session_id = %id,
+            "Ending playback the device left for a newer one of its user"
+        );
+        self.stop(id, StopMode::Detached)
+            .await;
+    }
+
+    /// End what a stop report of `item_id` by `user_id` leaves behind on
+    /// `device_id` under other play sessions than `play_session_id`.
+    ///
+    /// That is the user's reported sessions of the item whose ffmpeg stream was
+    /// already stopped (superseded, or DELETE ActiveEncodings): the client
+    /// switched streams under a new play session, and reports on that one.
+    /// With a live transcode, or never served by ffmpeg, a session may be
+    /// another tab still playing the item, so it is kept.
+    ///
+    /// `unnamed`: the report carried no PlaySessionId, so it was matched to
+    /// the device's reported session; the transcodes it played are the
+    /// device's unclaimed ones of the item.
+    async fn stop_left_behind(
+        &self,
+        device_id: &str,
+        user_id: Uuid,
+        item_id: Uuid,
+        play_session_id: &str,
+        unnamed: bool,
+    ) {
+        if device_id.is_empty() {
+            return;
+        }
+        let abandoned: Vec<String> = self
+            .sessions
+            .iter()
+            .filter(|e| {
+                let s = e.value();
+                e.key() != play_session_id
+                    && s.device_id == device_id
+                    && s.is_reported()
+                    && s.user_id == user_id
+                    && s.item_id == item_id
+                    && matches!(s.served, Some(ServedPlayback::Ffmpeg { .. }))
+                    && s.transcode
+                        .is_none()
+            })
+            .map(|e| {
+                e.key()
+                    .clone()
+            })
+            .collect();
+        for id in abandoned {
+            // A seek restarts its session's transcode under this lock: once
+            // it is ours, a seeking session has its transcode again.
+            let _create = TRANSCODE_CREATE_LOCKS
+                .lock_if_exists(&id)
+                .await;
+            if self
+                .sessions
+                .get(&id)
+                .is_some_and(|s| {
+                    s.transcode
+                        .is_none()
+                })
+            {
+                info!(
+                    play_session_id = %id,
+                    stopped_play_session_id = play_session_id,
+                    "Ending play session the device switched streams away from"
+                );
+                self.stop(&id, StopMode::Detached)
+                    .await;
+            }
+        }
+        if unnamed {
+            self.stop_unclaimed_transcodes(device_id, user_id, item_id)
+                .await;
+        }
+    }
+
+    /// Stop `user_id`'s transcodes of `item_id` on `device_id` that no playback
+    /// report has claimed, for a stop report without PlaySessionId: its
+    /// client's reports went to a generated play session, never to the
+    /// transcode it played. Returns whether any was stopped.
+    pub async fn stop_unclaimed_transcodes(
+        &self,
+        device_id: &str,
+        user_id: Uuid,
+        item_id: Uuid,
+    ) -> bool {
+        if device_id.is_empty() {
+            return false;
+        }
+        let stubs: Vec<_> = self
+            .sessions
+            .iter()
+            .filter(|e| {
+                e.value()
+                    .device_id
+                    == device_id
+                    && !e
+                        .value()
+                        .is_reported()
+            })
+            .filter_map(|e| {
+                Some((
+                    e.key()
+                        .clone(),
+                    e.value()
+                        .transcode
+                        .clone()?,
+                ))
+            })
+            .collect();
+        let mut stopped = false;
+        for (id, ts) in stubs {
+            let of_the_stop = {
+                let t = ts
+                    .read()
+                    .await;
+                t.user_id == user_id && t.item_id == item_id
+            };
+            if !of_the_stop {
+                continue;
+            }
+            info!(
+                play_session_id = %id,
+                %item_id,
+                "Stopping unclaimed transcode of the item stopped with no play session"
+            );
+            // Stop a transcode still being created for it too.
+            let _create = TRANSCODE_CREATE_LOCKS
+                .lock_if_exists(&id)
+                .await;
+            stopped |= self
+                .stop(&id, StopMode::Detached)
+                .await
+                .is_some();
+        }
+        stopped
+    }
     /// Stop and remove the transcode from a session, keeping the session.
     pub async fn stop_transcode(&self, id: &str, mode: StopMode) {
         let ts = self
@@ -1434,8 +1763,9 @@ impl PlaybackSessionManager {
             .expect("handoff lock is not poisoned") = false;
     }
 
-    /// Spawn a background task that stops abandoned transcodes every
-    /// `interval` (see `supersede_abandoned_transcodes`).
+    /// Spawn a background task that ends left playbacks and stops abandoned
+    /// transcodes every `interval` (see `end_left_playbacks` and
+    /// `supersede_abandoned_transcodes`).
     pub fn spawn_supersede_task(self, interval: Duration) -> JoinHandle<()> {
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
@@ -1443,7 +1773,10 @@ impl PlaybackSessionManager {
                 ticker
                     .tick()
                     .await;
-                self.supersede_abandoned_transcodes(std::time::Instant::now())
+                let now = std::time::Instant::now();
+                self.end_left_playbacks(now)
+                    .await;
+                self.supersede_abandoned_transcodes(now)
                     .await;
             }
         })
@@ -1573,6 +1906,51 @@ impl PlaybackSessionManager {
     }
 }
 
+/// How long a playback goes without a report before its client has left
+/// it: Jellyfin clients report progress every 10 s (jellyfin-web) to 15 s
+/// (Android TV), paused too; this leaves room for a missed one.
+const REPORTS_LEFT_AFTER: Duration = Duration::from_secs(30);
+
+/// Whether a client last reporting on a playback at `last_report` (never:
+/// `None`) left it for one begun at `since`, as of `now`.
+fn reports_left(
+    last_report: Option<std::time::Instant>,
+    since: std::time::Instant,
+    now: std::time::Instant,
+) -> bool {
+    last_report.is_none_or(|last_report| {
+        last_report < since
+            && now.saturating_duration_since(last_report) >= REPORTS_LEFT_AFTER
+    })
+}
+
+/// Whether `ts`'s client left it for a playback begun at `since`: no request
+/// started since then, and none for two of the segments ffmpeg cut, which
+/// with a copied video end at the source's keyframes, so may be longer than
+/// requested.
+async fn left_for_playback(
+    ts: &Arc<tokio::sync::RwLock<TranscodeSession>>,
+    since: std::time::Instant,
+    now: std::time::Instant,
+) -> bool {
+    let playlist = {
+        let s = ts
+            .read()
+            .await;
+        if s.stopped || !s.left_for(since) || !s.abandoned(now) {
+            return false;
+        }
+        s.variant_playlist_path()
+    };
+    let longest = tokio::fs::read_to_string(playlist)
+        .await
+        .map(|playlist| longest_segment(&playlist))
+        .unwrap_or_default();
+    ts.read()
+        .await
+        .abandoned_with_segments_of(now, longest)
+}
+
 fn retain_leases(
     target: &mut Vec<Arc<crate::torrent::TorrentLease>>,
     leases: Vec<Arc<crate::torrent::TorrentLease>>,
@@ -1676,6 +2054,7 @@ mod tests {
             now_playing_queue: None,
             playlist_item_id: None,
             started_at: Utc::now(),
+            reported_at: std::time::Instant::now(),
             last_activity: Utc::now(),
             last_report: None,
             transcode: None,
@@ -2432,8 +2811,9 @@ mod tests {
         assert!(attach(&sessions, "hls", "phone", ts.clone()));
 
         // `start` makes up a PlaySessionId when the report has none.
+        let user = Uuid::new_v4();
         let mut report = playback_session("generated", PlayMethod::Transcode);
-        report.user_id = Uuid::new_v4();
+        report.user_id = user;
         report.device_id = "phone".to_string();
         sessions
             .insert(report)
@@ -2451,10 +2831,501 @@ mod tests {
         );
         assert_eq!(
             sessions
-                .get_by_device("phone")
+                .get_by_device("phone", user)
                 .map(|s| s.play_session_id),
             Some("generated".to_string())
         );
+        // Another user signed in on the device has no session there.
+        assert!(
+            sessions
+                .get_by_device("phone", Uuid::new_v4())
+                .is_none()
+        );
+    }
+
+    fn reported(id: &str, user: Uuid, device: &str, item: Uuid) -> PlaybackSession {
+        let mut session = playback_session(id, PlayMethod::Transcode);
+        session.user_id = user;
+        session.device_id = device.to_string();
+        session.item_id = item;
+        session
+    }
+
+    /// A reported session served by ffmpeg, its transcode not attached.
+    fn streamed(id: &str, user: Uuid, item: Uuid) -> PlaybackSession {
+        let mut session = reported(id, user, "browser", item);
+        session.served = Some(transcoded());
+        session
+    }
+
+    /// Put a session in place without `insert` replacing any.
+    fn put(sessions: &PlaybackSessionManager, session: PlaybackSession) {
+        sessions
+            .sessions
+            .insert(
+                session
+                    .play_session_id
+                    .clone(),
+                session,
+            );
+    }
+
+    #[tokio::test]
+    async fn a_start_report_replaces_only_the_users_untranscoded_session_of_the_item() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions = PlaybackSessionManager::new(temp.path());
+        let (user, other_user) = (Uuid::new_v4(), Uuid::new_v4());
+        let (item, other_item) = (Uuid::new_v4(), Uuid::new_v4());
+        // A tab transcoding the item: `end_left_playbacks` judges it.
+        sessions
+            .insert(reported("transcoded", user, "browser", item))
+            .await;
+        let transcoded_ts = transcode_of(temp.path(), "transcoded", user, item);
+        assert!(attach(
+            &sessions,
+            "transcoded",
+            "browser",
+            transcoded_ts.clone()
+        ));
+        // Direct played: the same item's, a second tab's of another item on
+        // the shared DeviceId, and another user's signed in on the device.
+        for (id, session_user, session_item) in [
+            ("direct", user, item),
+            ("other-item", user, other_item),
+            ("other-user", other_user, item),
+        ] {
+            sessions
+                .insert(reported(id, session_user, "browser", session_item))
+                .await;
+        }
+
+        // The item restarted under a new play session.
+        sessions
+            .insert(reported("restarted", user, "browser", item))
+            .await;
+
+        assert!(
+            sessions
+                .get("direct")
+                .is_none()
+        );
+        for id in ["transcoded", "other-item", "other-user", "restarted"] {
+            assert!(
+                sessions
+                    .get(id)
+                    .is_some(),
+                "{id}"
+            );
+        }
+        assert!(
+            !transcoded_ts
+                .read()
+                .await
+                .stopped
+        );
+    }
+
+    #[tokio::test]
+    async fn a_playback_left_for_a_newer_one_of_its_user_ends_whatever_its_item() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions = PlaybackSessionManager::new(temp.path());
+        let (user, other_user) = (Uuid::new_v4(), Uuid::new_v4());
+        let start = std::time::Instant::now();
+        let at = |secs| start + Duration::from_secs(secs);
+        // (id, device, user, started, last request, last report): each its
+        // own item.
+        let playbacks = [
+            // Closed (or zapped away from) before the newer ones started.
+            ("left", "browser", user, 0, 0, 0),
+            // Another tab, which requested after the ones after it started
+            // (its reports were lost).
+            ("requesting-tab", "browser", user, 1, 30, 0),
+            // Another tab, paused before "newer" started: no requests, but
+            // it goes on reporting.
+            ("paused-tab", "browser", user, 2, 5, 95),
+            ("newer", "browser", user, 20, 99, 99),
+            // Another user's on the device, and the user's on another one.
+            ("other-user", "browser", other_user, 0, 0, 0),
+            ("other-device", "tv", user, 0, 0, 0),
+        ];
+        let mut transcodes = Vec::new();
+        for (id, device, session_user, started, last_request, last_report) in playbacks
+        {
+            let mut session = reported(id, session_user, device, Uuid::new_v4());
+            session.reported_at = at(started);
+            session.last_report = Some(at(last_report));
+            let item = session.item_id;
+            put(&sessions, session);
+            let ts = transcode_of(temp.path(), id, session_user, item);
+            created(&ts, at(started)).await;
+            requested(&ts, at(last_request)).await;
+            assert!(attach(&sessions, id, device, ts.clone()));
+            transcodes.push((id, ts));
+        }
+
+        sessions
+            .end_left_playbacks(at(100))
+            .await;
+
+        for (id, ts) in transcodes {
+            let left = id == "left";
+            assert_eq!(
+                sessions
+                    .get(id)
+                    .is_none(),
+                left,
+                "{id}"
+            );
+            assert_eq!(
+                ts.read()
+                    .await
+                    .stopped,
+                left,
+                "{id}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_playback_left_for_a_newer_one_is_kept_until_abandoned() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions = PlaybackSessionManager::new(temp.path());
+        let user = Uuid::new_v4();
+        let start = std::time::Instant::now();
+        let at = |secs| start + Duration::from_secs(secs);
+        // A channel zap: the last request and report a second before the
+        // next channel.
+        for (id, started, last) in [("ch1", 0, 9), ("ch2", 10, 30)] {
+            let mut session = reported(id, user, "tv", Uuid::new_v4());
+            session.reported_at = at(started);
+            session.last_report = Some(at(last));
+            let item = session.item_id;
+            put(&sessions, session);
+            let ts = transcode_of(temp.path(), id, user, item);
+            created(&ts, at(started)).await;
+            requested(&ts, at(last)).await;
+            assert!(attach(&sessions, id, "tv", ts));
+        }
+
+        // 11 s without a request, under two 6 s segments: maybe a stall.
+        // Then 12 s, abandoned, but 12 s without a report: maybe a slow
+        // network. Then 29 s.
+        for secs in [20, 21, 38] {
+            sessions
+                .end_left_playbacks(at(secs))
+                .await;
+            assert!(
+                sessions
+                    .get_transcode("ch1")
+                    .is_some(),
+                "{secs}"
+            );
+        }
+
+        sessions
+            .end_left_playbacks(at(39))
+            .await;
+        assert!(
+            sessions
+                .get("ch1")
+                .is_none()
+        );
+        assert!(
+            sessions
+                .get_transcode("ch2")
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_direct_play_left_for_a_newer_one_ends_once_it_stops_reporting() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions = PlaybackSessionManager::new(temp.path());
+        let user = Uuid::new_v4();
+        let start = std::time::Instant::now();
+        let at = |secs| start + Duration::from_secs(secs);
+        // (id, started, last report), each its own item, none transcoded.
+        for (id, started, last_report) in [
+            // The app closed 5 s in; the newer playback started at 20 s.
+            ("left", 0, 5),
+            // Another tab, still reporting.
+            ("reporting-tab", 1, 30),
+            ("newer", 20, 30),
+        ] {
+            let mut session = reported(id, user, "browser", Uuid::new_v4());
+            session.served = Some(ServedPlayback::Direct);
+            session.reported_at = at(started);
+            session.last_report = Some(at(last_report));
+            put(&sessions, session);
+        }
+
+        // 29 s without a report: maybe a slow network.
+        sessions
+            .end_left_playbacks(at(34))
+            .await;
+        assert!(
+            sessions
+                .get("left")
+                .is_some()
+        );
+
+        sessions
+            .end_left_playbacks(at(35))
+            .await;
+        for (id, kept) in [("left", false), ("reporting-tab", true), ("newer", true)] {
+            assert_eq!(
+                sessions
+                    .get(id)
+                    .is_some(),
+                kept,
+                "{id}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_playback_left_for_one_stopped_since_still_ends() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions = PlaybackSessionManager::new(temp.path());
+        let user = Uuid::new_v4();
+        let start = std::time::Instant::now();
+        let at = |secs| start + Duration::from_secs(secs);
+        let item = Uuid::new_v4();
+        let mut left = reported("left", user, "tv", item);
+        left.reported_at = at(0);
+        left.last_report = Some(at(9));
+        put(&sessions, left);
+        let left_ts = transcode_of(temp.path(), "left", user, item);
+        created(&left_ts, at(0)).await;
+        requested(&left_ts, at(9)).await;
+        assert!(attach(&sessions, "left", "tv", left_ts.clone()));
+        // A newer playback starts at 10 s and stops at 16 s, before the
+        // left one counts as abandoned.
+        let mut newer = reported("newer", user, "tv", Uuid::new_v4());
+        newer.reported_at = at(10);
+        sessions
+            .insert(newer)
+            .await;
+        sessions
+            .stop("newer", StopMode::Detached)
+            .await;
+
+        sessions
+            .end_left_playbacks(at(39))
+            .await;
+        assert!(
+            sessions
+                .get("left")
+                .is_none()
+        );
+        assert!(
+            left_ts
+                .read()
+                .await
+                .stopped
+        );
+        // Nothing older is left to measure against that start.
+        sessions
+            .end_left_playbacks(at(41))
+            .await;
+        assert!(
+            sessions
+                .latest_starts
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_request_without_user_finds_the_session_of_the_devices_only_user() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions = PlaybackSessionManager::new(temp.path());
+        let user = Uuid::new_v4();
+        put(&sessions, reported("first", user, "tv", Uuid::new_v4()));
+        put(&sessions, reported("second", user, "tv", Uuid::new_v4()));
+        assert!(
+            sessions
+                .get_by_device_of_its_only_user("tv")
+                .is_some()
+        );
+        // A transcode stub has no user to tell apart.
+        assert!(attach(
+            &sessions,
+            "stub",
+            "tv",
+            transcode(temp.path(), "stub", Uuid::new_v4())
+        ));
+        assert!(
+            sessions
+                .get_by_device_of_its_only_user("tv")
+                .is_some()
+        );
+
+        // Two users signed in on the device: whose request is it?
+        put(
+            &sessions,
+            reported("other", Uuid::new_v4(), "tv", Uuid::new_v4()),
+        );
+        assert!(
+            sessions
+                .get_by_device_of_its_only_user("tv")
+                .is_none()
+        );
+        assert!(
+            sessions
+                .get_by_device_of_its_only_user("phone")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stop_ends_the_users_session_the_device_switched_streams_away_from() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions = PlaybackSessionManager::new(temp.path());
+        let (user, other_user) = (Uuid::new_v4(), Uuid::new_v4());
+        let (item, other_item) = (Uuid::new_v4(), Uuid::new_v4());
+        // Before the stream switch: its transcode was superseded, and the
+        // client reports on its new play session since.
+        put(&sessions, streamed("switched-from", user, item));
+        // Another tab still transcoding the item.
+        put(&sessions, streamed("tab", user, item));
+        assert!(attach(
+            &sessions,
+            "tab",
+            "browser",
+            transcode(temp.path(), "tab", item)
+        ));
+        // Another tab direct playing it: no transcode to lose.
+        let mut direct = reported("direct", user, "browser", item);
+        direct.served = Some(ServedPlayback::Direct);
+        put(&sessions, direct);
+        put(&sessions, streamed("other-user", other_user, item));
+        put(&sessions, streamed("other-item", user, other_item));
+        let mut other_device = streamed("other-device", user, item);
+        other_device.device_id = "tv".to_string();
+        put(&sessions, other_device);
+
+        sessions
+            .stop_left_behind("browser", user, item, "switched-to", false)
+            .await;
+
+        assert!(
+            sessions
+                .get("switched-from")
+                .is_none()
+        );
+        for id in ["tab", "direct", "other-user", "other-item", "other-device"] {
+            assert!(
+                sessions
+                    .get(id)
+                    .is_some(),
+                "{id}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_session_between_the_transcodes_of_a_seek_is_not_ended() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions = PlaybackSessionManager::new(temp.path());
+        let user = Uuid::new_v4();
+        let item = Uuid::new_v4();
+        // A seek stopped its transcode and is creating the next one.
+        put(&sessions, streamed("seeking", user, item));
+        let creating = TRANSCODE_CREATE_LOCKS
+            .lock("seeking".to_string())
+            .await;
+        let stop = tokio::spawn({
+            let sessions = sessions.clone();
+            async move {
+                sessions
+                    .stop_left_behind("browser", user, item, "other-tab", false)
+                    .await
+            }
+        });
+        // Let the stop find the session without a transcode and wait.
+        tokio::task::yield_now().await;
+        assert!(attach(
+            &sessions,
+            "seeking",
+            "browser",
+            transcode(temp.path(), "seeking", item)
+        ));
+        drop(creating);
+        stop.await
+            .unwrap();
+
+        assert!(
+            sessions
+                .get_transcode("seeking")
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stop_without_play_session_stops_the_unclaimed_transcode_of_the_item() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions = PlaybackSessionManager::new(temp.path());
+        let user = Uuid::new_v4();
+        let item = Uuid::new_v4();
+        // Reports without PlaySessionId went to a generated session; the
+        // stream they were about is a transcode no report claimed.
+        put(&sessions, reported("generated", user, "browser", item));
+        let played = transcode_of(temp.path(), "hls", user, item);
+        assert!(attach(&sessions, "hls", "browser", played.clone()));
+        let kept = [
+            ("other-item", "browser", user, Uuid::new_v4()),
+            ("other-device", "tv", user, item),
+            // Another user signed in on the device, playing the item too.
+            ("other-user", "browser", Uuid::new_v4(), item),
+        ];
+        for (id, device, kept_user, kept_item) in kept {
+            assert!(attach(
+                &sessions,
+                id,
+                device,
+                transcode_of(temp.path(), id, kept_user, kept_item)
+            ));
+        }
+
+        // A report naming its play session says nothing about other streams.
+        sessions
+            .stop_left_behind("browser", user, item, "generated", false)
+            .await;
+        assert!(
+            sessions
+                .get_transcode("hls")
+                .is_some()
+        );
+
+        sessions
+            .stop_left_behind("browser", user, item, "generated", true)
+            .await;
+        assert!(
+            sessions
+                .get("hls")
+                .is_none()
+        );
+        assert!(
+            played
+                .read()
+                .await
+                .stopped
+        );
+        assert!(
+            removed(
+                temp.path()
+                    .join("hls")
+            )
+            .await
+        );
+        for (id, _, _, _) in kept {
+            assert!(
+                sessions
+                    .get_transcode(id)
+                    .is_some(),
+                "{id}"
+            );
+        }
     }
 
     #[tokio::test]

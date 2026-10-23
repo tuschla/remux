@@ -800,7 +800,7 @@ pub async fn system_restart(
 
     // Returns only if the new process could not be spawned: this one keeps
     // serving, so it must transcode again.
-    if let Err(e) = restart_server().await {
+    if let Err(e) = restart_server() {
         state
             .ctx
             .sessions
@@ -814,8 +814,22 @@ pub async fn system_restart(
     })))
 }
 
+/// How long the process outlives a restart or shutdown response: the client
+/// has its answer by then, and a restart's new process has had a moment to
+/// start.
+const EXIT_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Run `exit` from a task once `delay` has passed. Exiting inside the handler
+/// would drop the connection before the response is written.
+fn exit_later(delay: std::time::Duration, exit: impl FnOnce() + Send + 'static) {
+    tokio::spawn(async move {
+        tokio::time::sleep(delay).await;
+        exit();
+    });
+}
+
 /// Actually restart the server process
-async fn restart_server() -> Result<()> {
+fn restart_server() -> Result<()> {
     info!("Initiating server restart...");
 
     // Get the current executable path and arguments
@@ -835,15 +849,13 @@ async fn restart_server() -> Result<()> {
     }
 
     // Start the new process
-    let mut child = command.spawn()?;
+    let child = command.spawn()?;
 
     info!("New server process started with PID: {}", child.id());
 
-    // Give the new process a moment to start
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
-    // Exit the current process
-    std::process::exit(0);
+    // Exit the current process once the response is out
+    exit_later(EXIT_DELAY, || std::process::exit(0));
+    Ok(())
 }
 
 /// Shutdown the server (Admin only)
@@ -866,27 +878,14 @@ pub async fn system_shutdown(
         .stop_all()
         .await;
 
-    // Trigger actual server shutdown
-    shutdown_server().await?;
+    info!("Server is shutting down gracefully");
+    // Exit the process once the response is out
+    exit_later(EXIT_DELAY, || std::process::exit(0));
 
     Ok(Json(json!({
         "Message": "Server shutdown initiated",
         "IsShuttingDown": true
     })))
-}
-
-/// Actually shutdown the server process
-async fn shutdown_server() -> Result<()> {
-    info!("Initiating server shutdown...");
-
-    // Perform graceful shutdown
-    info!("Server is shutting down gracefully");
-
-    // Give a moment for cleanup
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
-    // Exit the process
-    std::process::exit(0);
 }
 
 #[get("/system/info")]
@@ -928,6 +927,23 @@ mod test {
     use axum_test::expect_json;
     use http::header::HeaderValue;
     use serde_json::json;
+
+    /// A restart or shutdown exits after its handler returned, so the client
+    /// gets the response instead of a dropped connection.
+    #[tokio::test]
+    async fn exit_waits_for_the_handler_to_return() {
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        exit_later(std::time::Duration::ZERO, move || {
+            let _ = tx.send(());
+        });
+        // The caller still runs, and answers, before the exit.
+        assert!(
+            rx.try_recv()
+                .is_err()
+        );
+        rx.await
+            .expect("exit runs once the handler yields");
+    }
 
     #[tokio::test]
     async fn web_manifest_test() {
