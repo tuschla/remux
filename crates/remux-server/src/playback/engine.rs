@@ -2065,6 +2065,12 @@ pub async fn start_transcode(
                 let mut s = session_clone
                     .write()
                     .await;
+                // A stop between a seek restart's decision and here found no
+                // ffmpeg to kill; don't start one it can't stop.
+                if stopped.is_cancelled() {
+                    debug!(session_id = %s.id, "session stopped before ffmpeg started");
+                    break;
+                }
                 s.start_time_secs = params
                     .start_time_ticks
                     .map(|t| (t / 10_000_000) as u32)

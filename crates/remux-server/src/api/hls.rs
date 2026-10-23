@@ -28,9 +28,9 @@ use crate::{
     playback_session::{FfmpegTrack, ServedPlayback},
 };
 
-/// Serializes the lookup-or-create-transcode sequence per play_session_id so
-/// two racing requests for the same session can't each spawn their own
-/// ffmpeg process.
+/// Serializes the lookup-or-create-transcode sequence and segment-driven seek
+/// restarts per play_session_id so two racing requests for the same session
+/// can't each spawn their own ffmpeg process.
 static TRANSCODE_CREATE_LOCKS: crate::keyed_lock::KeyedLock<String> =
     crate::keyed_lock::KeyedLock::new();
 
@@ -1102,8 +1102,45 @@ enum MissingSegment {
     Wait,
     /// VOD seek: restart ffmpeg at the requested segment.
     Restart,
-    /// Live segment that was already cleaned up or will never be written.
+    /// Segment that was already cleaned up or will never be written.
     Gone,
+}
+
+/// What a session's ffmpeg is doing, as far as a missing segment cares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FfmpegRun {
+    /// Running; a seek restart kills it first.
+    Running,
+    /// Being (re)started, or a live run stopped for an idle client that the
+    /// engine restarts on the next request: no process to kill, segments
+    /// are coming.
+    Starting,
+    /// Exited on its own (complete or failed): nothing more will be written.
+    Finished,
+    /// The session was stopped: it must not get a new ffmpeg.
+    Stopped,
+}
+
+impl FfmpegRun {
+    fn of(s: &TranscodeSession) -> Self {
+        // The engine clears `kill_tx` and records Complete/Error under the
+        // same write lock, and a killed run keeps its Running state.
+        if s.stopped
+            .is_cancelled()
+        {
+            FfmpegRun::Stopped
+        } else if s
+            .kill_tx
+            .is_some()
+        {
+            FfmpegRun::Running
+        } else if matches!(s.state, TranscodeState::Error(_) | TranscodeState::Complete)
+        {
+            FfmpegRun::Finished
+        } else {
+            FfmpegRun::Starting
+        }
+    }
 }
 
 /// Live sessions are never restarted: `-ss` on a live input produces nothing
@@ -1116,27 +1153,33 @@ fn missing_segment_action(
     is_live: bool,
     requested_idx: u32,
     current_idx: Option<u32>,
-    finished: bool,
+    run: FfmpegRun,
     segment_gap_threshold: u32,
 ) -> MissingSegment {
+    if run == FfmpegRun::Stopped {
+        return MissingSegment::Gone;
+    }
     if is_live {
         return match current_idx {
-            _ if finished => MissingSegment::Gone,
+            _ if run == FfmpegRun::Finished => MissingSegment::Gone,
             Some(cur) if requested_idx < cur => MissingSegment::Gone,
             _ => MissingSegment::Wait,
         };
     }
-    match current_idx {
+    let seek = match current_idx {
         // No segments on disk yet. If FFmpeg is still running, wait for it:
         // killing it here causes an infinite restart cycle.
-        None if finished => MissingSegment::Restart,
-        None => MissingSegment::Wait,
+        None => run == FfmpegRun::Finished,
         // Seeking backward.
-        Some(cur) if requested_idx < cur => MissingSegment::Restart,
+        Some(cur) if requested_idx < cur => true,
         // Too far ahead.
-        Some(cur) if requested_idx.saturating_sub(cur) > segment_gap_threshold => {
-            MissingSegment::Restart
-        }
+        Some(cur) => requested_idx.saturating_sub(cur) > segment_gap_threshold,
+    };
+    match run {
+        // A finished run must be restarted too: nothing else will ever write
+        // the segment, and the session could never seek back again.
+        FfmpegRun::Running | FfmpegRun::Finished if seek => MissingSegment::Restart,
+        // Another request is restarting ffmpeg already.
         _ => MissingSegment::Wait,
     }
 }
@@ -1326,12 +1369,16 @@ async fn hls_segment_inner(
                 s.is_live,
                 requested_idx,
                 current_idx,
-                matches!(s.state, TranscodeState::Error(_) | TranscodeState::Complete),
+                FfmpegRun::of(&s),
                 segment_gap_threshold,
             );
 
             if action == MissingSegment::Gone {
-                debug!(requested_idx, ?current_idx, "Live segment already removed");
+                debug!(
+                    requested_idx,
+                    ?current_idx,
+                    "Segment removed or never to be written"
+                );
                 None::<()>.context_not_found(&format!(
                     "segment {} is no longer available",
                     segment_id
@@ -1339,19 +1386,36 @@ async fn hls_segment_inner(
             }
 
             if action == MissingSegment::Restart {
-                // Guard against concurrent restart: only proceed if FFmpeg
-                // is actually running (kill_tx is Some). If another request
-                // already killed it and started a new one, just wait.
-                let has_running_ffmpeg = s
-                    .kill_tx
-                    .is_some();
-                if !has_running_ffmpeg {
+                // Decide again under the per-session lock, held until the
+                // new run is marked Starting: a concurrent request may have
+                // restarted ffmpeg meanwhile, and two restarts would leave
+                // two ffmpegs writing into one directory.
+                drop(s);
+                let _restart_guard = TRANSCODE_CREATE_LOCKS
+                    .lock(play_session_id.clone())
+                    .await;
+                let s = session
+                    .read()
+                    .await;
+                let run = FfmpegRun::of(&s);
+                let current_idx = get_current_transcoding_index(&output_dir);
+                let restart = !segment_path.exists()
+                    && missing_segment_action(
+                        s.is_live,
+                        requested_idx,
+                        current_idx,
+                        run,
+                        segment_gap_threshold,
+                    ) == MissingSegment::Restart;
+                if !restart {
                     drop(s);
-                    // Another request already restarted — fall through to wait loop.
+                    // Another request restarted ffmpeg or the segment appeared
+                    // meanwhile — fall through to the wait loop.
                 } else {
                     debug!(
                         requested_idx,
                         ?current_idx,
+                        ?run,
                         segment_gap_threshold,
                         "Segment-driven transcode restart"
                     );
@@ -1524,7 +1588,7 @@ async fn hls_segment_inner(
                             error!("Transcode restart failed: {:#}", e);
                         }
                     });
-                } // else: has_running_ffmpeg
+                } // else: restart
             } // MissingSegment::Restart
         }
     }
@@ -1674,33 +1738,102 @@ mod tests {
 
     #[test]
     fn live_missing_segment_is_never_seek_restarted() {
-        use super::{MissingSegment::*, missing_segment_action};
+        use super::{FfmpegRun::*, MissingSegment::*, missing_segment_action};
         // Requested segment already cleaned up: answer at once.
-        assert_eq!(missing_segment_action(true, 53, Some(64), false, 4), Gone);
+        assert_eq!(missing_segment_action(true, 53, Some(64), Running, 4), Gone);
         // Next segments, even far ahead: wait for ffmpeg, never restart.
-        assert_eq!(missing_segment_action(true, 65, Some(64), false, 4), Wait);
-        assert_eq!(missing_segment_action(true, 90, Some(64), false, 4), Wait);
+        assert_eq!(missing_segment_action(true, 65, Some(64), Running, 4), Wait);
+        assert_eq!(missing_segment_action(true, 90, Some(64), Running, 4), Wait);
         // ffmpeg restarting with an empty dir: wait.
-        assert_eq!(missing_segment_action(true, 0, None, false, 4), Wait);
+        assert_eq!(missing_segment_action(true, 0, None, Starting, 4), Wait);
         // Live ffmpeg gave up: nothing more will be written.
-        assert_eq!(missing_segment_action(true, 65, Some(64), true, 4), Gone);
-        assert_eq!(missing_segment_action(true, 0, None, true, 4), Gone);
+        assert_eq!(
+            missing_segment_action(true, 65, Some(64), Finished, 4),
+            Gone
+        );
+        assert_eq!(missing_segment_action(true, 0, None, Finished, 4), Gone);
     }
 
     #[test]
     fn vod_missing_segment_restarts_on_seek() {
-        use super::{MissingSegment::*, missing_segment_action};
+        use super::{FfmpegRun::*, MissingSegment::*, missing_segment_action};
         assert_eq!(
-            missing_segment_action(false, 53, Some(64), false, 4),
+            missing_segment_action(false, 53, Some(64), Running, 4),
             Restart
         );
         assert_eq!(
-            missing_segment_action(false, 70, Some(64), false, 4),
+            missing_segment_action(false, 70, Some(64), Running, 4),
             Restart
         );
-        assert_eq!(missing_segment_action(false, 66, Some(64), false, 4), Wait);
-        assert_eq!(missing_segment_action(false, 0, None, false, 4), Wait);
-        assert_eq!(missing_segment_action(false, 0, None, true, 4), Restart);
+        assert_eq!(
+            missing_segment_action(false, 66, Some(64), Running, 4),
+            Wait
+        );
+        assert_eq!(missing_segment_action(false, 0, None, Running, 4), Wait);
+        assert_eq!(missing_segment_action(false, 0, None, Finished, 4), Restart);
+    }
+
+    /// A forward seek's `-c copy` run can finish the file within a second;
+    /// seeking back afterwards must restart it, not wait 60 s for a 404.
+    #[test]
+    fn vod_seek_restarts_a_finished_transcode() {
+        use super::{FfmpegRun::*, MissingSegment::*, missing_segment_action};
+        assert_eq!(
+            missing_segment_action(false, 10, Some(1210), Finished, 4),
+            Restart
+        );
+        assert_eq!(
+            missing_segment_action(false, 70, Some(64), Finished, 4),
+            Restart
+        );
+        // Just past the end of a finished run: nothing to seek to.
+        assert_eq!(
+            missing_segment_action(false, 66, Some(64), Finished, 4),
+            Wait
+        );
+    }
+
+    /// While another request restarts ffmpeg there is nothing to kill; a
+    /// second restart would run two ffmpegs into one directory.
+    #[test]
+    fn vod_seek_waits_for_a_restart_in_progress() {
+        use super::{FfmpegRun::*, MissingSegment::*, missing_segment_action};
+        assert_eq!(
+            missing_segment_action(false, 10, Some(64), Starting, 4),
+            Wait
+        );
+        assert_eq!(
+            missing_segment_action(false, 70, Some(64), Starting, 4),
+            Wait
+        );
+        assert_eq!(missing_segment_action(false, 0, None, Starting, 4), Wait);
+    }
+
+    /// A stopped session must not get a new ffmpeg, even to seek.
+    #[test]
+    fn stopped_session_segment_is_gone() {
+        use super::{FfmpegRun::*, MissingSegment::*, missing_segment_action};
+        assert_eq!(
+            missing_segment_action(false, 10, Some(1210), Stopped, 4),
+            Gone
+        );
+        assert_eq!(missing_segment_action(false, 0, None, Stopped, 4), Gone);
+        assert_eq!(missing_segment_action(true, 65, Some(64), Stopped, 4), Gone);
+    }
+
+    /// The engine stops the ffmpeg of an idle live client and restarts it on
+    /// its next request, so that request waits for the new run.
+    #[test]
+    fn idle_stopped_live_session_waits_for_its_restart() {
+        use super::{FfmpegRun::*, MissingSegment::*, missing_segment_action};
+        assert_eq!(
+            missing_segment_action(true, 65, Some(64), Starting, 4),
+            Wait
+        );
+        assert_eq!(
+            missing_segment_action(true, 90, Some(64), Starting, 4),
+            Wait
+        );
     }
 
     #[test]
