@@ -2886,7 +2886,7 @@ impl AddonService {
                     match tokio::time::timeout(addon_fetch_timeout, answer).await {
                         Ok(Ok(results)) => return results.unwrap_or_default(),
                         Ok(Err(e)) => {
-                            warn!(addon = %r.row.name, error = %e, "search addon error")
+                            warn!(addon = %r.row.name, %kind, query, error = %format!("{e:#}"), "search addon error")
                         }
                         Err(_) => warn!(addon = %r.row.name, "search addon timed out"),
                     }

@@ -900,24 +900,14 @@ impl DeezerAddon {
         let t = std::time::Instant::now();
         debug!(query, limit, "Deezer track search starting");
 
-        let data = match self
-            .client
-            .execute(dz::SearchTracksEndpoint {
-                q: query.to_string(),
-                limit: limit.min(1000) as u32,
-            })
-            .await
-        {
-            Ok(dz::DeezerResult::Ok(list)) => list.data,
-            Ok(dz::DeezerResult::Err { error }) => {
-                warn!(query, %error, "Deezer track search returned error");
-                return Ok(vec![]);
-            }
-            Err(e) => {
-                warn!(query, error = %e, "Deezer track search HTTP error");
-                return Ok(vec![]);
-            }
-        };
+        let data = search_data(
+            self.client
+                .execute(dz::SearchTracksEndpoint {
+                    q: query.to_string(),
+                    limit: limit.min(1000) as u32,
+                })
+                .await,
+        )?;
 
         let results: Vec<_> = data
             .into_iter()
@@ -946,24 +936,14 @@ impl DeezerAddon {
         // Fetch a larger slice than the caller wants: singles/EPs are filtered
         // out below, so only a fraction of the response survives.
         let fetch = (limit * 3).min(100);
-        let data = match self
-            .client
-            .execute(dz::SearchAlbumsEndpoint {
-                q: query.to_string(),
-                limit: fetch as u32,
-            })
-            .await
-        {
-            Ok(dz::DeezerResult::Ok(list)) => list.data,
-            Ok(dz::DeezerResult::Err { error }) => {
-                warn!(query, %error, "Deezer album search returned error");
-                return Ok(vec![]);
-            }
-            Err(e) => {
-                warn!(query, error = %e, "Deezer album search HTTP error");
-                return Ok(vec![]);
-            }
-        };
+        let data = search_data(
+            self.client
+                .execute(dz::SearchAlbumsEndpoint {
+                    q: query.to_string(),
+                    limit: fetch as u32,
+                })
+                .await,
+        )?;
 
         let results: Vec<_> = data
             .into_iter()
@@ -990,24 +970,14 @@ impl DeezerAddon {
         let t = std::time::Instant::now();
         debug!(query, limit, "Deezer artist search starting");
 
-        let data = match self
-            .client
-            .execute(dz::SearchArtistsEndpoint {
-                q: query.to_string(),
-                limit: limit.min(25) as u32,
-            })
-            .await
-        {
-            Ok(dz::DeezerResult::Ok(list)) => list.data,
-            Ok(dz::DeezerResult::Err { error }) => {
-                warn!(query, %error, "Deezer artist search returned error");
-                return Ok(vec![]);
-            }
-            Err(e) => {
-                warn!(query, error = %e, "Deezer artist search HTTP error");
-                return Ok(vec![]);
-            }
-        };
+        let data = search_data(
+            self.client
+                .execute(dz::SearchArtistsEndpoint {
+                    q: query.to_string(),
+                    limit: limit.min(25) as u32,
+                })
+                .await,
+        )?;
 
         let results: Vec<_> = data
             .into_iter()
@@ -1239,6 +1209,20 @@ impl SearchAddon for DeezerAddon {
 // ---------------------------------------------------------------------------
 // Free helpers
 // ---------------------------------------------------------------------------
+
+/// Code 800 ("no data") and 500 (ParameterException, Deezer's answer to a
+/// blank query or one like `+`) just mean nothing matched.
+fn search_data<T>(
+    response: Result<dz::DeezerResult<dz::DeezerList<T>>, sdks::ClientError>,
+) -> Result<Vec<T>> {
+    match response? {
+        dz::DeezerResult::Ok(list) => Ok(list.data),
+        dz::DeezerResult::Err { error } if matches!(error.code, 800 | 500) => {
+            Ok(vec![])
+        }
+        dz::DeezerResult::Err { error } => Err(anyhow!("{error}")),
+    }
+}
 
 async fn fetch_deezer_playlist(
     client: &sdks::RestClient<sdks::NoAuth>,
@@ -1758,5 +1742,46 @@ mod tests {
                 .get_image(db::ImageKind::Primary)
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn search_reports_failures_but_not_empty_answers() {
+        let (_server, guard) = crate::integration_test::new_test_server()
+            .await
+            .unwrap();
+        let deezer = httpmock::MockServer::start();
+        let api_error =
+            |code: u32| serde_json::json!({"error": {"code": code, "message": ""}});
+        // One server for all cases, so each gets its own path prefix.
+        for (prefix, status, body, failed) in [
+            ("/deezer-http-500", 500, serde_json::json!({}), true),
+            // Quota and similar failures come as a 200 error object.
+            ("/deezer-quota", 200, api_error(4), true),
+            ("/deezer-no-data", 200, api_error(800), false),
+            // Deezer's answer to a blank query or one like `+`.
+            ("/deezer-bad-parameter", 200, api_error(500), false),
+        ] {
+            deezer.mock(|when, then| {
+                when.path(format!("{prefix}/search"));
+                then.status(status)
+                    .json_body(body);
+            });
+            let addon = DeezerAddon {
+                playlists: vec![],
+                client: sdks::RestClient::new(&deezer.url(prefix)).unwrap(),
+            };
+            let result = addon
+                .search(&db::MediaKind::Track, "query", 10, &guard.0)
+                .await;
+            assert_eq!(result.is_err(), failed, "{prefix}");
+            if let Ok(tracks) = result {
+                assert!(
+                    tracks
+                        .unwrap()
+                        .is_empty(),
+                    "{prefix}"
+                );
+            }
+        }
     }
 }

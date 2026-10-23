@@ -142,10 +142,12 @@ pub enum ClientError {
         endpoint: Option<Secret<String>>,
         body: Option<Secret<String>>,
     },
-    #[error("json error (status={status}): {source}")]
+    /// Not named `source`: the message already includes it, so `{:#}` would
+    /// print it twice.
+    #[error("json error (status={status}): {error}")]
     Json {
         status: u16,
-        source: serde_json::Error,
+        error: serde_json::Error,
         endpoint: Option<Secret<String>>,
         body: Option<Secret<String>>,
     },
@@ -170,6 +172,26 @@ impl ClientError {
     }
 }
 
+/// A `reqwest::Error` names the request URL, which for credentialed addons
+/// carries the secret; drop it, also inside the retry middleware's wrapper.
+fn without_url(error: MiddlewareError) -> MiddlewareError {
+    use reqwest_retry::RetryError;
+    match error {
+        MiddlewareError::Reqwest(e) => MiddlewareError::Reqwest(e.without_url()),
+        MiddlewareError::Middleware(e) => MiddlewareError::Middleware(match e
+            .downcast::<RetryError>()
+        {
+            Ok(RetryError::WithRetries { retries, err }) => RetryError::WithRetries {
+                retries,
+                err: without_url(err),
+            }
+            .into(),
+            Ok(RetryError::Error(err)) => RetryError::Error(without_url(err)).into(),
+            Err(e) => e,
+        }),
+    }
+}
+
 #[cfg(test)]
 mod client_error_tests {
     use super::*;
@@ -191,6 +213,29 @@ mod client_error_tests {
                 .contains(secret)
         );
         assert!(!format!("{error:?}").contains(secret));
+    }
+
+    #[tokio::test]
+    async fn transport_errors_redact_credentialed_urls() {
+        let secret = "do-not-log-this-token";
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener
+            .local_addr()
+            .unwrap();
+        drop(listener);
+        // The retry wrapper holds the plain reqwest error, so this covers both.
+        let error = RestClient::new(&format!("http://{address}/{secret}/"))
+            .unwrap()
+            .with_retry(
+                ExponentialBackoff::builder()
+                    .retry_bounds(Duration::from_millis(1), Duration::from_millis(1))
+                    .build_with_max_retries(1),
+            )
+            .execute(crate::stremio::ManifestEndpoint)
+            .await
+            .unwrap_err();
+        assert!(!format!("{error:#}").contains(secret), "{error:#}");
+        assert!(!format!("{error:?}").contains(secret), "{error:?}");
     }
 }
 
@@ -608,7 +653,7 @@ impl<A: Auth + Clone> RestClient<A> {
             Body::Json(v) => {
                 let bytes = serde_json::to_vec(&v).map_err(|e| ClientError::Json {
                     status: 0,
-                    source: e,
+                    error: e,
                     endpoint: Some(Secret::new(url.to_string())),
                     body: Some(Secret::new(v.to_string())),
                 })?;
@@ -638,7 +683,7 @@ impl<A: Auth + Clone> RestClient<A> {
             .mw
             .execute_with_extensions(request, &mut ext)
             .await
-            .map_err(|e| match e {
+            .map_err(|e| match without_url(e) {
                 reqwest_middleware::Error::Reqwest(e) => ClientError::Transport(e),
                 reqwest_middleware::Error::Middleware(e) => ClientError::Other(e),
             })?;
@@ -676,7 +721,7 @@ impl<A: Auth + Clone> RestClient<A> {
                     .map(Arc::new)
                     .map_err(|e| ClientError::Json {
                         status: s,
-                        source: e,
+                        error: e,
                         endpoint: Some(Secret::new(url.to_string())),
                         body: Some(Secret::new(text.clone())),
                     })?;
@@ -700,7 +745,7 @@ impl<A: Auth + Clone> RestClient<A> {
                     .map(Arc::new)
                     .map_err(|e| ClientError::Json {
                         status: s,
-                        source: e,
+                        error: e,
                         endpoint: Some(Secret::new(url.to_string())),
                         body: Some(Secret::new(text.clone())),
                     })?;
@@ -722,7 +767,7 @@ impl<A: Auth + Clone> RestClient<A> {
                     .map(Arc::new)
                     .map_err(|e| ClientError::Json {
                         status: s,
-                        source: e,
+                        error: e,
                         endpoint: Some(Secret::new(url.to_string())),
                         body: Some(Secret::new(text.clone())),
                     })

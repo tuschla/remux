@@ -2,7 +2,7 @@ use crate::{
     sdks,
     sdks::{CachedEndpoint, ClientError, Endpoint, WithExtraQuery},
 };
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use futures::{
     future,
     stream::{self, Stream, StreamExt},
@@ -113,17 +113,21 @@ impl StremioService {
             .meta)
     }
 
+    /// No search catalog for `media_type` or a 404 from it means no matches;
+    /// any other failure is an error, so search can tell a broken addon apart.
     pub async fn search(
         &self,
         media_type: sdks::stremio::MediaType,
         q: String,
     ) -> Result<Vec<sdks::stremio::Meta>> {
-        let catalog = self
+        let Some(catalog) = self
             .get_manifest()
             .await?
             .get_search_catalog(&media_type.to_string())
-            .ok_or_else(|| anyhow!("no search catalog for type {}", media_type))?;
-        Ok(self
+        else {
+            return Ok(vec![]);
+        };
+        match self
             .client
             .execute(
                 self.ep(sdks::stremio::CatalogEndpoint {
@@ -139,8 +143,13 @@ impl StremioService {
                 })
                 .with_cache(Duration::from_secs(60)),
             )
-            .await?
-            .metas)
+            .await
+        {
+            Ok(response) => Ok(response.metas),
+            // Same convention as catalog pages (see `is_404`).
+            Err(e) if is_404(&e) => Ok(vec![]),
+            Err(e) => Err(e.into()),
+        }
     }
 
     pub async fn get_streams(
