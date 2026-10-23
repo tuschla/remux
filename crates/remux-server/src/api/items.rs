@@ -194,6 +194,20 @@ fn kind_limit(kind: &db::MediaKind, limit: usize) -> usize {
     }
 }
 
+/// How many search results to gather for the page at `skip`/`limit`. One past
+/// the page end: remote search has no real total, so `TotalRecordCount` is the
+/// number of hits gathered, and Jellyfin clients stop paging once
+/// `StartIndex + Limit >= TotalRecordCount`. The extra hit makes a full page
+/// report that another page exists. `Limit=0` asks for no page, so it gets
+/// no extra hit and keeps reporting a total of 0 at `StartIndex` 0.
+fn search_fetch_limit(skip: u32, limit: usize) -> usize {
+    let page_end = (skip as usize).saturating_add(limit);
+    if limit == 0 {
+        return page_end;
+    }
+    page_end.saturating_add(1)
+}
+
 /// Whether a search for `kind` may be dispatched to a remote addon, or must
 /// stay local-only.
 fn is_remote_enabled(cfg: &api::ServerConfiguration, kind: &db::MediaKind) -> bool {
@@ -318,7 +332,7 @@ pub async fn get_items(
             let limit = q
                 .limit
                 .unwrap_or(250) as usize;
-            let fetch_limit = (skip as usize).saturating_add(limit);
+            let fetch_limit = search_fetch_limit(skip, limit);
 
             // Requested kinds: explicit from the client, or fall back to the computed
             // defaults (Movie + Series + Episode with exclude_item_types already applied).
@@ -3882,7 +3896,7 @@ pub async fn media_segments(
 mod tests {
     use super::{
         RemoteImagesQuery, exclude_episodes_from_search, external_id_infos_for_kind,
-        is_remote_enabled,
+        is_remote_enabled, search_fetch_limit,
     };
     use chrono::Utc;
     use http::header::HeaderValue;
@@ -3959,6 +3973,121 @@ mod tests {
         exclude_episodes_from_search(&mut browse);
         assert_eq!(browse.include_item_types, Some(vec![MediaType::Episode]));
         assert_eq!(browse.exclude_item_types, None);
+    }
+
+    #[test]
+    fn search_fetch_limit_reaches_one_past_the_page() {
+        assert_eq!(search_fetch_limit(0, 10), 11);
+        assert_eq!(search_fetch_limit(20, 10), 31);
+        assert_eq!(search_fetch_limit(u32::MAX, usize::MAX), usize::MAX);
+        assert_eq!(search_fetch_limit(0, 0), 0);
+        assert_eq!(search_fetch_limit(20, 0), 20);
+    }
+
+    /// A remote search provider that, like real addons, caps its own result
+    /// list: 25 movie hits for any query, at most `limit` of them.
+    struct TwentyFiveRemoteHits;
+
+    #[async_trait::async_trait]
+    impl crate::addons::SearchAddon for TwentyFiveRemoteHits {
+        async fn search_supports(&self, kind: &db::MediaKind) -> bool {
+            *kind == db::MediaKind::Movie
+        }
+
+        async fn search(
+            &self,
+            _kind: &db::MediaKind,
+            _query: &str,
+            limit: usize,
+            _ctx: &crate::AppContext,
+        ) -> anyhow::Result<Option<Vec<db::Media>>> {
+            Ok(Some(
+                (0..limit.min(25))
+                    .map(|n| {
+                        let (id, external_ids) = make_content_ids(
+                            db::MediaKind::Movie,
+                            &format!("tt-remote-hit-{n}"),
+                        );
+                        db::Media {
+                            id,
+                            title: format!("Remote hit {n}"),
+                            kind: db::MediaKind::Movie,
+                            external_ids,
+                            ..Default::default()
+                        }
+                    })
+                    .collect(),
+            ))
+        }
+    }
+
+    /// Remote search has no real total, so `TotalRecordCount` is the number of
+    /// hits gathered. A full page must report more than `StartIndex + Limit`,
+    /// or Jellyfin clients never request the next page.
+    #[tokio::test]
+    async fn remote_search_total_signals_further_pages() {
+        let (server, guard, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+        let now = Utc::now().naive_utc();
+        guard
+            .0
+            .addons
+            .set_runtimes(vec![crate::addons::AddonRuntime {
+                row: crate::addons::Addon {
+                    id: Uuid::new_v4(),
+                    name: "remote hits".into(),
+                    preset: crate::addons::AddonPresetRef {
+                        kind: "scripted".into(),
+                        config: serde_json::Value::Null.into(),
+                    },
+                    resources: vec![remux_sdks::stremio::ResourceType::Search],
+                    types: vec![],
+                    enabled: true,
+                    priority: 0,
+                    created_at: now,
+                    updated_at: now,
+                    system: true,
+                    is_default: true,
+                    http_redirect_stream: false,
+                    subtitle_extraction: false,
+                    probe_on_scan: false,
+                    service_filter: vec![],
+                },
+                caps: crate::addons::AddonCapabilities {
+                    search: Some(std::sync::Arc::new(TwentyFiveRemoteHits)),
+                    ..Default::default()
+                },
+            }]);
+
+        let mut pages = Vec::new();
+        for start in ["0", "10", "20", "30"] {
+            let body: serde_json::Value = server
+                .get("/items")
+                .add_header(
+                    http::header::AUTHORIZATION,
+                    HeaderValue::from_str(&auth).unwrap(),
+                )
+                .add_query_params(&[
+                    ("searchTerm", "remote"),
+                    ("includeItemTypes", "Movie"),
+                    ("startIndex", start),
+                    ("limit", "10"),
+                ])
+                .await
+                .json();
+            pages.push((
+                body["Items"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                body["TotalRecordCount"]
+                    .as_i64()
+                    .unwrap(),
+            ));
+        }
+        // Before the fix the totals were [10, 20, 25, 25]: page one claimed to
+        // be the last.
+        assert_eq!(pages, vec![(10, 11), (10, 21), (5, 25), (0, 25)]);
     }
 
     #[test]
