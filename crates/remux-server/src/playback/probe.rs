@@ -26,6 +26,7 @@ fn ffprobe_args(
     url: &str,
     allow_nonstandard_hls_extensions: bool,
     headers: Option<&str>,
+    unseekable: bool,
 ) -> Vec<String> {
     let mut args = vec![
         "-v".into(),
@@ -49,8 +50,40 @@ fn ffprobe_args(
     if let Some(headers) = headers {
         args.extend(["-headers".into(), headers.into()]);
     }
+    if unseekable {
+        args.extend(["-seekable".into(), "0".into()]);
+    }
     args.push(url.into());
     args
+}
+
+/// Containers ffprobe needs to seek in: an MP4 `moov` atom or MKV cues can sit
+/// at the end of the file.
+const SEEK_NEEDING_EXTENSIONS: [&str; 6] = ["mp4", "m4v", "mov", "mkv", "webm", "avi"];
+
+/// Whether a live input is first probed with `-seekable 0`. A live HTTP
+/// upstream may answer `Accept-Ranges: bytes` with a bogus huge
+/// Content-Length; ffprobe then seeks to the claimed end and times out. A file
+/// listed as a channel keeps seeking. `-seekable` is an HTTP protocol option.
+fn reads_live_input_unseekable(url: &str) -> bool {
+    let Ok(url) = url::Url::parse(url) else {
+        return false;
+    };
+    if !matches!(url.scheme(), "http" | "https") {
+        return false;
+    }
+    let file = url
+        .path()
+        .rsplit('/')
+        .next()
+        .unwrap_or_default();
+    !file
+        .rsplit_once('.')
+        .is_some_and(|(_, ext)| {
+            SEEK_NEEDING_EXTENSIONS
+                .iter()
+                .any(|known| ext.eq_ignore_ascii_case(known))
+        })
 }
 
 #[cfg(test)]
@@ -72,8 +105,12 @@ mod extension_retry_tests {
 
     #[test]
     fn retry_uses_hls_extension_compatibility_options() {
-        let args =
-            super::ffprobe_args("https://relay.example/hls?url=playlist", true, None);
+        let args = super::ffprobe_args(
+            "https://relay.example/hls?url=playlist",
+            true,
+            None,
+            false,
+        );
 
         assert!(
             args.windows(2)
@@ -87,6 +124,27 @@ mod extension_retry_tests {
             args.windows(2)
                 .any(|pair| { pair == ["-extension_picky", "0"] })
         );
+    }
+
+    #[test]
+    fn only_live_http_streams_are_probed_unseekable() {
+        for url in [
+            "http://provider.example/live/user/pass/1.ts",
+            "http://provider.example/live/user/pass/1",
+            "http://provider.example/stream.php?file=movie.mp4",
+            "https://provider.example/channel.m3u8",
+        ] {
+            assert!(super::reads_live_input_unseekable(url), "{url}");
+        }
+        for url in [
+            "http://provider.example/movie/user/pass/1.mp4",
+            "https://provider.example/clip.MP4?token=abc",
+            "http://provider.example/a.mkv",
+            "rtsp://camera.example/stream",
+            "/media/movie.mkv",
+        ] {
+            assert!(!super::reads_live_input_unseekable(url), "{url}");
+        }
     }
 }
 
@@ -697,25 +755,16 @@ fn run_ffprobe(
     }
 }
 
-/// Probe a media URL with ffprobe and return a Jellyfin `MediaSourceInfo`
-/// alongside any chapter-derived `MediaSegments`.
-pub fn probe_media(url: &str) -> Result<(api::MediaSourceInfo, MediaSegments)> {
-    probe_media_with(url, None, None)
-}
-
-/// `headers` is an ffmpeg `-headers` value (`"Name: value\r\n"` lines) sent with
-/// HTTP requests, e.g. for a WebDAV source that needs basic auth. `timeout`
-/// bounds the whole probe; ffprobe is killed when it expires.
-pub fn probe_media_with(
+/// Runs ffprobe, retrying with relaxed HLS extensions if they were rejected.
+fn run_probe(
     url: &str,
+    shown: &str,
     headers: Option<&str>,
-    timeout: Option<std::time::Duration>,
-) -> Result<(api::MediaSourceInfo, MediaSegments)> {
-    let shown = redact_url(url);
-    debug!(url = %shown, "probing media");
-    let deadline = timeout.map(|t| std::time::Instant::now() + t);
-
-    let mut output = run_ffprobe(&ffprobe_args(url, false, headers), deadline)?;
+    unseekable: bool,
+    deadline: Option<std::time::Instant>,
+) -> Result<std::process::Output> {
+    let mut output =
+        run_ffprobe(&ffprobe_args(url, false, headers, unseekable), deadline)?;
 
     if !output
         .status
@@ -724,16 +773,51 @@ pub fn probe_media_with(
             &output.stderr,
         ))
     {
-        output = run_ffprobe(&ffprobe_args(url, true, headers), deadline)?;
+        output = run_ffprobe(&ffprobe_args(url, true, headers, unseekable), deadline)?;
     }
 
     if !output
         .status
         .success()
     {
-        let stderr = String::from_utf8_lossy(&output.stderr).replace(url, &shown);
+        let stderr = String::from_utf8_lossy(&output.stderr).replace(url, shown);
         return Err(anyhow!("ffprobe failed for {}: {}", shown, stderr));
     }
+    Ok(output)
+}
+
+/// Probe a media URL with ffprobe and return a Jellyfin `MediaSourceInfo`
+/// alongside any chapter-derived `MediaSegments`.
+pub fn probe_media(url: &str) -> Result<(api::MediaSourceInfo, MediaSegments)> {
+    probe_media_with(url, None, None, false)
+}
+
+/// `headers` is an ffmpeg `-headers` value (`"Name: value\r\n"` lines) sent with
+/// HTTP requests, e.g. for a WebDAV source that needs basic auth. `timeout`
+/// bounds the whole probe; ffprobe is killed when it expires. `live` marks a
+/// live TV source (see `reads_live_input_unseekable`).
+pub fn probe_media_with(
+    url: &str,
+    headers: Option<&str>,
+    timeout: Option<std::time::Duration>,
+    live: bool,
+) -> Result<(api::MediaSourceInfo, MediaSegments)> {
+    let shown = redact_url(url);
+    debug!(url = %shown, "probing media");
+    let started = std::time::Instant::now();
+    let deadline = timeout.map(|t| started + t);
+
+    let output = if live && reads_live_input_unseekable(url) {
+        // Half the budget, so a seeking retry still fits (e.g. a moov-at-end
+        // MP4 behind an extensionless URL).
+        run_probe(url, &shown, headers, true, timeout.map(|t| started + t / 2))
+            .or_else(|error| {
+                debug!(url = %shown, %error, "retrying probe with seeking");
+                run_probe(url, &shown, headers, false, deadline)
+            })?
+    } else {
+        run_probe(url, &shown, headers, false, deadline)?
+    };
 
     let probe: FfprobeOutput = serde_json::from_slice(&output.stdout)
         .map_err(|e| anyhow!("Failed to parse ffprobe output: {}", e))?;
@@ -1288,10 +1372,12 @@ pub(crate) enum ProbeOutcome {
 }
 
 /// Resolve probe data for a single source: cache hit → skip → live probe with fallback.
+/// `live` marks a live TV source (see `probe_media_with`).
 pub(crate) async fn probe_stream(
     stream: &db::Media,
     url_opt: Option<String>,
     skip_probe: bool,
+    live: bool,
     timeout_secs: u64,
     auto_next_stream: bool,
     max_retries: usize,
@@ -1365,6 +1451,7 @@ pub(crate) async fn probe_stream(
                 &url,
                 None,
                 Some(std::time::Duration::from_secs(timeout_secs)),
+                live,
             )
         },
     )
@@ -2434,8 +2521,12 @@ mod timeout_tests {
                 .unwrap()
         );
         let started = std::time::Instant::now();
-        let result =
-            probe_media_with(&url, None, Some(std::time::Duration::from_millis(700)));
+        let result = probe_media_with(
+            &url,
+            None,
+            Some(std::time::Duration::from_millis(700)),
+            false,
+        );
         let err = result
             .unwrap_err()
             .to_string();
@@ -2469,10 +2560,14 @@ mod redact_tests {
     #[test]
     fn failure_error_does_not_contain_the_url() {
         let url = "http://127.0.0.1:1/secret-path/f.mkv?token=s3cret";
-        let err =
-            super::probe_media_with(url, None, Some(std::time::Duration::from_secs(5)))
-                .unwrap_err()
-                .to_string();
+        let err = super::probe_media_with(
+            url,
+            None,
+            Some(std::time::Duration::from_secs(5)),
+            false,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(
             !err.contains("s3cret") && !err.contains("secret-path"),
             "{err}"

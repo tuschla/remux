@@ -780,6 +780,8 @@ impl StreamService {
                 &stream,
                 url_opt,
                 skip_probe,
+                item.as_ref()
+                    .is_some_and(|it| it.is_live()),
                 timeout_secs,
                 auto_next,
                 max_retries,
