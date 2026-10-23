@@ -5503,6 +5503,36 @@ mod tests {
         }
     }
 
+    /// Results linked through one wrong id (a copy of Inception carrying
+    /// Interstellar's imdb id) stay apart when their tmdb ids differ.
+    #[tokio::test]
+    async fn search_keeps_apart_results_linked_by_a_conflicting_id() {
+        let hit = |title: &str, tmdb: i64, imdb: Option<&str>| db::Media {
+            id: Uuid::new_v4(),
+            title: title.into(),
+            kind: db::MediaKind::Movie,
+            external_ids: db::ExternalIds {
+                tmdb: Some(tmdb),
+                imdb: imdb
+                    .and_then(|i| db::NonEmptyString::try_new(i.to_string()).ok()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let titles = search_with(
+            vec![
+                search_runtime(vec![hit("Inception", 27205, None)]),
+                search_runtime(vec![
+                    hit("Inception (wrong imdb)", 27205, Some("tt0816692")),
+                    hit("Interstellar", 157336, Some("tt0816692")),
+                ]),
+            ],
+            20,
+        )
+        .await;
+        assert_eq!(titles, ["Inception", "Interstellar"]);
+    }
+
     /// An addon whose search failed doesn't hide the others' results.
     #[tokio::test]
     async fn failed_search_addon_does_not_hide_other_results() {
