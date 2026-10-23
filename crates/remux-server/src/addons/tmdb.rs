@@ -8,8 +8,8 @@ use uuid::Uuid;
 
 use super::{
     AddonCapabilities, AddonKind, AddonMetadata, AddonPreset, AddonPresetRegistration,
-    CatalogAddon, CatalogInfo, MediaKind, MetaAddon, ResourceType, SearchAddon,
-    TreeAddon,
+    CatalogAddon, CatalogCompleteness, CatalogInfo, CatalogStream, MediaKind,
+    MetaAddon, ResourceType, SearchAddon, TreeAddon,
 };
 use crate::{
     AppContext, api, common, db, sdks,
@@ -246,12 +246,24 @@ impl CatalogAddon for TmdbAddon {
         ctx: &AppContext,
         local_id: &str,
     ) -> Result<Option<Pin<Box<dyn Stream<Item = db::Media> + Send>>>> {
+        Ok(self
+            .catalog_stream_tracked(ctx, local_id)
+            .await?
+            .map(CatalogStream::into_boxed))
+    }
+
+    async fn catalog_stream_tracked(
+        &self,
+        ctx: &AppContext,
+        local_id: &str,
+    ) -> Result<Option<CatalogStream>> {
         let config = crate::db::Settings::get_config(&ctx.db).await?;
         let client = tmdb_client(
             config.get_tmdb_key(),
             &ctx.config
                 .tmdb_base_url,
         )?;
+        let completeness = CatalogCompleteness::default();
 
         let stream: Pin<Box<dyn Stream<Item = db::Media> + Send>> = match local_id {
             "popular_movies" => Box::pin(discover_movie_stream(
@@ -260,6 +272,7 @@ impl CatalogAddon for TmdbAddon {
                     sort_by: Some("popularity.desc".into()),
                     ..Default::default()
                 },
+                completeness.clone(),
             )),
             "popular_tv" => Box::pin(discover_tv_stream(
                 client,
@@ -267,6 +280,7 @@ impl CatalogAddon for TmdbAddon {
                     sort_by: Some("popularity.desc".into()),
                     ..Default::default()
                 },
+                completeness.clone(),
             )),
             "top_rated_movies" => Box::pin(discover_movie_stream(
                 client,
@@ -275,6 +289,7 @@ impl CatalogAddon for TmdbAddon {
                     vote_count_gte: Some(300),
                     ..Default::default()
                 },
+                completeness.clone(),
             )),
             "top_rated_tv" => Box::pin(discover_tv_stream(
                 client,
@@ -283,18 +298,22 @@ impl CatalogAddon for TmdbAddon {
                     vote_count_gte: Some(300),
                     ..Default::default()
                 },
+                completeness.clone(),
             )),
             "trending_movies_week" => Box::pin(trending_movie_stream(
                 client,
                 sdks::tmdb::TrendingWindow::Week,
+                completeness.clone(),
             )),
-            "trending_tv_week" => {
-                Box::pin(trending_tv_stream(client, sdks::tmdb::TrendingWindow::Week))
-            }
+            "trending_tv_week" => Box::pin(trending_tv_stream(
+                client,
+                sdks::tmdb::TrendingWindow::Week,
+                completeness.clone(),
+            )),
             _ => return Ok(None),
         };
 
-        Ok(Some(stream))
+        Ok(Some(CatalogStream::new(stream, completeness)))
     }
 }
 
@@ -350,22 +369,44 @@ fn series_result_to_stub(s: sdks::tmdb::SeriesSearchResult) -> db::Media {
     media
 }
 
+/// TMDB rejects pages past 500, so a longer catalog ends there.
+const MAX_PAGE: u32 = 500;
+
+/// A failed page ends the catalog early; flagging it keeps the import from
+/// removing the members on the pages it never got.
+fn page_or_incomplete<T>(
+    resp: Result<T, ClientError>,
+    completeness: &CatalogCompleteness,
+) -> Option<T> {
+    match resp {
+        Ok(resp) => Some(resp),
+        Err(e) => {
+            warn!(error = %e, "TMDB catalog page failed, stopping the catalog here");
+            completeness.mark_incomplete();
+            None
+        }
+    }
+}
+
 fn discover_movie_stream(
     client: sdks::RestClient<sdks::BearerAuth>,
     query: sdks::tmdb::DiscoverQuery,
+    completeness: CatalogCompleteness,
 ) -> impl Stream<Item = db::Media> + Send {
     futures::stream::unfold(
-        (client, query, Some(1u32)),
-        |(client, query, maybe_page)| async move {
+        (client, query, Some(1u32), completeness),
+        |(client, query, maybe_page, completeness)| async move {
             let page = maybe_page?;
             let page_query = sdks::tmdb::DiscoverQuery {
                 page: Some(page),
                 ..query.clone()
             };
-            let resp = client
-                .execute(sdks::tmdb::DiscoverMovieEndpoint { query: page_query })
-                .await
-                .ok()?;
+            let resp = page_or_incomplete(
+                client
+                    .execute(sdks::tmdb::DiscoverMovieEndpoint { query: page_query })
+                    .await,
+                &completeness,
+            )?;
             if resp
                 .results
                 .is_empty()
@@ -377,8 +418,11 @@ fn discover_movie_stream(
                 .into_iter()
                 .map(movie_result_to_stub)
                 .collect();
-            let next = (page < resp.total_pages).then_some(page + 1);
-            Some((futures::stream::iter(items), (client, query, next)))
+            let next = (page < resp.total_pages && page < MAX_PAGE).then_some(page + 1);
+            Some((
+                futures::stream::iter(items),
+                (client, query, next, completeness),
+            ))
         },
     )
     .flatten()
@@ -387,19 +431,22 @@ fn discover_movie_stream(
 fn discover_tv_stream(
     client: sdks::RestClient<sdks::BearerAuth>,
     query: sdks::tmdb::DiscoverQuery,
+    completeness: CatalogCompleteness,
 ) -> impl Stream<Item = db::Media> + Send {
     futures::stream::unfold(
-        (client, query, Some(1u32)),
-        |(client, query, maybe_page)| async move {
+        (client, query, Some(1u32), completeness),
+        |(client, query, maybe_page, completeness)| async move {
             let page = maybe_page?;
             let page_query = sdks::tmdb::DiscoverQuery {
                 page: Some(page),
                 ..query.clone()
             };
-            let resp = client
-                .execute(sdks::tmdb::DiscoverTvEndpoint { query: page_query })
-                .await
-                .ok()?;
+            let resp = page_or_incomplete(
+                client
+                    .execute(sdks::tmdb::DiscoverTvEndpoint { query: page_query })
+                    .await,
+                &completeness,
+            )?;
             if resp
                 .results
                 .is_empty()
@@ -411,8 +458,11 @@ fn discover_tv_stream(
                 .into_iter()
                 .map(series_result_to_stub)
                 .collect();
-            let next = (page < resp.total_pages).then_some(page + 1);
-            Some((futures::stream::iter(items), (client, query, next)))
+            let next = (page < resp.total_pages && page < MAX_PAGE).then_some(page + 1);
+            Some((
+                futures::stream::iter(items),
+                (client, query, next, completeness),
+            ))
         },
     )
     .flatten()
@@ -421,18 +471,21 @@ fn discover_tv_stream(
 fn trending_movie_stream(
     client: sdks::RestClient<sdks::BearerAuth>,
     window: sdks::tmdb::TrendingWindow,
+    completeness: CatalogCompleteness,
 ) -> impl Stream<Item = db::Media> + Send {
     futures::stream::unfold(
-        (client, Some(1u32)),
-        move |(client, maybe_page)| async move {
+        (client, Some(1u32), completeness),
+        move |(client, maybe_page, completeness)| async move {
             let page = maybe_page?;
-            let resp = client
-                .execute(sdks::tmdb::TrendingMovieEndpoint {
-                    window,
-                    page: Some(page),
-                })
-                .await
-                .ok()?;
+            let resp = page_or_incomplete(
+                client
+                    .execute(sdks::tmdb::TrendingMovieEndpoint {
+                        window,
+                        page: Some(page),
+                    })
+                    .await,
+                &completeness,
+            )?;
             if resp
                 .results
                 .is_empty()
@@ -444,8 +497,8 @@ fn trending_movie_stream(
                 .into_iter()
                 .map(movie_result_to_stub)
                 .collect();
-            let next = (page < resp.total_pages).then_some(page + 1);
-            Some((futures::stream::iter(items), (client, next)))
+            let next = (page < resp.total_pages && page < MAX_PAGE).then_some(page + 1);
+            Some((futures::stream::iter(items), (client, next, completeness)))
         },
     )
     .flatten()
@@ -454,18 +507,21 @@ fn trending_movie_stream(
 fn trending_tv_stream(
     client: sdks::RestClient<sdks::BearerAuth>,
     window: sdks::tmdb::TrendingWindow,
+    completeness: CatalogCompleteness,
 ) -> impl Stream<Item = db::Media> + Send {
     futures::stream::unfold(
-        (client, Some(1u32)),
-        move |(client, maybe_page)| async move {
+        (client, Some(1u32), completeness),
+        move |(client, maybe_page, completeness)| async move {
             let page = maybe_page?;
-            let resp = client
-                .execute(sdks::tmdb::TrendingTvEndpoint {
-                    window,
-                    page: Some(page),
-                })
-                .await
-                .ok()?;
+            let resp = page_or_incomplete(
+                client
+                    .execute(sdks::tmdb::TrendingTvEndpoint {
+                        window,
+                        page: Some(page),
+                    })
+                    .await,
+                &completeness,
+            )?;
             if resp
                 .results
                 .is_empty()
@@ -477,8 +533,8 @@ fn trending_tv_stream(
                 .into_iter()
                 .map(series_result_to_stub)
                 .collect();
-            let next = (page < resp.total_pages).then_some(page + 1);
-            Some((futures::stream::iter(items), (client, next)))
+            let next = (page < resp.total_pages && page < MAX_PAGE).then_some(page + 1);
+            Some((futures::stream::iter(items), (client, next, completeness)))
         },
     )
     .flatten()
@@ -2695,5 +2751,67 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    fn tmdb_movie_page(total_pages: u32) -> serde_json::Value {
+        serde_json::json!({
+            "page": 1,
+            "total_pages": total_pages,
+            "total_results": total_pages,
+            "results": [{ "id": 1, "title": "Film" }]
+        })
+    }
+
+    /// A page failing partway leaves the catalog incomplete, so its import
+    /// keeps the members on the pages it never got.
+    #[tokio::test]
+    async fn catalog_is_incomplete_when_a_page_fails() {
+        let tmdb = httpmock::MockServer::start();
+        tmdb.mock(|when, then| {
+            when.path("/discover/movie")
+                .query_param("page", "1");
+            then.status(200)
+                .json_body(tmdb_movie_page(3));
+        });
+        tmdb.mock(|when, then| {
+            when.path("/discover/movie")
+                .query_param("page", "2");
+            then.status(500);
+        });
+        let guard = ctx_with_tmdb(&tmdb).await;
+
+        let stream = TmdbAddon
+            .catalog_stream_tracked(&guard.0, "popular_movies")
+            .await
+            .unwrap()
+            .unwrap();
+        let completeness = stream.completeness();
+
+        assert_eq!(
+            stream
+                .count()
+                .await,
+            1
+        );
+        assert!(!completeness.is_complete());
+    }
+
+    /// TMDB rejects pages past 500, so a longer catalog stops asking there
+    /// instead of ending on that rejection.
+    #[tokio::test]
+    async fn catalog_stops_at_page_500() {
+        let tmdb = httpmock::MockServer::start();
+        let pages = tmdb.mock(|when, then| {
+            when.path("/discover/movie");
+            then.status(200)
+                .json_body(tmdb_movie_page(600));
+        });
+        let client = tmdb_client("key", &tmdb.base_url()).unwrap();
+
+        discover_movie_stream(client, Default::default(), Default::default())
+            .count()
+            .await;
+
+        assert_eq!(pages.hits(), 500);
     }
 }
