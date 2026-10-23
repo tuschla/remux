@@ -34,9 +34,19 @@ pub struct StremioService {
 impl StremioService {
     pub fn from_url(url: &str) -> Result<Self> {
         let parsed = url::Url::parse(url).map_err(|e| anyhow::anyhow!("{e}"))?;
+        // Keep values encoded: the request builder joins query pairs verbatim,
+        // so a decoded `a%26b` would split into two parameters.
         let extra_query: Vec<(String, String)> = parsed
-            .query_pairs()
-            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .query()
+            .unwrap_or_default()
+            .split('&')
+            .filter(|pair| !pair.is_empty())
+            .map(|pair| {
+                let (k, v) = pair
+                    .split_once('=')
+                    .unwrap_or((pair, ""));
+                (k.to_string(), v.to_string())
+            })
             .collect();
         let mut clean = parsed.clone();
         clean.set_query(None);
@@ -460,5 +470,23 @@ mod tests {
             .await;
 
         assert_eq!(names, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn catalog_request_keeps_manifest_query_encoded() {
+        let server = httpmock::MockServer::start();
+        let catalog = server.mock(|when, then| {
+            when.path("/catalog/movie/test.json")
+                .query_param("tag", "a&b");
+            then.status(200)
+                .json_body(serde_json::json!({"metas": []}));
+        });
+
+        let svc = StremioService::from_url(&server.url("/?tag=a%26b")).unwrap();
+        svc.get_catalog_stream("movie".to_string(), "test".to_string(), false, 1)
+            .await
+            .unwrap();
+
+        catalog.assert();
     }
 }
