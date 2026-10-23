@@ -4801,6 +4801,104 @@ mod tests {
         );
     }
 
+    /// Progress while remembering is off forgets the stored picks, as in
+    /// Jellyfin, so switching it back on does not revive them.
+    #[tokio::test]
+    async fn test_remembering_off_forgets_the_stored_tracks() {
+        let (server, guard, token) = authenticated_server().await;
+        let auth = HeaderValue::from_str(&auth_header_with_token(&token)).unwrap();
+        let media = insert_multilang_source(&guard.0).await;
+        let psid = "forget-tracks-test";
+
+        let me: serde_json::Value = server
+            .get("/users/me")
+            .add_header(http::header::AUTHORIZATION, auth.clone())
+            .await
+            .json();
+        let config_path = format!(
+            "/users/{}/configuration",
+            me["Id"]
+                .as_str()
+                .unwrap()
+        );
+        let remember = |audio: bool, subtitle: bool| {
+            user_config_with(json!({
+                "RememberAudioSelections": audio,
+                "RememberSubtitleSelections": subtitle
+            }))
+        };
+        let progress = json!({
+            "ItemId": media.id.to_string(),
+            "PlaySessionId": psid,
+            "PositionTicks": 100_000_000i64,
+            "AudioStreamIndex": 2,
+            "SubtitleStreamIndex": 3
+        });
+
+        server
+            .post("/sessions/playing")
+            .add_header(http::header::AUTHORIZATION, auth.clone())
+            .json(&json!({
+                "ItemId": media.id.to_string(),
+                "PlaySessionId": psid,
+                "PositionTicks": 0
+            }))
+            .await;
+        server
+            .post("/sessions/playing/progress")
+            .add_header(http::header::AUTHORIZATION, auth.clone())
+            .json(&progress)
+            .await;
+
+        let db = &guard
+            .0
+            .db;
+        let user = &crate::db::User::get_by_username(db, "test")
+            .await
+            .unwrap()
+            .unwrap();
+        let media = &media;
+        let stored = || async move {
+            let state = crate::db::UserMediaState::get_or_new(db, user, media)
+                .await
+                .unwrap();
+            (state.audio_idx, state.subtitle_idx)
+        };
+        assert_eq!(stored().await, (Some(2), Some(3)), "picks are remembered");
+
+        server
+            .post(&config_path)
+            .add_header(http::header::AUTHORIZATION, auth.clone())
+            .json(&remember(false, true))
+            .await;
+        server
+            .post("/sessions/playing/progress")
+            .add_header(http::header::AUTHORIZATION, auth.clone())
+            .json(&progress)
+            .await;
+        assert_eq!(
+            stored().await,
+            (None, Some(3)),
+            "turning audio off keeps the subtitle"
+        );
+
+        server
+            .post(&config_path)
+            .add_header(http::header::AUTHORIZATION, auth.clone())
+            .json(&remember(false, false))
+            .await;
+        server
+            .post("/sessions/playing/progress")
+            .add_header(http::header::AUTHORIZATION, auth.clone())
+            .json(&progress)
+            .await;
+        assert_eq!(
+            stored().await,
+            (None, None),
+            "remembering off forgets the picks"
+        );
+    }
+
     /// A movie with two releases laying the same two audio languages out in
     /// opposite order: "Release 0" (stored first) Italian then Japanese,
     /// "Release 1" (higher bitrate, so ranked first) Japanese then Italian.

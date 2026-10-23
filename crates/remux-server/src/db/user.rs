@@ -487,6 +487,16 @@ pub struct AudioPick {
     pub chosen: bool,
 }
 
+/// What a playback report does to one remembered track selection.
+#[derive(Debug, Clone, Copy)]
+pub enum TrackMemory<T> {
+    Keep,
+    Remember(T),
+    /// Remembering is off: drop the stored pick, as Jellyfin does, so turning
+    /// the setting back on does not revive a pick from before it was off.
+    Forget,
+}
+
 /// A personal rating on Jellyfin's 0-10 scale. Jellyfin stores no `Likes`
 /// field, deriving it from this at [`UserRating::LIKE_THRESHOLD`].
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -1134,8 +1144,8 @@ impl UserMediaState {
     /// for a user/media pair.
     ///
     /// * `position_ticks` – current playback position in 100-nanosecond ticks.
-    /// * `audio` / `subtitle_idx` – stream selections to remember; pass
-    ///   `None` to leave existing values unchanged. See [`AudioPick`].
+    /// * `audio` / `subtitle` – what to do with the remembered stream
+    ///   selections; see [`TrackMemory`].
     /// * `runtime_seconds` – when `Some`, the 90 % "mark as watched" threshold
     ///   is applied. Pass `None` for progress updates (no watched-check) and
     ///   `Some(media.runtime)` for stop events.
@@ -1148,19 +1158,27 @@ impl UserMediaState {
         user: &User,
         media: &super::Media,
         position_ticks: i64,
-        audio: Option<AudioPick>,
-        subtitle_idx: Option<i64>,
+        audio: TrackMemory<AudioPick>,
+        subtitle: TrackMemory<i64>,
         runtime_seconds: Option<i64>,
     ) -> Result<bool> {
         let mut ms = Self::get_or_new(db, user, media).await?;
         let position_seconds = position_ticks / 10_000_000;
         ms.playback_position = position_seconds;
 
-        if let Some(pick) = audio {
-            ms.remember_audio(pick);
+        match audio {
+            TrackMemory::Keep => {}
+            TrackMemory::Remember(pick) => ms.remember_audio(pick),
+            TrackMemory::Forget => {
+                ms.audio_idx = None;
+                ms.stream_id = None;
+                ms.audio_chosen = false;
+            }
         }
-        if let Some(idx) = subtitle_idx {
-            ms.subtitle_idx = Some(idx);
+        match subtitle {
+            TrackMemory::Keep => {}
+            TrackMemory::Remember(idx) => ms.subtitle_idx = Some(idx),
+            TrackMemory::Forget => ms.subtitle_idx = None,
         }
 
         // On stop events apply resume/played thresholds from server config.
@@ -1741,8 +1759,8 @@ mod playback_threshold_tests {
             user,
             media,
             ticks(secs),
-            None,
-            None,
+            TrackMemory::Keep,
+            TrackMemory::Keep,
             media.runtime,
         )
         .await
@@ -1802,8 +1820,8 @@ mod playback_threshold_tests {
             &user,
             &media,
             ticks(RUNTIME * 99 / 100),
-            None,
-            None,
+            TrackMemory::Keep,
+            TrackMemory::Keep,
             None,
         )
         .await
