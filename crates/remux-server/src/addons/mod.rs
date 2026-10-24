@@ -2135,6 +2135,14 @@ impl AddonService {
         Ok(())
     }
 
+    /// Swaps in hand-built addons, so tests outside this module can stand in
+    /// for remote providers without a network.
+    #[cfg(test)]
+    pub(crate) fn set_runtimes(&self, runtimes: Vec<AddonRuntime>) {
+        self.inner
+            .store(Arc::new(runtimes));
+    }
+
     pub fn list(&self) -> arc_swap::Guard<Arc<Vec<AddonRuntime>>> {
         self.inner
             .load()
