@@ -82,8 +82,178 @@ pub(crate) struct DefaultStreamPrefs<'a> {
     pub original_language: Option<&'a str>,
     pub requested_audio: Option<i64>,
     pub requested_subtitle: Option<i64>,
-    pub remembered_audio: Option<i64>,
+    pub remembered_audio: Option<&'a RememberedAudio>,
     pub remembered_subtitle: Option<i64>,
+}
+
+/// A remembered audio track. Its index only names a track within the stream
+/// it was picked on; other releases of the item lay their tracks out
+/// differently, so they get the track's language instead.
+pub(crate) struct RememberedAudio {
+    pub index: i64,
+    /// `None` for selections remembered before the stream was recorded, or
+    /// whose stream an older build left describing another index.
+    pub stream_id: Option<Uuid>,
+    /// The user picked the track; one that merely played by default (say
+    /// the only track of a dub) says nothing about other releases.
+    pub chosen: bool,
+    /// The audio tracks of `stream_id`, loaded for a chosen track only;
+    /// empty when unknown (stream row gone).
+    pub tracks: Vec<AudioTrack>,
+}
+
+/// What tells one audio track of a release from another.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct AudioTrack {
+    pub index: i64,
+    /// Two-letter language.
+    pub language: Option<String>,
+    pub commentary: bool,
+}
+
+impl AudioTrack {
+    fn of(stream: &api::MediaStream) -> Option<Self> {
+        matches!(stream.type_, Some(MediaStreamType::Audio)).then(|| Self {
+            index: stream.index,
+            language: stream
+                .language
+                .as_deref()
+                .and_then(remux_sdks::remux::lang_to_two_letter),
+            commentary: stream
+                .title
+                .as_deref()
+                .is_some_and(|title| {
+                    title
+                        .to_ascii_lowercase()
+                        .contains("commentary")
+                }),
+        })
+    }
+}
+
+impl RememberedAudio {
+    pub async fn load(
+        db: &sqlx::SqlitePool,
+        state: &db::UserMediaState,
+    ) -> Option<Self> {
+        let index = state.audio_idx?;
+        let stream_id = state.audio_stream_id();
+        let chosen = state.audio_chosen && stream_id.is_some();
+        let tracks = match stream_id.filter(|_| chosen) {
+            Some(stream_id) => db::Media::get_by_id(db, &stream_id)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|stream| stream.probe_data)
+                .map(|probe| {
+                    probe
+                        .media_streams
+                        .iter()
+                        .filter_map(AudioTrack::of)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            None => Vec::new(),
+        };
+        Some(Self {
+            index,
+            stream_id,
+            chosen,
+            tracks,
+        })
+    }
+
+    /// The remembered track's index in `source`, whose concrete stream is
+    /// `stream_id`. The index itself on the stream it was picked on, without
+    /// a recorded stream, without a known track language, or where the audio
+    /// tracks are laid out identically. Elsewhere only a chosen track counts,
+    /// as the best audio track in its language: a commentary when the pick
+    /// was one, else not, then the container default, then the first. `None`
+    /// leaves `source` to the regular default-track rules.
+    pub fn index_for(
+        &self,
+        stream_id: Uuid,
+        source: &api::MediaSourceInfo,
+    ) -> Option<i64> {
+        match self.stream_id {
+            Some(id) if id != stream_id => {}
+            _ => return Some(self.index),
+        }
+        if !self.chosen {
+            return None;
+        }
+        let Some((picked, language)) = self
+            .tracks
+            .iter()
+            .find(|t| t.index == self.index)
+            .and_then(|t| {
+                Some((
+                    t,
+                    t.language
+                        .as_deref()?,
+                ))
+            })
+        else {
+            return Some(self.index);
+        };
+        let tracks: Vec<(AudioTrack, bool)> = source
+            .media_streams
+            .iter()
+            .filter_map(|s| Some((AudioTrack::of(s)?, s.is_default == Some(true))))
+            .collect();
+        if tracks
+            .iter()
+            .map(|(t, _)| t)
+            .eq(&self.tracks)
+        {
+            return Some(self.index);
+        }
+        tracks
+            .iter()
+            .filter(|(t, _)| {
+                t.language
+                    .as_deref()
+                    == Some(language)
+            })
+            .min_by_key(|(t, default)| (t.commentary != picked.commentary, !default))
+            .map(|(t, _)| t.index)
+    }
+
+    /// The audio track `source` plays when the client asks for none:
+    /// its resolved default, else the first audio track, which players fall
+    /// back to. A reported track that differs was picked by the user.
+    /// `remembered_audio` is [`Self::index_for`] for `source`.
+    pub fn automatic_index(
+        source: &api::MediaSourceInfo,
+        user_cfg: &api::UserConfiguration,
+        original_language: Option<&str>,
+        remembered_audio: Option<i64>,
+    ) -> Option<i64> {
+        let mut automatic = api::MediaSourceInfo {
+            media_streams: source
+                .media_streams
+                .clone(),
+            ..Default::default()
+        };
+        automatic.resolve_default_streams(
+            user_cfg,
+            None,
+            original_language,
+            None,
+            None,
+            remembered_audio,
+            None,
+        );
+        automatic
+            .default_audio_stream_index
+            .or_else(|| {
+                source
+                    .media_streams
+                    .iter()
+                    .find(|s| matches!(s.type_, Some(MediaStreamType::Audio)))
+                    .map(|s| s.index)
+            })
+    }
 }
 
 pub(crate) struct StreamServiceConfig {
@@ -204,13 +374,16 @@ impl StreamService {
                         ranking.subtitle_mode,
                     )
                 });
+            let remembered_audio = prefs
+                .remembered_audio
+                .and_then(|audio| audio.index_for(source.id, &info));
             info.resolve_default_streams(
                 prefs.user_cfg,
                 prefs.server_metadata_language,
                 prefs.original_language,
                 prefs.requested_audio,
                 prefs.requested_subtitle,
-                prefs.remembered_audio,
+                remembered_audio,
                 prefs.remembered_subtitle,
             );
             (info, allow_subtitle_extraction)
@@ -1008,6 +1181,75 @@ impl StreamService {
                 effective_stream_id,
             );
         }
+        // Playback reports name a stream less precisely than stream URLs (no
+        // MediaSourceId, or the item's id on an unanswered play session), so
+        // they are paired with the user's own latest answer on this device:
+        // a DeviceId can be shared by several users of one client.
+        if let Some(user_id) = self.user_id {
+            for answered_source in [None, Some(source_id)] {
+                self.ctx
+                    .store
+                    .save(
+                        Self::answer_key(
+                            user_id,
+                            device_id,
+                            self.item_id,
+                            answered_source,
+                        ),
+                        effective_stream_id,
+                        std::time::Duration::from_secs(24 * 3600),
+                    );
+            }
+        }
+    }
+
+    /// The stream the user's latest PlaybackInfo answer for `item_id` on this
+    /// device selected when asked for `source_id` (item, group, or stream
+    /// ID), or for any source when `None`.
+    pub fn answered_stream_for(
+        ctx: &AppContext,
+        user_id: Uuid,
+        device_id: &str,
+        item_id: Uuid,
+        source_id: Option<Uuid>,
+    ) -> Option<Uuid> {
+        ctx.store
+            .get::<Uuid>(Self::answer_key(user_id, device_id, item_id, source_id))
+            .map(|id| *id)
+    }
+
+    /// The item's first stream in the stored order (no addon refresh): the
+    /// one its id stands for as a source id (Jellyfin's id for the
+    /// first-ranked source) when no PlaybackInfo answer is known.
+    pub async fn first_stored_stream_id(
+        ctx: &AppContext,
+        item_id: Uuid,
+    ) -> Option<Uuid> {
+        let mut item = db::Media::get_by_id(&ctx.db, &item_id)
+            .await
+            .ok()
+            .flatten()?;
+        item.streams(&ctx.db)
+            .await
+            .ok()?
+            .first()
+            .map(|s| s.id)
+    }
+
+    /// `source_id` is the id PlaybackInfo was asked for; `None` keys the
+    /// latest answer for any.
+    fn answer_key(
+        user_id: Uuid,
+        device_id: &str,
+        item_id: Uuid,
+        source_id: Option<Uuid>,
+    ) -> String {
+        match source_id {
+            Some(source_id) => {
+                format!("pstream:answer:{user_id}:{device_id}:{item_id}:{source_id}")
+            }
+            None => format!("pstream:answer:{user_id}:{device_id}:{item_id}"),
+        }
     }
 
     /// The device-keyed mapping for `source_id`; see `save_selected_stream`.
@@ -1090,6 +1332,64 @@ impl StreamService {
 
     fn selected_stream_key(play_session_id: &str, source_id: Uuid) -> String {
         format!("pstream:psid:{play_session_id}:{source_id}")
+    }
+
+    /// Records the audio track `stream_id` plays unless the client asks for
+    /// another ([`RememberedAudio::automatic_index`]) as this PlaybackInfo
+    /// answer resolved it, for playback reports to compare theirs against.
+    /// Keyed by play session, and by user and device like the answer
+    /// `save_selected_stream` records for reports.
+    pub fn save_automatic_audio(
+        ctx: &AppContext,
+        play_session_id: &str,
+        user_id: Uuid,
+        device_id: &str,
+        item_id: Uuid,
+        stream_id: Uuid,
+        index: Option<i64>,
+    ) {
+        for key in [
+            Self::automatic_audio_key(play_session_id, stream_id),
+            Self::user_automatic_audio_key(user_id, device_id, item_id, stream_id),
+        ] {
+            ctx.store
+                .save(key, index, std::time::Duration::from_secs(24 * 3600));
+        }
+    }
+
+    /// The track [`Self::save_automatic_audio`] recorded for a playback
+    /// report on `stream_id`: by play session when the report has one, else
+    /// the user's latest on this device.
+    pub fn automatic_audio_for(
+        ctx: &AppContext,
+        user_id: Uuid,
+        device_id: &str,
+        item_id: Uuid,
+        stream_id: Uuid,
+        play_session_id: Option<&str>,
+    ) -> Option<i64> {
+        let key = match play_session_id {
+            Some(psid) => Self::automatic_audio_key(psid, stream_id),
+            None => {
+                Self::user_automatic_audio_key(user_id, device_id, item_id, stream_id)
+            }
+        };
+        ctx.store
+            .get::<Option<i64>>(key)
+            .and_then(|index| *index)
+    }
+
+    fn automatic_audio_key(play_session_id: &str, stream_id: Uuid) -> String {
+        format!("pstream:audio:psid:{play_session_id}:{stream_id}")
+    }
+
+    fn user_automatic_audio_key(
+        user_id: Uuid,
+        device_id: &str,
+        item_id: Uuid,
+        stream_id: Uuid,
+    ) -> String {
+        format!("pstream:audio:{user_id}:{device_id}:{item_id}:{stream_id}")
     }
 
     /// Persist the resolved stream UUID in the device-preference store (24 h TTL).
@@ -1677,6 +1977,171 @@ mod tests {
             probe_ids,
             vec![original_ids[1], original_ids[2], original_ids[0]]
         );
+    }
+
+    /// A source of audio tracks (language, title, container default), the
+    /// first at index 1; an empty language or title is unset.
+    fn audio_source(tracks: &[(&str, &str, bool)]) -> api::MediaSourceInfo {
+        let set = |s: &str| (!s.is_empty()).then(|| s.to_string());
+        api::MediaSourceInfo {
+            media_streams: tracks
+                .iter()
+                .zip(1..)
+                .map(|(&(language, title, default), index)| api::MediaStream {
+                    type_: Some(MediaStreamType::Audio),
+                    index,
+                    language: set(language),
+                    title: set(title),
+                    is_default: Some(default),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn languages(languages: &[&str]) -> api::MediaSourceInfo {
+        audio_source(
+            &languages
+                .iter()
+                .map(|&language| (language, "", false))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    /// Track `index` remembered on `stream_id`, whose tracks are `source`'s.
+    fn remembered(
+        index: i64,
+        stream_id: Uuid,
+        chosen: bool,
+        source: &api::MediaSourceInfo,
+    ) -> RememberedAudio {
+        RememberedAudio {
+            index,
+            stream_id: Some(stream_id),
+            chosen,
+            tracks: source
+                .media_streams
+                .iter()
+                .filter_map(AudioTrack::of)
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn remembered_audio_index_follows_its_language_to_other_streams() {
+        let picked_on = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        let ita_eng = languages(&["ita", "eng"]);
+        let english = remembered(2, picked_on, true, &ita_eng);
+        assert_eq!(english.index_for(picked_on, &ita_eng), Some(2));
+        assert_eq!(
+            english.index_for(other, &languages(&["eng", "ita"])),
+            Some(1)
+        );
+        assert_eq!(english.index_for(other, &languages(&["ita", "ger"])), None);
+
+        // Legacy (no stream recorded) or unknown language: keep the index.
+        let legacy = RememberedAudio {
+            stream_id: None,
+            ..remembered(2, picked_on, true, &ita_eng)
+        };
+        let untagged = remembered(2, picked_on, true, &languages(&["ita", ""]));
+        for audio in [legacy, untagged] {
+            assert_eq!(audio.index_for(other, &languages(&["ita", "ger"])), Some(2));
+        }
+    }
+
+    /// The only track of an English dub played by default; other releases
+    /// keep their own default instead of switching to English.
+    #[test]
+    fn remembered_audio_that_played_by_default_stays_on_its_stream() {
+        let dub = Uuid::new_v4();
+        let english = languages(&["eng"]);
+        let played = remembered(1, dub, false, &english);
+        assert_eq!(played.index_for(dub, &english), Some(1));
+        assert_eq!(
+            played.index_for(Uuid::new_v4(), &languages(&["jpn", "eng"])),
+            None
+        );
+    }
+
+    /// Among several tracks in the remembered language, the main one wins
+    /// over the one at the remembered index, unless the tracks are laid out
+    /// as on the stream the pick was made on.
+    #[test]
+    fn remembered_audio_prefers_the_main_track_in_its_language() {
+        let picked_on = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        let fre_kor = languages(&["fre", "kor"]);
+        let korean = remembered(2, picked_on, true, &fre_kor);
+        assert_eq!(
+            korean.index_for(
+                other,
+                &audio_source(&[
+                    ("kor", "TrueHD 7.1", true),
+                    ("kor", "DD 5.1", false),
+                    ("eng", "", false),
+                ])
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            korean.index_for(
+                other,
+                &audio_source(&[
+                    ("kor", "", false),
+                    ("kor", "Director's Commentary", true),
+                    ("eng", "", false),
+                ])
+            ),
+            Some(1)
+        );
+
+        // A picked commentary finds the commentary.
+        let commentary = remembered(
+            2,
+            picked_on,
+            true,
+            &audio_source(&[("fre", "", true), ("fre", "Commentary", false)]),
+        );
+        assert_eq!(
+            commentary.index_for(
+                other,
+                &audio_source(&[("fre", "Commentary", false), ("fre", "", true)])
+            ),
+            Some(1)
+        );
+
+        // Laid out identically (e.g. another encode): the same track.
+        assert_eq!(korean.index_for(other, &fre_kor), Some(2));
+        let kor_kor = languages(&["kor", "kor"]);
+        assert_eq!(
+            remembered(2, picked_on, true, &kor_kor).index_for(other, &kor_kor),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn automatic_audio_is_the_resolved_default_else_the_first_track() {
+        let cfg = api::UserConfiguration {
+            play_default_audio_track: true,
+            remember_audio_selections: true,
+            ..Default::default()
+        };
+        let eng_jpn = languages(&["eng", "jpn"]);
+        let automatic = |original_language, remembered| {
+            RememberedAudio::automatic_index(
+                &eng_jpn,
+                &cfg,
+                original_language,
+                remembered,
+            )
+        };
+        assert_eq!(automatic(Some("jpn"), None), Some(2));
+        assert_eq!(automatic(Some("jpn"), Some(1)), Some(1));
+        // Nothing matches and nothing is flagged default.
+        assert_eq!(automatic(None, None), Some(1));
     }
 
     #[test]

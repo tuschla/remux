@@ -54,7 +54,10 @@ use crate::{
         session::{TranscodeSession, TranscodeState},
     },
     sdks,
-    services::{MediaResolveService, ProbeResult, StreamService, StreamServiceConfig},
+    services::{
+        MediaResolveService, ProbeResult, RememberedAudio, StreamService,
+        StreamServiceConfig,
+    },
     torrent,
 };
 use axum_anyhow::ApiResult as Result;
@@ -166,7 +169,7 @@ async fn load_saved_selections(
     db: &sqlx::SqlitePool,
     user_id: &uuid::Uuid,
     media_id: &uuid::Uuid,
-) -> (Option<i64>, Option<i64>) {
+) -> (Option<RememberedAudio>, Option<i64>) {
     let media = crate::db::Media::get_by_id(db, media_id)
         .await
         .ok()
@@ -182,7 +185,9 @@ async fn load_saved_selections(
     .fetch_optional(db)
     .await
     {
-        Ok(Some(state)) => (state.audio_idx, state.subtitle_idx),
+        Ok(Some(state)) => {
+            (RememberedAudio::load(db, &state).await, state.subtitle_idx)
+        }
         _ => (None, None),
     }
 }
@@ -477,7 +482,7 @@ async fn items_playbackinfo_inner(
         original_language: ranking_original_language.as_deref(),
         requested_audio: q.audio_stream_index,
         requested_subtitle: q.subtitle_stream_index,
-        remembered_audio: saved_audio,
+        remembered_audio: saved_audio.as_ref(),
         remembered_subtitle: saved_subtitle,
     };
 
@@ -616,13 +621,16 @@ async fn items_playbackinfo_inner(
         // per-request API values (never persisted); resolving before the transcode
         // decision and subtitle delivery means those consumers see the stream the
         // client will actually get.
+        let remembered_audio = saved_audio
+            .as_ref()
+            .and_then(|audio| audio.index_for(effective_stream.id, &source));
         source.resolve_default_streams(
             &user_cfg,
             server_subtitle_lang,
             original_language.as_deref(),
             q.audio_stream_index,
             q.subtitle_stream_index,
-            saved_audio,
+            remembered_audio,
             saved_subtitle,
         );
         let effective_sub_idx = q
@@ -885,15 +893,41 @@ async fn items_playbackinfo_inner(
 
     // Re-resolve defaults after external subtitles were injected so language
     // matching can also pick addon subtitles (same request context as the
-    // per-source resolve inside the probe loop).
-    for source in &mut media_sources {
+    // per-source resolve inside the probe loop). Each listed stream's own
+    // default track is recorded too: a playback report on another track
+    // tells a pick the user made from a default that just played.
+    for (source, extras) in media_sources
+        .iter_mut()
+        .zip(&source_extras)
+    {
+        let remembered_audio = saved_audio
+            .as_ref()
+            .and_then(|audio| audio.index_for(extras.effective_stream_id, source));
+        StreamService::save_automatic_audio(
+            &state.ctx,
+            &play_session_id,
+            session
+                .user
+                .id,
+            &session
+                .device
+                .id,
+            id,
+            extras.effective_stream_id,
+            RememberedAudio::automatic_index(
+                source,
+                &user_cfg,
+                original_language.as_deref(),
+                remembered_audio,
+            ),
+        );
         source.resolve_default_streams(
             &user_cfg,
             server_subtitle_lang,
             original_language.as_deref(),
             q.audio_stream_index,
             q.subtitle_stream_index,
-            saved_audio,
+            remembered_audio,
             saved_subtitle,
         );
     }
@@ -4477,6 +4511,289 @@ mod tests {
         assert!(
             body["MediaSources"][0]["DefaultAudioStreamIndex"].is_null(),
             "With RememberAudioSelections=false, audio track switch must not be recalled and nothing is flagged default"
+        );
+    }
+
+    /// Sends a playback start and progress `report`, then returns the
+    /// remembered audio (index, stream, chosen).
+    async fn report_audio(
+        server: &axum_test::TestServer,
+        auth: &HeaderValue,
+        ctx: &crate::AppContext,
+        user_id: uuid::Uuid,
+        media_id: uuid::Uuid,
+        report: &serde_json::Value,
+    ) -> (Option<i64>, Option<uuid::Uuid>, bool) {
+        for path in ["/sessions/playing", "/sessions/playing/progress"] {
+            server
+                .post(path)
+                .add_header(http::header::AUTHORIZATION, auth.clone())
+                .json(report)
+                .await;
+        }
+        let state = sqlx::query_as::<_, crate::db::UserMediaState>(
+            "SELECT * FROM user_media_state WHERE user_id = ?1 AND media_id = ?2",
+        )
+        .bind(user_id)
+        .bind(media_id)
+        .fetch_one(&ctx.db)
+        .await
+        .unwrap();
+        (state.audio_idx, state.audio_stream_id(), state.audio_chosen)
+    }
+
+    /// A remembered audio index is stored with the stream PlaybackInfo
+    /// selected (here ranked first by bitrate), not the item's first stream,
+    /// and counts as chosen only when it differs from the track PlaybackInfo
+    /// had that stream play; the default playing on another release keeps a
+    /// chosen track. Without that selection (unanswered PlaySessionId, or
+    /// after a restart) the index is paired with the reported stream source,
+    /// for the item's own id with the stream ranked first (the user's last
+    /// answer on the device, else the stored order), and without a source
+    /// with the stream the user was last told to play there. Only with none
+    /// of that known is it stored without a stream.
+    #[tokio::test]
+    async fn test_remembered_audio_records_the_selected_stream() {
+        let (server, guard, token) = authenticated_server().await;
+        let auth = HeaderValue::from_str(&auth_header_with_token(&token)).unwrap();
+        let ctx = &guard.0;
+        let owner = crate::integration_test::seed_movie(ctx).await;
+        let mut releases = vec![];
+        for (idx, bitrate) in [8_000_000, 20_000_000]
+            .into_iter()
+            .enumerate()
+        {
+            let mut stream = insert_test_source(ctx).await;
+            let path = format!("{idx}.mkv");
+            stream.title = format!("Release {idx}");
+            stream
+                .stream_info
+                .as_mut()
+                .unwrap()
+                .descriptor = crate::stream::StreamDescriptor::Local(path.into());
+            let probe = stream
+                .probe_data
+                .as_mut()
+                .unwrap();
+            probe.bitrate = Some(bitrate);
+            probe
+                .media_streams
+                .push(crate::api::MediaStream {
+                    codec: Some("aac".to_string()),
+                    type_: Some(crate::api::MediaStreamType::Audio),
+                    index: 2,
+                    ..Default::default()
+                });
+            stream
+                .save(&ctx.db)
+                .await
+                .unwrap();
+            // `Media::save` doesn't update `parent_id`.
+            sqlx::query("UPDATE media SET parent_id = ?, idx = ? WHERE id = ?")
+                .bind(owner.id)
+                .bind(idx as i64)
+                .bind(stream.id)
+                .execute(&ctx.db)
+                .await
+                .unwrap();
+            releases.push(stream.id);
+        }
+        // Within the streams TTL, so no addon refresh drops the rows above.
+        sqlx::query("UPDATE media SET streams_refreshed_at = ? WHERE id = ?")
+            .bind(chrono::Utc::now().naive_utc() - chrono::Duration::seconds(30))
+            .bind(owner.id)
+            .execute(&ctx.db)
+            .await
+            .unwrap();
+
+        let device = crate::db::auth::Device::get_by_access_token(&ctx.db, &token)
+            .await
+            .unwrap()
+            .unwrap();
+        let report =
+            |source: Option<serde_json::Value>, psid: serde_json::Value, audio: i64| {
+                let mut report = json!({
+                    "ItemId": owner.id.to_string(),
+                    "PlaySessionId": psid,
+                    "PositionTicks": 100_000_000i64,
+                    "AudioStreamIndex": audio
+                });
+                if let Some(source) = source {
+                    report["MediaSourceId"] = source;
+                }
+                report
+            };
+        let unanswered = json!("unanswered");
+        let item_source = Some(json!(
+            owner
+                .id
+                .to_string()
+        ));
+
+        // No PlaybackInfo answered yet.
+        for (report, remembered) in [
+            (report(None, unanswered.clone(), 1), (1, None, false)),
+            (
+                report(item_source.clone(), unanswered.clone(), 2),
+                (2, Some(releases[0]), false),
+            ),
+        ] {
+            let (index, stream, chosen) = remembered;
+            assert_eq!(
+                report_audio(&server, &auth, ctx, device.user_id, owner.id, &report)
+                    .await,
+                (Some(index), stream, chosen),
+                "{report}"
+            );
+        }
+
+        // Start the answered phase with nothing remembered: a remembered
+        // track becomes the stream's default PlaybackInfo records, so the
+        // pick above would make track 1 a change on `releases[0]`.
+        sqlx::query(
+            "DELETE FROM user_media_state WHERE user_id = ?1 AND media_id = ?2",
+        )
+        .bind(device.user_id)
+        .bind(owner.id)
+        .execute(&ctx.db)
+        .await
+        .unwrap();
+
+        let info: serde_json::Value = server
+            .post(&format!("/items/{}/playbackinfo", owner.id))
+            .add_header(http::header::AUTHORIZATION, auth.clone())
+            .json(&json!({}))
+            .await
+            .json();
+        assert_eq!(info["MediaSources"][0]["Name"], "Release 1", "{info}");
+        let psid = info["PlaySessionId"].clone();
+        let selected = Some(info["MediaSources"][0]["Id"].clone());
+        let release = |i: usize| Some(json!(releases[i].to_string()));
+        for (report, remembered) in [
+            (
+                report(selected.clone(), psid.clone(), 1),
+                (1, Some(releases[1]), false),
+            ),
+            (
+                report(selected, psid.clone(), 2),
+                (2, Some(releases[1]), true),
+            ),
+            (
+                report(release(0), psid.clone(), 1),
+                (2, Some(releases[1]), true),
+            ),
+            (
+                report(item_source.clone(), unanswered.clone(), 2),
+                (2, Some(releases[1]), true),
+            ),
+            (
+                report(item_source.clone(), unanswered.clone(), 3),
+                (3, Some(releases[1]), false),
+            ),
+            (
+                report(release(0), unanswered.clone(), 1),
+                (1, Some(releases[0]), false),
+            ),
+        ] {
+            let (index, stream, chosen) = remembered;
+            assert_eq!(
+                report_audio(&server, &auth, ctx, device.user_id, owner.id, &report)
+                    .await,
+                (Some(index), stream, chosen),
+                "{report}"
+            );
+        }
+
+        // A report without a MediaSourceId on a play session PlaybackInfo
+        // answered for a specific release.
+        let info: serde_json::Value = server
+            .post(&format!("/items/{}/playbackinfo", owner.id))
+            .add_header(http::header::AUTHORIZATION, auth.clone())
+            .json(&json!({ "MediaSourceId": releases[0].to_string() }))
+            .await
+            .json();
+        let report = report(None, info["PlaySessionId"].clone(), 2);
+        assert_eq!(
+            report_audio(&server, &auth, ctx, device.user_id, owner.id, &report).await,
+            (Some(2), Some(releases[0]), true),
+            "{report}"
+        );
+    }
+
+    /// Two users of one client share its DeviceId. A report that names no
+    /// stream PlaybackInfo answered is paired with the reporting user's own
+    /// latest answer on the device, never with the other user's.
+    #[tokio::test]
+    async fn test_remembered_audio_ignores_another_users_answer_on_the_device() {
+        let (server, guard, token) = authenticated_server().await;
+        let auth = HeaderValue::from_str(&auth_header_with_token(&token)).unwrap();
+        let ctx = &guard.0;
+        let owner = crate::integration_test::seed_movie(ctx).await;
+        let release = insert_test_source(ctx).await;
+        // `Media::save` doesn't update `parent_id`.
+        sqlx::query("UPDATE media SET parent_id = ?, idx = 0 WHERE id = ?")
+            .bind(owner.id)
+            .bind(release.id)
+            .execute(&ctx.db)
+            .await
+            .unwrap();
+        // Within the streams TTL, so no addon refresh drops the row above.
+        sqlx::query("UPDATE media SET streams_refreshed_at = ? WHERE id = ?")
+            .bind(chrono::Utc::now().naive_utc() - chrono::Duration::seconds(30))
+            .bind(owner.id)
+            .execute(&ctx.db)
+            .await
+            .unwrap();
+
+        server
+            .post("/users/new")
+            .add_header(http::header::AUTHORIZATION, auth.clone())
+            .json(&json!({ "Name": "other", "Password": "pass1234" }))
+            .await;
+        // Same DeviceId as the first user's token.
+        let other: serde_json::Value = server
+            .post("/users/authenticatebyname")
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_static(AUTH_HEADER),
+            )
+            .json(&json!({ "Username": "other", "Pw": "pass1234" }))
+            .await
+            .json();
+        let other_auth = HeaderValue::from_str(&auth_header_with_token(
+            other["AccessToken"]
+                .as_str()
+                .unwrap(),
+        ))
+        .unwrap();
+        let playback_info = |auth: HeaderValue| {
+            server
+                .post(&format!("/items/{}/playbackinfo", owner.id))
+                .add_header(http::header::AUTHORIZATION, auth)
+                .json(&json!({ "MediaSourceId": release.id.to_string() }))
+        };
+        playback_info(other_auth).await;
+
+        let user_id = crate::db::auth::Device::get_by_access_token(&ctx.db, &token)
+            .await
+            .unwrap()
+            .unwrap()
+            .user_id;
+        let report = json!({
+            "ItemId": owner.id.to_string(),
+            "PlaySessionId": "unanswered",
+            "PositionTicks": 100_000_000i64,
+            "AudioStreamIndex": 1
+        });
+        assert_eq!(
+            report_audio(&server, &auth, ctx, user_id, owner.id, &report).await,
+            (Some(1), None, false)
+        );
+
+        playback_info(auth.clone()).await;
+        assert_eq!(
+            report_audio(&server, &auth, ctx, user_id, owner.id, &report).await,
+            (Some(1), Some(release.id), false)
         );
     }
 

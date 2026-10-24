@@ -12,12 +12,24 @@ use crate::{
 };
 use remux_sdks::remux::{PlayMethod, PlaybackInfo, QueueItem};
 
+/// The concrete stream behind a playback report's source, which a reported
+/// audio track index points into.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PlayedStream {
+    pub id: Uuid,
+    /// The track PlaybackInfo had the stream play unless asked for another;
+    /// `None` when no PlaybackInfo answer for the report is known.
+    pub automatic_audio: Option<i64>,
+}
+
 #[derive(Clone)]
 pub struct PlaybackSession {
     pub play_session_id: String,
     pub user_id: Uuid,
     pub item_id: Uuid,
     pub media_source_id: Option<String>,
+    /// Concrete stream PlaybackInfo selected behind `media_source_id`.
+    pub played_stream: Option<PlayedStream>,
     pub device_id: String,
     pub client_name: String,
     pub position_ticks: i64,
@@ -173,6 +185,7 @@ impl PlaybackSessionManager {
         db: &sqlx::SqlitePool,
         auth_session: &auth::AuthSession,
         data: &PlaybackInfo,
+        played_stream: Option<PlayedStream>,
     ) -> anyhow::Result<()> {
         let play_session_id = data
             .play_session_id
@@ -279,6 +292,7 @@ impl PlaybackSessionManager {
             media_source_id: data
                 .media_source_id
                 .clone(),
+            played_stream,
             device_id: auth_session
                 .device
                 .id
@@ -401,13 +415,15 @@ impl PlaybackSessionManager {
     ///
     /// Updates the in-memory session state, notifies the transcode buffer
     /// monitor, persists the playback position to the DB, and logs stream-
-    /// selection changes.
+    /// selection changes. `reported_stream` is the stream PlaybackInfo
+    /// selected for the report's source, used when the session has none.
     pub async fn progress(
         &self,
         db: &sqlx::SqlitePool,
         user: &db::User,
         psid: &str,
         data: &PlaybackInfo,
+        reported_stream: Option<PlayedStream>,
     ) -> anyhow::Result<()> {
         let ps_snapshot = self.get(psid);
         let ps = match ps_snapshot.as_ref() {
@@ -558,10 +574,23 @@ impl PlaybackSessionManager {
                 })
                 .unwrap_or_default();
 
-            let audio_idx = if cfg.remember_audio_selections {
+            let audio = if cfg.remember_audio_selections {
                 data.audio_stream_index
                     .or(ps.audio_stream_index)
-                    .map(|x| x as i64)
+                    .map(|x| {
+                        let index = x as i64;
+                        let played = ps
+                            .played_stream
+                            .filter(|_| ps.item_id == item_id)
+                            .or(reported_stream);
+                        db::AudioPick {
+                            index,
+                            stream_id: played.map(|p| p.id),
+                            chosen: played
+                                .and_then(|p| p.automatic_audio)
+                                .is_some_and(|automatic| automatic != index),
+                        }
+                    })
             } else {
                 None
             };
@@ -578,7 +607,7 @@ impl PlaybackSessionManager {
                 user,
                 &media,
                 position_ticks,
-                audio_idx,
+                audio,
                 subtitle_idx,
                 media.runtime,
             )
@@ -978,6 +1007,7 @@ impl PlaybackSessionManager {
                         user_id: Uuid::nil(),
                         item_id: Uuid::nil(),
                         media_source_id: None,
+                        played_stream: None,
                         device_id: inherited_device_id,
                         client_name: String::new(),
                         position_ticks: 0,
@@ -1279,6 +1309,7 @@ mod tests {
             play_session_id: id.to_string(),
             user_id: Uuid::nil(),
             item_id: Uuid::new_v4(),
+            played_stream: None,
             media_source_id: None,
             device_id: String::new(),
             client_name: String::new(),

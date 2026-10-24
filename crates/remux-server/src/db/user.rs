@@ -445,8 +445,25 @@ pub struct UserMediaState {
     pub last_played_at: Option<NaiveDateTime>,
     pub subtitle_idx: Option<i64>,
     pub audio_idx: Option<i64>,
+    /// The `audio_idx` that `stream_id` was recorded with; see
+    /// [`UserMediaState::audio_stream_id`].
+    pub stream_audio_idx: Option<i64>,
+    /// The user picked `audio_idx` over the track PlaybackInfo had the stream
+    /// play, so other releases follow it.
+    pub audio_chosen: bool,
     /// Set via [`UserMediaState::set_rating`] so it only holds parsed [`UserRating`]s.
     pub rating: Option<f64>,
+}
+
+/// The audio track a playback report says is playing.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AudioPick {
+    pub index: i64,
+    /// The stream `index` points into, when known.
+    pub stream_id: Option<Uuid>,
+    /// The track differs from the one PlaybackInfo had that stream play
+    /// unless asked for another, so the user picked it.
+    pub chosen: bool,
 }
 
 /// A personal rating on Jellyfin's 0-10 scale. Jellyfin stores no `Likes`
@@ -608,9 +625,10 @@ impl UserMediaState {
                                 .media_raw
                                 .clone()
                         }),
-                    stream_id: primary
-                        .stream_id
-                        .or(other.stream_id),
+                    // Paired with `audio_idx`.
+                    stream_id: primary.stream_id,
+                    stream_audio_idx: primary.stream_audio_idx,
+                    audio_chosen: primary.audio_chosen,
                     favorite: existing.favorite || old_row.favorite,
                     play_count: existing
                         .play_count
@@ -645,9 +663,10 @@ impl UserMediaState {
             r#"
             INSERT INTO user_media_state (
                 user_id, media_id, media_raw, stream_id, favorite, play_count,
-                played_at, playback_position, last_played_at, subtitle_idx, audio_idx, rating
+                played_at, playback_position, last_played_at, subtitle_idx, audio_idx, rating,
+                stream_audio_idx, audio_chosen
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
             ON CONFLICT(user_id, media_id) DO UPDATE SET
                 media_raw = excluded.media_raw,
                 stream_id = excluded.stream_id,
@@ -658,7 +677,9 @@ impl UserMediaState {
                 last_played_at = excluded.last_played_at,
                 subtitle_idx = excluded.subtitle_idx,
                 audio_idx = excluded.audio_idx,
-                rating = excluded.rating
+                rating = excluded.rating,
+                stream_audio_idx = excluded.stream_audio_idx,
+                audio_chosen = excluded.audio_chosen
             "#,
         )
         .bind(merged.user_id)
@@ -673,6 +694,8 @@ impl UserMediaState {
         .bind(merged.subtitle_idx)
         .bind(merged.audio_idx)
         .bind(merged.rating)
+        .bind(merged.stream_audio_idx)
+        .bind(merged.audio_chosen)
         .execute(&mut *tx)
         .await?;
 
@@ -1026,12 +1049,61 @@ impl UserMediaState {
             .map(|r| r >= UserRating::LIKE_THRESHOLD)
     }
 
+    /// The stream the remembered `audio_idx` points into. Older builds update
+    /// `audio_idx` alone and leave a `stream_id` recorded for another index.
+    /// Known limitation: an older build re-picking the same index, on another
+    /// stream, leaves the pair looking valid, so the old stream's track
+    /// language still applies.
+    pub fn audio_stream_id(&self) -> Option<Uuid> {
+        self.stream_id
+            .filter(|_| {
+                self.stream_audio_idx
+                    .is_some()
+                    && self.stream_audio_idx == self.audio_idx
+            })
+    }
+
+    /// Remembers the audio track a playback report says is playing.
+    fn remember_audio(&mut self, pick: AudioPick) {
+        let stored_stream = self.audio_stream_id();
+        // Unknown, the stored stream stays only for an unchanged index.
+        if self.audio_idx == Some(pick.index)
+            && pick
+                .stream_id
+                .is_none_or(|id| stored_stream == Some(id))
+            && (self.audio_chosen || !pick.chosen)
+        {
+            return;
+        }
+        // The track another stream merely played by default (often the
+        // remembered pick, found there by language) must not replace the pick
+        // other streams follow.
+        if !pick.chosen
+            && self.audio_chosen
+            && stored_stream.is_some()
+            && pick
+                .stream_id
+                .is_some_and(|id| stored_stream != Some(id))
+        {
+            return;
+        }
+        self.audio_idx = Some(pick.index);
+        self.stream_id = pick.stream_id;
+        self.stream_audio_idx = pick
+            .stream_id
+            .map(|_| pick.index);
+        self.audio_chosen = pick.chosen
+            && pick
+                .stream_id
+                .is_some();
+    }
+
     /// Persist playback position (and optionally stream-selection preferences)
     /// for a user/media pair.
     ///
     /// * `position_ticks` – current playback position in 100-nanosecond ticks.
-    /// * `audio_idx` / `subtitle_idx` – stream selections to remember; pass
-    ///   `None` to leave existing values unchanged.
+    /// * `audio` / `subtitle_idx` – stream selections to remember; pass
+    ///   `None` to leave existing values unchanged. See [`AudioPick`].
     /// * `runtime_seconds` – when `Some`, the 90 % "mark as watched" threshold
     ///   is applied. Pass `None` for progress updates (no watched-check) and
     ///   `Some(media.runtime)` for stop events.
@@ -1044,7 +1116,7 @@ impl UserMediaState {
         user: &User,
         media: &super::Media,
         position_ticks: i64,
-        audio_idx: Option<i64>,
+        audio: Option<AudioPick>,
         subtitle_idx: Option<i64>,
         runtime_seconds: Option<i64>,
     ) -> Result<bool> {
@@ -1052,8 +1124,8 @@ impl UserMediaState {
         let position_seconds = position_ticks / 10_000_000;
         ms.playback_position = position_seconds;
 
-        if let Some(idx) = audio_idx {
-            ms.audio_idx = Some(idx);
+        if let Some(pick) = audio {
+            ms.remember_audio(pick);
         }
         if let Some(idx) = subtitle_idx {
             ms.subtitle_idx = Some(idx);
@@ -1138,9 +1210,11 @@ impl UserMediaState {
                 last_played_at,
                 subtitle_idx,
                 audio_idx,
-                rating
+                rating,
+                stream_audio_idx,
+                audio_chosen
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
             ON CONFLICT(user_id, media_id)
             DO UPDATE SET
                 media_raw = excluded.media_raw,
@@ -1152,7 +1226,9 @@ impl UserMediaState {
                 last_played_at = excluded.last_played_at,
                 subtitle_idx = excluded.subtitle_idx,
                 audio_idx = excluded.audio_idx,
-                rating = excluded.rating
+                rating = excluded.rating,
+                stream_audio_idx = excluded.stream_audio_idx,
+                audio_chosen = excluded.audio_chosen
             "#,
         )
         .bind(self.user_id)
@@ -1167,6 +1243,8 @@ impl UserMediaState {
         .bind(self.subtitle_idx)
         .bind(self.audio_idx)
         .bind(self.rating)
+        .bind(self.stream_audio_idx)
+        .bind(self.audio_chosen)
         .execute(db)
         .await?;
 
@@ -1552,6 +1630,74 @@ mod rating_tests {
         assert_eq!(state(None).likes(), None);
         assert_eq!(state(Some(just_under_threshold())).likes(), Some(false));
         assert_eq!(state(Some(UserRating::LIKE_THRESHOLD)).likes(), Some(true));
+    }
+}
+
+#[cfg(test)]
+mod remembered_audio_tests {
+    use super::*;
+
+    fn pick(index: i64, stream_id: Option<Uuid>, chosen: bool) -> AudioPick {
+        AudioPick {
+            index,
+            stream_id,
+            chosen,
+        }
+    }
+
+    fn remembered(state: &UserMediaState) -> (Option<i64>, Option<Uuid>, bool) {
+        (state.audio_idx, state.audio_stream_id(), state.audio_chosen)
+    }
+
+    /// A track that just played by default is remembered for its own stream;
+    /// a track the user picked stays until they pick again, whatever other
+    /// releases play by default meanwhile.
+    #[test]
+    fn a_default_that_played_never_replaces_a_chosen_track() {
+        let [dub, original, other] = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
+        let mut state = UserMediaState::default();
+
+        state.remember_audio(pick(1, Some(dub), false));
+        assert_eq!(remembered(&state), (Some(1), Some(dub), false));
+
+        state.remember_audio(pick(2, Some(original), true));
+        assert_eq!(remembered(&state), (Some(2), Some(original), true));
+
+        // Another release playing the picked language by default, at 1.
+        state.remember_audio(pick(1, Some(other), false));
+        assert_eq!(remembered(&state), (Some(2), Some(original), true));
+
+        // Back to the default on the stream the pick was made on.
+        state.remember_audio(pick(1, Some(original), false));
+        assert_eq!(remembered(&state), (Some(1), Some(original), false));
+    }
+
+    #[test]
+    fn an_unknown_stream_keeps_the_stored_one_only_for_an_unchanged_index() {
+        let stream = Uuid::new_v4();
+        let mut state = UserMediaState::default();
+        state.remember_audio(pick(2, Some(stream), true));
+
+        state.remember_audio(pick(2, None, false));
+        assert_eq!(remembered(&state), (Some(2), Some(stream), true));
+
+        state.remember_audio(pick(3, None, false));
+        assert_eq!(remembered(&state), (Some(3), None, false));
+    }
+
+    /// Older builds update `audio_idx` alone, so the stream recorded for the
+    /// previous index no longer describes it.
+    #[test]
+    fn a_stream_recorded_for_another_index_is_not_trusted() {
+        let [picked_on, other] = [Uuid::new_v4(), Uuid::new_v4()];
+        let mut state = UserMediaState::default();
+        state.remember_audio(pick(2, Some(picked_on), true));
+        state.audio_idx = Some(3);
+        assert_eq!(state.audio_stream_id(), None);
+
+        // Nor does its chosen flag hold off a default played elsewhere.
+        state.remember_audio(pick(1, Some(other), false));
+        assert_eq!(remembered(&state), (Some(1), Some(other), false));
     }
 }
 
