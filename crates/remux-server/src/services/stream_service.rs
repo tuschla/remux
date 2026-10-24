@@ -919,6 +919,11 @@ impl StreamService {
             })
             .collect();
 
+        // A live channel's sources are probed without seeking (see
+        // `probe_media_with`); its stream children are plain Stream rows.
+        let item_is_live = item
+            .as_ref()
+            .is_some_and(|it| it.is_live());
         let mut results = Vec::with_capacity(
             sel.candidates
                 .len(),
@@ -953,6 +958,7 @@ impl StreamService {
                 &stream,
                 url_opt,
                 skip_probe,
+                item_is_live || stream.is_live(),
                 timeout_secs,
                 auto_next,
                 max_retries,
