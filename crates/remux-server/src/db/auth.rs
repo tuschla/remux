@@ -775,67 +775,67 @@ fn header_text_lossy(v: &http::HeaderValue) -> String {
     String::from_utf8_lossy(v.as_bytes()).into_owned()
 }
 
+impl JellyfinAuthHeader {
+    /// Mirrors Jellyfin's `AuthorizationContext`: Client/Device/DeviceId/Version
+    /// come from the Authorization (or X-Emby-Authorization) header, while the
+    /// token is taken from the first non-empty source of: that header's
+    /// `Token`, X-Emby-Token, X-MediaBrowser-Token, then the `api_key` /
+    /// `ApiKey` (or legacy `token`) query parameter. A header that carries
+    /// only client info must not hide a token sent elsewhere.
+    fn from_headers_and_query(headers: &http::HeaderMap, query: Option<&str>) -> Self {
+        let mut auth = headers
+            .get(http::header::AUTHORIZATION)
+            .or_else(|| headers.get("X-Emby-Authorization"))
+            .map(header_text_lossy)
+            .and_then(|raw| JellyfinAuthHeader::from_str(&raw).ok())
+            .unwrap_or_default();
+
+        let has_token = |auth: &JellyfinAuthHeader| {
+            auth.token
+                .as_deref()
+                .is_some_and(|t| !t.is_empty())
+        };
+
+        if !has_token(&auth) {
+            auth.token = ["X-Emby-Token", "X-MediaBrowser-Token"]
+                .into_iter()
+                .filter_map(|name| headers.get(name))
+                .map(header_text_lossy)
+                .find(|t| !t.is_empty());
+        }
+
+        if !has_token(&auth) {
+            auth.token = query.and_then(|query| {
+                query
+                    .split('&')
+                    .filter_map(|pair| pair.split_once('='))
+                    .find(|(key, val)| {
+                        !val.is_empty()
+                            && (key.eq_ignore_ascii_case("api_key")
+                                || key.eq_ignore_ascii_case("apikey")
+                                || key.eq_ignore_ascii_case("token"))
+                    })
+                    .map(|(_, val)| val.to_string())
+            });
+        }
+
+        auth
+    }
+}
+
 impl FromRequestParts<AppState> for JellyfinAuthHeader {
     type Rejection = ApiError;
 
     async fn from_request_parts(
         parts: &mut Parts,
-        state: &AppState,
+        _state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        if let Some(auth) = parts
-            .headers
-            .get(http::header::AUTHORIZATION)
-            .or_else(|| {
-                parts
-                    .headers
-                    .get("X-Emby-Authorization")
-            })
-            .map(header_text_lossy)
-            .and_then(|raw| JellyfinAuthHeader::from_str(&raw).ok())
-        {
-            return Ok(auth);
-        }
-
-        // Try X-Emby / MediaBrowser token headers
-        let token = parts
-            .headers
-            .get("X-Emby-Token")
-            .or_else(|| {
-                parts
-                    .headers
-                    .get("X-MediaBrowser-Token")
-            })
-            .map(header_text_lossy);
-
-        if let Some(token) = token {
-            return Ok(JellyfinAuthHeader {
-                token: Some(token),
-                ..Default::default()
-            });
-        }
-
-        // Query params fallback
-        if let Some(query) = parts
-            .uri
-            .query()
-        {
-            for pair in query.split('&') {
-                let mut kv = pair.splitn(2, '=');
-                if let (Some(key), Some(val)) = (kv.next(), kv.next()) {
-                    if key.eq_ignore_ascii_case("api_key")
-                        || key.eq_ignore_ascii_case("apikey")
-                        || key.eq_ignore_ascii_case("token")
-                    {
-                        return Ok(JellyfinAuthHeader {
-                            token: Some(val.to_string()),
-                            ..Default::default()
-                        });
-                    }
-                }
-            }
-        }
-
-        Ok(JellyfinAuthHeader::default())
+        Ok(JellyfinAuthHeader::from_headers_and_query(
+            &parts.headers,
+            parts
+                .uri
+                .query(),
+        ))
     }
 }
 
@@ -924,6 +924,154 @@ mod tests {
                 "each key should own a session under its own device id: {device_ids:?}"
             );
         }
+    }
+
+    fn headers(pairs: &[(&str, &str)]) -> http::HeaderMap {
+        let mut map = http::HeaderMap::new();
+        for (name, value) in pairs {
+            map.insert(
+                http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                http::HeaderValue::from_str(value).unwrap(),
+            );
+        }
+        map
+    }
+
+    const CLIENT_ONLY: &str = r#"MediaBrowser Client="Jellyfin Web", Device="Firefox", DeviceId="dev-1", Version="10.10.0""#;
+
+    /// Jellyfin reads the token from the header, then X-Emby-Token /
+    /// X-MediaBrowser-Token, then the query string. A header carrying only
+    /// client info must fall through while still describing the client.
+    #[test]
+    fn header_without_token_falls_back_to_api_key_query() {
+        for name in ["Authorization", "X-Emby-Authorization"] {
+            for query in [
+                "api_key=secret",
+                "ApiKey=secret",
+                "Static=true&api_key=secret",
+            ] {
+                let auth = JellyfinAuthHeader::from_headers_and_query(
+                    &headers(&[(name, CLIENT_ONLY)]),
+                    Some(query),
+                );
+                assert_eq!(
+                    auth.token
+                        .as_deref(),
+                    Some("secret"),
+                    "{name} + ?{query}"
+                );
+                assert_eq!(
+                    auth.client
+                        .as_deref(),
+                    Some("Jellyfin Web")
+                );
+                assert_eq!(
+                    auth.device
+                        .as_deref(),
+                    Some("Firefox")
+                );
+                assert_eq!(
+                    auth.device_id
+                        .as_deref(),
+                    Some("dev-1")
+                );
+                assert_eq!(
+                    auth.version
+                        .as_deref(),
+                    Some("10.10.0")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn header_without_token_falls_back_to_token_headers() {
+        for name in ["X-Emby-Token", "X-MediaBrowser-Token"] {
+            let auth = JellyfinAuthHeader::from_headers_and_query(
+                &headers(&[("Authorization", CLIENT_ONLY), (name, "secret")]),
+                Some("api_key=other"),
+            );
+            assert_eq!(
+                auth.token
+                    .as_deref(),
+                Some("secret"),
+                "{name}"
+            );
+            assert_eq!(
+                auth.device_id
+                    .as_deref(),
+                Some("dev-1")
+            );
+        }
+    }
+
+    #[test]
+    fn empty_header_token_falls_back_to_api_key_query() {
+        let auth = JellyfinAuthHeader::from_headers_and_query(
+            &headers(&[(
+                "Authorization",
+                format!(r#"{CLIENT_ONLY}, Token="""#).as_str(),
+            )]),
+            Some("api_key=secret"),
+        );
+        assert_eq!(
+            auth.token
+                .as_deref(),
+            Some("secret")
+        );
+    }
+
+    #[test]
+    fn header_token_wins_over_other_sources() {
+        let auth = JellyfinAuthHeader::from_headers_and_query(
+            &headers(&[
+                (
+                    "Authorization",
+                    format!(r#"{CLIENT_ONLY}, Token="from-header""#).as_str(),
+                ),
+                ("X-Emby-Token", "from-emby-token"),
+            ]),
+            Some("api_key=from-query"),
+        );
+        assert_eq!(
+            auth.token
+                .as_deref(),
+            Some("from-header")
+        );
+    }
+
+    #[test]
+    fn non_mediabrowser_scheme_falls_back_to_api_key_query() {
+        let auth = JellyfinAuthHeader::from_headers_and_query(
+            &headers(&[("Authorization", "Bearer abc")]),
+            Some("api_key=secret"),
+        );
+        assert_eq!(
+            auth.token
+                .as_deref(),
+            Some("secret")
+        );
+    }
+
+    #[tokio::test]
+    async fn client_only_header_with_api_key_query_authenticates() {
+        use crate::integration_test::authenticated_server;
+        use http::header::{AUTHORIZATION, HeaderValue};
+
+        let (server, _guard, token) = authenticated_server().await;
+
+        server
+            .get(&format!("/users/me?api_key={token}"))
+            .add_header(AUTHORIZATION, HeaderValue::from_static(CLIENT_ONLY))
+            .await
+            .assert_status_ok();
+
+        server
+            .get("/users/me")
+            .add_header(AUTHORIZATION, HeaderValue::from_static(CLIENT_ONLY))
+            .expect_failure()
+            .await
+            .assert_status_unauthorized();
     }
 
     #[tokio::test]
