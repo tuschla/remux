@@ -1515,15 +1515,20 @@ async fn videos_stream_inner(
         .play_session_id
         .clone()
         .or_else(|| {
-            state
+            let device_id = q
+                .device_id
+                .as_deref()?;
+            let sessions = &state
                 .ctx
-                .sessions
-                .get_by_device(
-                    q.device_id
-                        .as_deref()?,
-                )
-                .filter(|session| session.item_id == id)
-                .map(|session| session.play_session_id)
+                .sessions;
+            // Without a token the user is unknown: only a device one user
+            // plays on says whose session this is.
+            match user_id {
+                Some(user_id) => sessions.get_by_device(device_id, user_id),
+                None => sessions.get_by_device_of_its_only_user(device_id),
+            }
+            .filter(|session| session.item_id == id)
+            .map(|session| session.play_session_id)
         });
     if let (Some(psid), crate::stream::StreamDescriptor::Torrent { info_hash, .. }) =
         (playback_id.as_deref(), &descriptor)
