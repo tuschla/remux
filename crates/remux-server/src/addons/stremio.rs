@@ -605,7 +605,7 @@ impl SearchAddon for StremioAddon {
         ctx: &AppContext,
     ) -> Result<Option<Vec<db::Media>>> {
         let svc = self.service()?;
-        stremio_search(&svc, kind, query, limit, ctx).await
+        stremio_search(&svc, self.addon_id, kind, query, limit, ctx).await
     }
 }
 
@@ -1638,13 +1638,12 @@ fn build_person_relations(
 /// empty answer.
 async fn stremio_search(
     svc: &stremio_service::StremioService,
+    addon_id: Uuid,
     kind: &db::MediaKind,
     query: &str,
     limit: usize,
     ctx: &AppContext,
 ) -> Result<Option<Vec<db::Media>>> {
-    use itertools::Itertools;
-
     let aio_type = match kind {
         db::MediaKind::Movie => sdks::stremio::MediaType::Movie,
         db::MediaKind::Series => sdks::stremio::MediaType::Series,
@@ -1662,7 +1661,22 @@ async fn stremio_search(
         return Ok(None);
     };
 
-    let mut media: Vec<db::Media> = results
+    let mut media = search_results(addon_id, kind, results, limit);
+    db::Media::preload_parents(&ctx.db, &mut media).await;
+
+    Ok(Some(media))
+}
+
+/// Converts search metas into at most `limit` result items of `kind`.
+fn search_results(
+    addon_id: Uuid,
+    kind: &db::MediaKind,
+    metas: Vec<sdks::stremio::Meta>,
+    limit: usize,
+) -> Vec<db::Media> {
+    use itertools::Itertools;
+
+    metas
         .into_iter()
         .unique_by(|m| {
             m.imdb_id
@@ -1687,25 +1701,38 @@ async fn stremio_search(
                     .as_ref()
                     .is_some_and(|v| !v.is_empty())
         })
-        .filter_map(|meta| {
-            let mut m = db::Media::try_from(meta.clone()).ok()?;
-            // Search catalogs can mix types: only the requested kind honours
-            // `IncludeItemTypes`. Compared after conversion so an item with
-            // episodes counts as the Series `Media::try_from` makes it.
-            if m.kind != *kind {
-                return None;
-            }
-            let rels = build_relations(&m, &meta);
-            m.relations = Some(rels);
-            Some(m)
-        })
-        // After the kind filter, so dropped items don't eat into the limit.
+        .filter_map(|meta| search_result_media(addon_id, meta))
+        // Search catalogs can mix types: only the requested kind honours
+        // `IncludeItemTypes`. Compared after conversion so an item with
+        // episodes counts as the Series `Media::try_from` makes it.
+        .filter(|m| m.kind == *kind)
+        // The id keys on the converted kind, so one meta id listed under two
+        // raw types that convert to the same kind (a custom type with
+        // episodes converts to series) would otherwise appear twice in one
+        // response.
+        .unique_by(|m| m.id)
+        // After the kind filter and dedupe, so dropped items don't eat into
+        // the limit.
         .take(limit)
-        .collect();
+        .collect()
+}
 
-    db::Media::preload_parents(&ctx.db, &mut media).await;
-
-    Ok(Some(media))
+/// Converts one search meta into its result item. Results with no stored
+/// row live only in the in-memory store, keyed by id, until clicked. A fresh
+/// id per conversion gave identical searches different Ids and cached a new
+/// copy of every result for an hour, so the id is derived from the addon
+/// and its meta id instead. Meta ids are addon-specific, hence the addon
+/// namespace. Live channels keep the id their stored rows are keyed on.
+fn search_result_media(addon_id: Uuid, meta: sdks::stremio::Meta) -> Option<db::Media> {
+    let mut m = db::Media::try_from(meta.clone()).ok()?;
+    if m.kind != db::MediaKind::TvChannel {
+        let key = format!("{}:{}", m.kind, meta.id);
+        m.id = Uuid::new_v5(&addon_id, key.as_bytes());
+    }
+    // After the id is final: relations are keyed on it.
+    let rels = build_relations(&m, &meta);
+    m.relations = Some(rels);
+    Some(m)
 }
 
 // ---------------------------------------------------------------------------
@@ -2934,17 +2961,30 @@ mod tests {
             "series",
             metas.clone(),
         );
-        let movies =
-            stremio_search(&series_only, &db::MediaKind::Movie, "matrix", 10, ctx)
-                .await
-                .unwrap();
+        let addon_id = Uuid::from_u128(1);
+        let movies = stremio_search(
+            &series_only,
+            addon_id,
+            &db::MediaKind::Movie,
+            "matrix",
+            10,
+            ctx,
+        )
+        .await
+        .unwrap();
         assert!(movies.is_none());
 
-        let series =
-            stremio_search(&series_only, &db::MediaKind::Series, "matrix", 10, ctx)
-                .await
-                .unwrap()
-                .unwrap();
+        let series = stremio_search(
+            &series_only,
+            addon_id,
+            &db::MediaKind::Series,
+            "matrix",
+            10,
+            ctx,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(
             kinds_and_titles(&series),
             vec![
@@ -2957,17 +2997,99 @@ mod tests {
 
         let movie_only =
             mock_search_addon(&addon, "/stremio-search-kind-movie", "movie", metas);
-        let movies =
-            stremio_search(&movie_only, &db::MediaKind::Movie, "matrix", 10, ctx)
-                .await
-                .unwrap()
-                .unwrap();
+        let movies = stremio_search(
+            &movie_only,
+            addon_id,
+            &db::MediaKind::Movie,
+            "matrix",
+            10,
+            ctx,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(
             kinds_and_titles(&movies),
             vec![
                 (db::MediaKind::Movie, "Matrix Movie"),
                 (db::MediaKind::Movie, "Matrix Capital Movie"),
             ]
+        );
+    }
+
+    fn search_meta(id: &str, kind: &str) -> sdks::stremio::Meta {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "type": kind,
+            "name": "Tatort",
+            "genres": ["Krimi"],
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn search_result_ids_are_stable_per_addon_and_meta() {
+        let addon = Uuid::from_u128(1);
+        let convert = |addon: Uuid, id: &str, kind: &str| {
+            search_result_media(addon, search_meta(id, kind)).unwrap()
+        };
+        let first = convert(addon, "mediathek:42", "series");
+        let again = convert(addon, "mediathek:42", "series");
+        assert_eq!(first.id, again.id, "same meta converts to the same id");
+        let relations = first
+            .relations
+            .as_ref()
+            .unwrap();
+        assert!(!relations.is_empty());
+        assert!(
+            relations
+                .iter()
+                .all(|(rel, _)| rel.left_media_id == first.id),
+            "relations point at the final id"
+        );
+
+        let other_meta = convert(addon, "mediathek:43", "series");
+        let other_kind = convert(addon, "mediathek:42", "movie");
+        let other_addon = convert(Uuid::from_u128(2), "mediathek:42", "series");
+        assert_ne!(first.id, other_meta.id);
+        assert_ne!(first.id, other_kind.id);
+        assert_ne!(first.id, other_addon.id);
+    }
+
+    #[test]
+    fn search_results_list_each_id_once() {
+        let addon = Uuid::from_u128(1);
+        // Custom type with episodes: converts to a series as well, so the
+        // same id.
+        let anime_show: sdks::stremio::Meta = serde_json::from_value(serde_json::json!({
+            "id": "mediathek:42",
+            "type": "anime",
+            "name": "Tatort",
+            "videos": [{"id": "mediathek:42:1:1", "season": 1, "episode": 1}],
+        }))
+        .unwrap();
+        let metas = vec![
+            search_meta("mediathek:42", "series"),
+            anime_show,
+            search_meta("mediathek:43", "series"),
+            search_meta("mediathek:44", "series"),
+        ];
+        let results = search_results(addon, &db::MediaKind::Series, metas, 2);
+        let ids: Vec<Uuid> = results
+            .iter()
+            .map(|m| m.id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                search_result_media(addon, search_meta("mediathek:42", "series"))
+                    .unwrap()
+                    .id,
+                search_result_media(addon, search_meta("mediathek:43", "series"))
+                    .unwrap()
+                    .id,
+            ],
+            "the duplicate is dropped and does not count against the limit"
         );
     }
 }

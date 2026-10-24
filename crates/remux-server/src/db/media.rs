@@ -3005,12 +3005,12 @@ impl Media {
     /// conversion) is preserved across the swap since it isn't a stored
     /// column and carries no bearing on which row is correct.
     ///
-    /// Remote results are minted with a fresh id per request and live in the
-    /// in-memory store for an hour. A client that keeps such an id, for
-    /// next-episode autoplay or a continue-watching entry, is left with a
-    /// dead one after that, or after a restart, and gets 404 on
-    /// `/shows/{id}/seasons` while the stored series is fine. Only results
-    /// with a matching row are rewritten; unknown items keep their id.
+    /// Remote results without a stored row live only in the in-memory store,
+    /// for an hour. A client that keeps such an id, for next-episode
+    /// autoplay or a continue-watching entry, is left with a dead one after
+    /// that, or after a restart, and gets 404 on `/shows/{id}/seasons` while
+    /// the stored series is fine. Only results with a matching row are
+    /// rewritten; unknown items keep their id.
     pub async fn adopt_existing_rows(db: &SqlitePool, items: &mut [Media]) {
         let mut kinds: Vec<MediaKind> = Vec::new();
         for m in items.iter() {
