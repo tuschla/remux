@@ -3369,7 +3369,10 @@ impl AddonService {
             searches
                 .iter()
                 .map(|(r, search)| async move {
-                    let answer = search.search(kind, query, limit, ctx);
+                    // A user is waiting: a rate-limited addon fails fast
+                    // instead of stalling the search for its whole cooldown.
+                    let answer =
+                        remux_sdks::interactive(search.search(kind, query, limit, ctx));
                     match tokio::time::timeout(addon_fetch_timeout, answer).await {
                         Ok(Ok(results)) => return results.unwrap_or_default(),
                         // `{:#}`: adapters wrap the upstream error in context, so the

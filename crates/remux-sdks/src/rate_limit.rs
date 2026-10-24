@@ -11,12 +11,97 @@ pub(crate) const DEFAULT_RETRY_AFTER: Duration = Duration::from_secs(60);
 
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(48 * 60 * 60);
 
+/// Longest a request inside [`interactive`] waits on a 429, either for its
+/// own Retry-After or for a shared cooldown before sending. A longer
+/// requested wait still feeds the shared cooldown in full, but this caller
+/// gets `RateLimited` in seconds instead of being held for the whole window
+/// (60 s by default, up to `MAX_RETRY_AFTER`), and later interactive callers
+/// get it at once without sending.
+#[cfg(not(target_arch = "wasm32"))]
+const MAX_IN_REQUEST_WAIT: Duration = Duration::from_secs(5);
+
+#[cfg(not(target_arch = "wasm32"))]
+tokio::task_local! {
+    static INTERACTIVE: ();
+}
+
+/// Runs `fut` as an interactive request, such as a user's search.
+///
+/// Inside it, a 429 is waited on for at most [`MAX_IN_REQUEST_WAIT`] and
+/// not retried, and a request is refused without sending while more than
+/// that is left of the shared cooldown: someone is waiting for the answer,
+/// and a fallback beats a minute-long stall. Outside it, background work
+/// (catalog import, metadata refresh) waits out every cooldown in full and
+/// retries, because giving up there loses data, e.g. a catalog page that
+/// was never fetched. Tasks spawned from `fut` do not inherit the scope.
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn interactive<F: Future>(fut: F) -> F::Output {
+    INTERACTIVE
+        .scope((), fut)
+        .await
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn is_interactive() -> bool {
+    INTERACTIVE
+        .try_with(|_| ())
+        .is_ok()
+}
+
+/// Response extension set by [`RetryAfterMiddleware`] on a 429 whose wait it
+/// cut short at [`MAX_IN_REQUEST_WAIT`]. The retry middleware returns such a
+/// response as-is: each retry would hit the same limit and wait again,
+/// turning one request into several back-to-back capped waits. A 429 whose
+/// whole wait fit under the cap stays untagged and is retried as usual.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Copy)]
+pub(crate) struct RateLimitedResponse;
+
+/// Returned by [`RetryAfterMiddleware`] inside [`interactive`], without
+/// sending, when the shared cooldown has more than [`MAX_IN_REQUEST_WAIT`] left. Mapped to
+/// `ClientError::RateLimited`.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug)]
+pub(crate) struct CooldownActive {
+    pub(crate) remaining: Duration,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl CooldownActive {
+    /// Rounded up, so a sub-second remainder never reads as "retry now".
+    pub(crate) fn retry_after_secs(&self) -> u64 {
+        self.remaining
+            .as_secs()
+            + u64::from(
+                self.remaining
+                    .subsec_nanos()
+                    > 0,
+            )
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl std::fmt::Display for CooldownActive {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "shared rate-limit cooldown active, retry after {}s",
+            self.retry_after_secs()
+        )
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl std::error::Error for CooldownActive {}
+
 /// Shared 429 cooldown for one provider.
 ///
 /// Give clones of one value to every [`RestClient`](crate::RestClient) that
-/// talks to the same upstream. After a 429, it parks all later requests until
-/// the shared cooldown has elapsed. It intentionally does not limit request
-/// concurrency; callers control that themselves.
+/// talks to the same upstream. After a 429, later requests wait out the
+/// cooldown; inside [`interactive`] they fail fast, without sending, when
+/// more than [`MAX_IN_REQUEST_WAIT`] of it is left. It
+/// intentionally does not limit request concurrency; callers control that
+/// themselves.
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Clone)]
 pub struct SharedRateLimit {
@@ -40,7 +125,15 @@ impl SharedRateLimit {
         *blocked_until = (*blocked_until).max(candidate);
     }
 
-    async fn wait_for_cooldown(&self) {
+    /// Waits for the cooldown to clear, unless that would take longer than
+    /// `max_wait`; then it returns at once. Giving up never touches the
+    /// cooldown, so callers refused here don't extend it.
+    async fn wait_for_cooldown(
+        &self,
+        max_wait: Duration,
+    ) -> Result<(), CooldownActive> {
+        // `None` (overflow) means no limit.
+        let give_up_after = Instant::now().checked_add(max_wait);
         loop {
             let blocked_until = *self
                 .blocked_until
@@ -48,7 +141,12 @@ impl SharedRateLimit {
                 .await;
             let now = Instant::now();
             if blocked_until <= now {
-                return;
+                return Ok(());
+            }
+            if give_up_after.is_some_and(|limit| blocked_until > limit) {
+                return Err(CooldownActive {
+                    remaining: blocked_until - now,
+                });
             }
             tokio::time::sleep_until(blocked_until).await;
         }
@@ -125,12 +223,23 @@ impl reqwest_middleware::Middleware for RetryAfterMiddleware {
         extensions: &mut http::Extensions,
         next: reqwest_middleware::Next<'_>,
     ) -> reqwest_middleware::Result<reqwest::Response> {
+        let interactive = is_interactive();
+        // Interactive: waiting out a long cooldown here would hold this
+        // request for the rest of a Retry-After window (60 s by default) and
+        // then send it into the same limit, re-arming the cooldown. Fail fast
+        // instead; short cooldowns (TMDB's 2 s) are still waited out.
+        let max_wait = if interactive {
+            MAX_IN_REQUEST_WAIT
+        } else {
+            Duration::MAX
+        };
         if let Some(limit) = &self.shared_rate_limit {
             limit
-                .wait_for_cooldown()
-                .await;
+                .wait_for_cooldown(max_wait)
+                .await
+                .map_err(reqwest_middleware::Error::middleware)?;
         }
-        let response = next
+        let mut response = next
             .run(req, extensions)
             .await?;
         if response.status() != http::StatusCode::TOO_MANY_REQUESTS {
@@ -145,19 +254,34 @@ impl reqwest_middleware::Middleware for RetryAfterMiddleware {
         if delay.is_zero() {
             return Ok(response);
         }
+        let wait = delay.min(max_wait);
         tracing::warn!(
-            url = %response.url(),
+            host = log_host(response.url()),
             retry_after_secs = delay.as_secs(),
-            shared = self.shared_rate_limit.is_some(),
+            wait_secs = wait.as_secs(),
+            shared = self
+                .shared_rate_limit
+                .is_some(),
             "upstream returned 429; backing off before this request returns"
         );
         if let Some(limit) = &self.shared_rate_limit {
             limit
                 .block_for(delay)
                 .await;
+        }
+        if interactive {
+            tokio::time::sleep(wait).await;
+            if wait < delay {
+                response
+                    .extensions_mut()
+                    .insert(RateLimitedResponse);
+            }
+        } else if let Some(limit) = &self.shared_rate_limit {
+            // Also waits out a longer cooldown another request recorded.
             limit
-                .wait_for_cooldown()
-                .await;
+                .wait_for_cooldown(Duration::MAX)
+                .await
+                .map_err(reqwest_middleware::Error::middleware)?;
         } else {
             tokio::time::sleep(delay).await;
         }
@@ -165,9 +289,27 @@ impl reqwest_middleware::Middleware for RetryAfterMiddleware {
     }
 }
 
+/// What the 429 warning names the upstream by: the host only. The userinfo,
+/// path and query of addon URLs often carry credentials.
+#[cfg(not(target_arch = "wasm32"))]
+fn log_host(url: &url::Url) -> &str {
+    url.host_str()
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn the_429_warning_names_only_the_host() {
+        let url = url::Url::parse(
+            "http://user:pass@addon.example:8080/SECRET-TOKEN/catalog/movie/search=x.json?apikey=KEY#frag",
+        )
+        .unwrap();
+        assert_eq!(log_host(&url), "addon.example");
+    }
 
     #[test]
     fn parses_delay_seconds() {
@@ -283,8 +425,9 @@ mod tests {
             let limit = SharedRateLimit::new();
             let started = Instant::now();
             limit
-                .wait_for_cooldown()
-                .await;
+                .wait_for_cooldown(Duration::MAX)
+                .await
+                .unwrap();
             assert_eq!(
                 started.elapsed(),
                 Duration::ZERO,
@@ -331,8 +474,9 @@ mod tests {
 
             let started = Instant::now();
             limit
-                .wait_for_cooldown()
-                .await;
+                .wait_for_cooldown(Duration::MAX)
+                .await
+                .unwrap();
             assert_eq!(started.elapsed(), Duration::from_secs(5));
         }
 
@@ -351,8 +495,9 @@ mod tests {
 
             let started = Instant::now();
             limit
-                .wait_for_cooldown()
-                .await;
+                .wait_for_cooldown(Duration::MAX)
+                .await
+                .unwrap();
             assert_eq!(
                 started.elapsed(),
                 Duration::from_secs(10),
@@ -372,8 +517,9 @@ mod tests {
 
             let started = Instant::now();
             limit
-                .wait_for_cooldown()
-                .await;
+                .wait_for_cooldown(Duration::MAX)
+                .await
+                .unwrap();
             assert_eq!(started.elapsed(), Duration::from_secs(10));
         }
 
@@ -385,10 +531,50 @@ mod tests {
                 .await;
 
             let started = Instant::now();
-            let (a, b) =
-                tokio::join!(limit.wait_for_cooldown(), limit.wait_for_cooldown());
-            let _: ((), ()) = (a, b);
+            let (a, b) = tokio::join!(
+                limit.wait_for_cooldown(Duration::MAX),
+                limit.wait_for_cooldown(Duration::MAX)
+            );
+            a.unwrap();
+            b.unwrap();
             assert_eq!(started.elapsed(), Duration::from_secs(3));
+        }
+
+        #[tokio::test(flavor = "current_thread", start_paused = true)]
+        async fn a_cooldown_within_max_wait_is_waited_out() {
+            let limit = SharedRateLimit::new();
+            limit
+                .block_for(Duration::from_secs(2))
+                .await;
+
+            let started = Instant::now();
+            limit
+                .wait_for_cooldown(Duration::from_secs(5))
+                .await
+                .unwrap();
+            assert_eq!(started.elapsed(), Duration::from_secs(2));
+        }
+
+        #[tokio::test(flavor = "current_thread", start_paused = true)]
+        async fn a_cooldown_beyond_max_wait_is_refused_at_once_without_extending_it() {
+            let limit = SharedRateLimit::new();
+            limit
+                .block_for(Duration::from_secs(60))
+                .await;
+
+            let started = Instant::now();
+            let refused = limit
+                .wait_for_cooldown(Duration::from_secs(5))
+                .await
+                .unwrap_err();
+            assert_eq!(started.elapsed(), Duration::ZERO);
+            assert_eq!(refused.remaining, Duration::from_secs(60));
+            assert_eq!(
+                limit
+                    .remaining_cooldown()
+                    .await,
+                Duration::from_secs(60)
+            );
         }
     }
 
@@ -559,6 +745,232 @@ mod tests {
             limited
                 .await
                 .unwrap();
+        }
+    }
+
+    /// The real retry and rate-limit middlewares, stacked the way `build_mw`
+    /// stacks them, in front of a canned 429 instead of a socket, so paused
+    /// time makes every wait exact.
+    #[cfg(not(target_arch = "wasm32"))]
+    mod in_request_wait {
+        use super::super::{
+            DEFAULT_RETRY_AFTER, MAX_IN_REQUEST_WAIT, RetryAfterMiddleware,
+            SharedRateLimit, interactive,
+        };
+        use reqwest::ResponseBuilderExt;
+        use reqwest_middleware::ClientWithMiddleware;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use tokio::time::Instant;
+
+        const CREDENTIALED_URL: &str =
+            "http://addon.example/SECRET-TOKEN/catalog/movie/search=x.json";
+
+        struct Canned429 {
+            retry_after: Option<&'static str>,
+            hits: Arc<AtomicUsize>,
+        }
+
+        #[async_trait::async_trait]
+        impl reqwest_middleware::Middleware for Canned429 {
+            async fn handle(
+                &self,
+                req: reqwest::Request,
+                _: &mut http::Extensions,
+                _: reqwest_middleware::Next<'_>,
+            ) -> reqwest_middleware::Result<reqwest::Response> {
+                self.hits
+                    .fetch_add(1, Ordering::SeqCst);
+                let mut response = http::Response::builder()
+                    .status(http::StatusCode::TOO_MANY_REQUESTS)
+                    .url(
+                        req.url()
+                            .clone(),
+                    );
+                if let Some(value) = self.retry_after {
+                    response = response.header(http::header::RETRY_AFTER, value);
+                }
+                Ok(response
+                    .body("")
+                    .unwrap()
+                    .into())
+            }
+        }
+
+        fn client(
+            retry_after: Option<&'static str>,
+            shared: &SharedRateLimit,
+        ) -> (ClientWithMiddleware, Arc<AtomicUsize>) {
+            let hits = Arc::new(AtomicUsize::new(0));
+            let client = reqwest_middleware::ClientBuilder::new(reqwest::Client::new())
+                .with(
+                    reqwest_retry::RetryTransientMiddleware::new_with_policy_and_strategy(
+                        crate::ExponentialBackoff::builder().build_with_max_retries(3),
+                        crate::NoTimeoutRetryStrategy,
+                    ),
+                )
+                .with(RetryAfterMiddleware {
+                    default_retry_after: DEFAULT_RETRY_AFTER,
+                    shared_rate_limit: Some(shared.clone()),
+                })
+                .with(Canned429 {
+                    retry_after,
+                    hits: hits.clone(),
+                })
+                .build();
+            (client, hits)
+        }
+
+        #[tokio::test(flavor = "current_thread", start_paused = true)]
+        async fn a_429_without_retry_after_returns_after_the_capped_wait_without_a_retry()
+         {
+            let shared = SharedRateLimit::new();
+            let (client, hits) = client(None, &shared);
+
+            let started = Instant::now();
+            let response = interactive(
+                client
+                    .get(CREDENTIALED_URL)
+                    .send(),
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(response.status(), http::StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(
+                hits.load(Ordering::SeqCst),
+                1,
+                "each retry would hit the same limit and wait again"
+            );
+            assert_eq!(started.elapsed(), MAX_IN_REQUEST_WAIT);
+            // The rest of the default window still gates later requests.
+            assert_eq!(
+                shared
+                    .remaining_cooldown()
+                    .await,
+                DEFAULT_RETRY_AFTER - MAX_IN_REQUEST_WAIT
+            );
+        }
+
+        #[tokio::test(flavor = "current_thread", start_paused = true)]
+        async fn a_request_during_a_long_cooldown_is_refused_without_sending() {
+            let shared = SharedRateLimit::new();
+            let (client, hits) = client(None, &shared);
+            interactive(
+                client
+                    .get(CREDENTIALED_URL)
+                    .send(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(hits.load(Ordering::SeqCst), 1);
+            let cooldown = shared
+                .remaining_cooldown()
+                .await;
+
+            let started = Instant::now();
+            let error = interactive(
+                client
+                    .get(CREDENTIALED_URL)
+                    .send(),
+            )
+            .await
+            .unwrap_err();
+
+            assert_eq!(started.elapsed(), std::time::Duration::ZERO);
+            assert_eq!(hits.load(Ordering::SeqCst), 1, "nothing may be sent");
+            let error = crate::middleware_error(error);
+            assert!(
+                matches!(
+                    error,
+                    crate::ClientError::RateLimited {
+                        retry_after_secs: 55
+                    }
+                ),
+                "{error:?}"
+            );
+            assert_eq!(
+                shared
+                    .remaining_cooldown()
+                    .await,
+                cooldown,
+                "a refused request must not re-arm the cooldown"
+            );
+        }
+
+        #[tokio::test(flavor = "current_thread", start_paused = true)]
+        async fn a_429_whose_wait_fits_under_the_cap_is_waited_in_full_and_retried() {
+            let shared = SharedRateLimit::new();
+            let (client, hits) = client(Some("2"), &shared);
+
+            let started = Instant::now();
+            let response = interactive(
+                client
+                    .get(CREDENTIALED_URL)
+                    .send(),
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(response.status(), http::StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(
+                hits.load(Ordering::SeqCst),
+                4,
+                "a wait that was not cut short leaves the retry policy in charge"
+            );
+            assert!(
+                started.elapsed() >= 4 * std::time::Duration::from_secs(2),
+                "every attempt should have waited its full Retry-After, took {:?}",
+                started.elapsed()
+            );
+        }
+
+        #[tokio::test(flavor = "current_thread", start_paused = true)]
+        async fn outside_interactive_a_429_waits_the_full_default_and_is_retried() {
+            let shared = SharedRateLimit::new();
+            let (client, hits) = client(None, &shared);
+
+            let started = Instant::now();
+            let response = client
+                .get(CREDENTIALED_URL)
+                .send()
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), http::StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(
+                hits.load(Ordering::SeqCst),
+                4,
+                "background work keeps retrying, e.g. a catalog page"
+            );
+            assert!(
+                started.elapsed() >= 4 * DEFAULT_RETRY_AFTER,
+                "every attempt should have waited the full default, took {:?}",
+                started.elapsed()
+            );
+        }
+
+        #[tokio::test(flavor = "current_thread", start_paused = true)]
+        async fn outside_interactive_a_long_cooldown_is_waited_not_refused() {
+            let shared = SharedRateLimit::new();
+            shared
+                .block_for(DEFAULT_RETRY_AFTER)
+                .await;
+            // `0`: the upstream asks for no wait, so only the existing
+            // cooldown delays the request.
+            let (client, hits) = client(Some("0"), &shared);
+
+            let started = Instant::now();
+            client
+                .get(CREDENTIALED_URL)
+                .send()
+                .await
+                .unwrap();
+
+            assert!(started.elapsed() >= DEFAULT_RETRY_AFTER);
+            assert_eq!(hits.load(Ordering::SeqCst), 4);
         }
     }
 }

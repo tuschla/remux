@@ -13,7 +13,7 @@ pub mod tmdb;
 mod rate_limit;
 
 #[cfg(not(target_arch = "wasm32"))]
-pub use rate_limit::SharedRateLimit;
+pub use rate_limit::{SharedRateLimit, interactive};
 
 use http::{Extensions, HeaderMap, HeaderValue, Method, header};
 use itertools::Itertools;
@@ -408,8 +408,9 @@ impl RetryPolicy for DynRetryPolicy {
 }
 
 /// Keeps retrying transient upstream failures, but never retries a request
-/// that already exceeded the client's deadline. A retry after a timeout turns
-/// one bounded request into several consecutive timeout windows.
+/// that already exceeded the client's deadline, or a 429 whose wait
+/// `RetryAfterMiddleware` cut short at its cap. Either retry turns one bounded
+/// request into several consecutive timeout or capped-wait windows.
 struct NoTimeoutRetryStrategy;
 
 impl RetryableStrategy for NoTimeoutRetryStrategy {
@@ -419,6 +420,15 @@ impl RetryableStrategy for NoTimeoutRetryStrategy {
     ) -> Option<Retryable> {
         match result {
             Err(MiddlewareError::Reqwest(error)) if error.is_timeout() => {
+                Some(Retryable::Fatal)
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            Ok(response)
+                if response
+                    .extensions()
+                    .get::<rate_limit::RateLimitedResponse>()
+                    .is_some() =>
+            {
                 Some(Retryable::Fatal)
             }
             Ok(response) => default_on_request_success(response),
@@ -448,6 +458,43 @@ fn build_mw(
         shared_rate_limit,
     });
     builder.build()
+}
+
+fn middleware_error(error: MiddlewareError) -> ClientError {
+    match error {
+        MiddlewareError::Reqwest(e) => ClientError::Transport(e),
+        MiddlewareError::Middleware(e) => {
+            // Refused before sending because of a long shared cooldown: the
+            // same outcome as a 429, so callers see one rate-limit error
+            // either way.
+            #[cfg(not(target_arch = "wasm32"))]
+            if let Some(cooldown) = refused_cooldown(&e) {
+                return ClientError::RateLimited {
+                    retry_after_secs: cooldown.retry_after_secs(),
+                };
+            }
+            ClientError::Other(e)
+        }
+    }
+}
+
+/// Finds a pre-send cooldown refusal, also under the `RetryError` that
+/// `RetryTransientMiddleware` wraps every error it passes through in. Its
+/// `source()` chain skips the refusal (`RetryError::Error` is transparent),
+/// so walk the wrappers explicitly.
+#[cfg(not(target_arch = "wasm32"))]
+fn refused_cooldown(error: &anyhow::Error) -> Option<&rate_limit::CooldownActive> {
+    if let Some(cooldown) = error.downcast_ref::<rate_limit::CooldownActive>() {
+        return Some(cooldown);
+    }
+    let inner = match error.downcast_ref::<reqwest_retry::RetryError>()? {
+        reqwest_retry::RetryError::WithRetries { err, .. }
+        | reqwest_retry::RetryError::Error(err) => err,
+    };
+    match inner {
+        MiddlewareError::Middleware(inner) => refused_cooldown(inner),
+        MiddlewareError::Reqwest(_) => None,
+    }
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
@@ -500,6 +547,42 @@ mod retry_strategy_tests {
         let retryable =
             NoTimeoutRetryStrategy.handle(&Err(MiddlewareError::Reqwest(error)));
         assert!(matches!(retryable, Some(Retryable::Transient)));
+    }
+
+    #[test]
+    fn a_refused_cooldown_maps_to_rate_limited() {
+        let error = MiddlewareError::middleware(rate_limit::CooldownActive {
+            remaining: Duration::from_millis(54_200),
+        });
+        assert!(matches!(
+            middleware_error(error),
+            ClientError::RateLimited {
+                retry_after_secs: 55
+            }
+        ));
+    }
+
+    #[test]
+    fn a_refused_cooldown_behind_the_retry_wrappers_maps_to_rate_limited() {
+        let refused = || {
+            MiddlewareError::middleware(rate_limit::CooldownActive {
+                remaining: Duration::from_secs(55),
+            })
+        };
+        for wrapped in [
+            reqwest_retry::RetryError::Error(refused()),
+            reqwest_retry::RetryError::WithRetries {
+                retries: 1,
+                err: refused(),
+            },
+        ] {
+            assert!(matches!(
+                middleware_error(MiddlewareError::middleware(wrapped)),
+                ClientError::RateLimited {
+                    retry_after_secs: 55
+                }
+            ));
+        }
     }
 }
 
@@ -571,7 +654,7 @@ impl<A: Auth + Clone> RestClient<A> {
         self
     }
 
-    /// Overrides how long to wait before retrying a 429 response that carries
+    /// Overrides the cooldown applied after a 429 response that carries
     /// no (or an unparseable) `Retry-After` header. Some upstreams — TMDB in
     /// particular — never send that header at all, so without this every 429
     /// falls back to the same conservative default meant for well-behaved
@@ -734,10 +817,7 @@ impl<A: Auth + Clone> RestClient<A> {
             .mw
             .execute_with_extensions(request, &mut ext)
             .await
-            .map_err(|e| match without_url(e) {
-                MiddlewareError::Reqwest(e) => ClientError::Transport(e),
-                MiddlewareError::Middleware(e) => ClientError::Other(e),
-            })?;
+            .map_err(|e| middleware_error(without_url(e)))?;
 
         let status = resp
             .status()
