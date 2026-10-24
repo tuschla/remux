@@ -28,7 +28,9 @@ impl Endpoint for FindByIdEndpoint {
     type Output = FindByIdResponse;
 
     fn path(&self) -> String {
-        format!("find/{}", self.external_id)
+        // The id is one path segment; encode it so a `/`, `?` or `#` in it
+        // can't escape `find/` or truncate the request.
+        format!("find/{}", urlencoding::encode(&self.external_id))
     }
 
     fn query_params(&self) -> impl serde::Serialize + '_ {
@@ -648,5 +650,27 @@ mod tests {
                 .is_empty()
         );
         assert!(parse(r#"{"movie_results": [], "tv_results": []}"#).is_ok());
+    }
+
+    #[test]
+    fn find_by_id_path_keeps_the_id_in_one_segment() {
+        let base = url::Url::parse("https://api.themoviedb.org/3/").unwrap();
+        for (id, expected) in [
+            ("tt0133093", "/3/find/tt0133093"),
+            ("tt1/../../movie/550", "/3/find/tt1%2F..%2F..%2Fmovie%2F550"),
+            ("tt1375666?x=1", "/3/find/tt1375666%3Fx%3D1"),
+            ("tt1375666#f", "/3/find/tt1375666%23f"),
+        ] {
+            let endpoint = FindByIdEndpoint {
+                external_id: id.to_string(),
+                external_source: "imdb_id".to_string(),
+            };
+            let url = base
+                .join(&endpoint.path())
+                .unwrap();
+            assert_eq!(url.path(), expected, "{id:?}");
+            assert_eq!(url.query(), None, "{id:?}");
+            assert_eq!(url.fragment(), None, "{id:?}");
+        }
     }
 }

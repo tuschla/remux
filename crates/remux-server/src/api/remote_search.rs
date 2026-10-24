@@ -211,7 +211,7 @@ pub async fn remote_search_apply(
         if let Some(s) = pids.get("Imdb") {
             media
                 .external_ids
-                .imdb = db::NonEmptyString::try_new(s.clone()).ok();
+                .imdb = db::ExternalIds::parse_imdb(s);
         }
         if let Some(s) = pids.get("Tvdb") {
             if let Ok(n) = s.parse::<i64>() {
@@ -494,6 +494,58 @@ mod tests {
                 .as_ref()
                 .map(|s| s.as_str()),
             Some("tt1375666")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_remote_search_apply_ignores_malformed_imdb_id() {
+        let (server, guard, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+        let now = Utc::now().naive_utc();
+
+        let mut media = db::Media {
+            title: "Inception".to_string(),
+            kind: db::MediaKind::Stream,
+            created_at: now,
+            updated_at: now,
+            ..Default::default()
+        };
+        media
+            .save(
+                &guard
+                    .0
+                    .db,
+            )
+            .await
+            .unwrap();
+
+        server
+            .post(&format!("/items/remotesearch/apply/{}", media.id))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .json(&json!({
+                "Name": "Inception",
+                "ProviderIds": { "Imdb": "tt1/../../movie/550" }
+            }))
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
+
+        let updated = db::Media::get_by_id(
+            &guard
+                .0
+                .db,
+            &media.id,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            updated
+                .external_ids
+                .imdb,
+            None
         );
     }
 
