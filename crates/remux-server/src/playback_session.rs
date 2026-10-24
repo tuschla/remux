@@ -8,7 +8,10 @@ use uuid::Uuid;
 use crate::{
     common, db,
     db::auth,
-    playback::{decision::PlaybackPermissions, session::TranscodeSession},
+    playback::{
+        decision::PlaybackPermissions,
+        session::{TranscodeSession, longest_segment},
+    },
 };
 use remux_sdks::remux::{PlayMethod, PlaybackInfo, QueueItem};
 
@@ -20,6 +23,20 @@ pub struct PlayedStream {
     /// The track PlaybackInfo had the stream play unless asked for another;
     /// `None` when no PlaybackInfo answer for the report is known.
     pub automatic_audio: Option<i64>,
+}
+
+/// Per play session: held while creating its transcode, so stops and dir
+/// removal never miss one still being created.
+pub(crate) static TRANSCODE_CREATE_LOCKS: crate::keyed_lock::KeyedLock<String> =
+    crate::keyed_lock::KeyedLock::new();
+
+/// How a stop treats the transcode's ffmpeg.
+#[derive(Clone, Copy)]
+pub enum StopMode {
+    /// Return at once; ffmpeg is reaped and its dir removed in the background.
+    Detached,
+    /// Wait (bounded) for the reap: the caller reuses the dir or exits.
+    Reaped,
 }
 
 #[derive(Clone)]
@@ -48,6 +65,9 @@ pub struct PlaybackSession {
     pub playlist_item_id: Option<String>,
     pub started_at: DateTime<Utc>,
     pub last_activity: DateTime<Utc>,
+    /// When the client last reported this play session (start, progress,
+    /// pause, resume, ping); `None` for a transcode stub.
+    pub last_report: Option<std::time::Instant>,
     /// Active transcode session owned by this playback session, if any.
     pub transcode: Option<Arc<tokio::sync::RwLock<TranscodeSession>>>,
     /// Stream group UUID that the selected source belongs to, if any.
@@ -80,6 +100,86 @@ impl PlaybackSession {
             }
         }
     }
+
+    /// False for a transcode stub no playback report has claimed yet.
+    fn is_reported(&self) -> bool {
+        !self
+            .user_id
+            .is_nil()
+    }
+
+    /// Whether the client still plays this session's transcode in spite of
+    /// one created `at` for its item on its device: it reported the session
+    /// since, or last reported it paused (a paused player requests nothing,
+    /// and reports again within 10-15 s). A retry's predecessor does
+    /// neither: the client left it, reports included, for the retry.
+    fn still_played(&self, at: std::time::Instant) -> bool {
+        self.is_paused
+            || self
+                .last_report
+                .is_some_and(|reported| reported >= at)
+    }
+}
+
+/// Which of a device's playback `sessions` `/Sessions` shows, and the
+/// transcode serving it. Reported sessions come first; an unreported
+/// transcode stub has no item to show (Jellyfin shows none before the start
+/// report) and is never shown. A reported transcode whose client retried
+/// under a new PlaySessionId without a new start report is served by the
+/// retry's stub.
+pub(crate) async fn now_playing<'a>(
+    sessions: &[&'a PlaybackSession],
+) -> Option<(
+    &'a PlaybackSession,
+    Option<Arc<tokio::sync::RwLock<TranscodeSession>>>,
+)> {
+    let shown = sessions
+        .iter()
+        .copied()
+        .filter(|s| {
+            s.is_reported()
+                || !s
+                    .item_id
+                    .is_nil()
+        })
+        .max_by_key(|s| {
+            (
+                s.is_reported(),
+                s.transcode
+                    .is_some(),
+                s.last_activity,
+            )
+        })?;
+    if shown
+        .transcode
+        .is_some()
+        || shown
+            .play_method
+            .as_deref()
+            != Some("Transcode")
+    {
+        return Some((
+            shown,
+            shown
+                .transcode
+                .clone(),
+        ));
+    }
+    for stub in sessions
+        .iter()
+        .filter(|s| !s.is_reported())
+    {
+        let Some(ts) = &stub.transcode else {
+            continue;
+        };
+        let t = ts
+            .read()
+            .await;
+        if !t.stopped && t.item_id == shown.item_id && t.user_id == shown.user_id {
+            return Some((shown, Some(ts.clone())));
+        }
+    }
+    Some((shown, None))
 }
 
 /// What a stream endpoint actually served for a playback session.
@@ -156,8 +256,9 @@ pub struct PlaybackSessionManager {
         Arc<DashMap<String, (DateTime<Utc>, Vec<Arc<crate::torrent::TorrentLease>>)>>,
     pending_play_methods: Arc<DashMap<String, (DateTime<Utc>, ServedPlayback)>>,
     // Makes that handoff atomic: a request cannot be stranded in pending
-    // while playback-start inserts its session.
-    handoff: Arc<std::sync::Mutex<()>>,
+    // while playback-start inserts its session. Its value is `closed`: set by
+    // `stop_all` (shutdown), after which no transcode is attached.
+    handoff: Arc<std::sync::Mutex<bool>>,
     base_dir: PathBuf,
 }
 
@@ -169,7 +270,7 @@ impl PlaybackSessionManager {
             sessions: Arc::new(DashMap::new()),
             pending_torrents: Arc::new(DashMap::new()),
             pending_play_methods: Arc::new(DashMap::new()),
-            handoff: Arc::new(std::sync::Mutex::new(())),
+            handoff: Arc::new(std::sync::Mutex::new(false)),
             base_dir,
         }
     }
@@ -327,6 +428,7 @@ impl PlaybackSessionManager {
                 .clone(),
             started_at: Utc::now(),
             last_activity: Utc::now(),
+            last_report: Some(std::time::Instant::now()),
             transcode: None,
             group_id,
             item_kind,
@@ -441,7 +543,7 @@ impl PlaybackSessionManager {
                 .item_id
                 .is_nil()
         {
-            self.stop(psid)
+            self.stop(psid, StopMode::Detached)
                 .await;
             return Ok(());
         }
@@ -547,6 +649,7 @@ impl PlaybackSessionManager {
                 }
             }
             ps.last_activity = Utc::now();
+            ps.last_report = Some(std::time::Instant::now());
         });
 
         // Update transcode buffer monitor with actual playback position.
@@ -635,9 +738,14 @@ impl PlaybackSessionManager {
         psid: &str,
         data: &PlaybackInfo,
     ) -> anyhow::Result<bool> {
-        let ps = self
-            .stop(psid)
+        // Stop a transcode still being created for this session too.
+        let create = TRANSCODE_CREATE_LOCKS
+            .lock_if_exists(&psid.to_string())
             .await;
+        let ps = self
+            .stop(psid, StopMode::Detached)
+            .await;
+        drop(create);
 
         let item_id = Some(data.item_id)
             .filter(|id| !id.is_nil())
@@ -740,21 +848,9 @@ impl PlaybackSessionManager {
     /// Removes stale sessions for the same device so `get_sessions` always
     /// finds the most recent playback.
     pub async fn insert(&self, mut session: PlaybackSession) {
-        if session
-            .transcode
-            .is_none()
-        {
-            if let Some(existing) = self
-                .sessions
-                .get(&session.play_session_id)
-            {
-                session.transcode = existing
-                    .value()
-                    .transcode
-                    .clone();
-            }
-        }
         // Remove any previous session for this device (different play_session_id).
+        // Unreported transcode stubs are left alone: a start report without
+        // (or with another) PlaySessionId must not kill the stream it reports.
         if !session
             .device_id
             .is_empty()
@@ -766,6 +862,8 @@ impl PlaybackSessionManager {
                     e.value()
                         .device_id
                         == session.device_id
+                        && e.value()
+                            .is_reported()
                         && e.key() != &session.play_session_id
                 })
                 .map(|e| {
@@ -774,7 +872,7 @@ impl PlaybackSessionManager {
                 })
                 .collect();
             for id in stale {
-                self.stop(&id)
+                self.stop(&id, StopMode::Detached)
                     .await;
             }
         }
@@ -826,13 +924,26 @@ impl PlaybackSessionManager {
             );
             session.served = Some(served);
         }
-        self.sessions
-            .insert(
+        // Take a pre-attached transcode while replacing the entry, so one
+        // attached during the awaits above is not dropped with its ffmpeg.
+        let entry = self
+            .sessions
+            .entry(
                 session
                     .play_session_id
                     .clone(),
-                session,
             );
+        if let dashmap::mapref::entry::Entry::Occupied(existing) = &entry
+            && session
+                .transcode
+                .is_none()
+        {
+            session.transcode = existing
+                .get()
+                .transcode
+                .clone();
+        }
+        entry.insert(session);
     }
 
     /// Return a clone of the session, if it exists.
@@ -868,7 +979,7 @@ impl PlaybackSessionManager {
             .collect()
     }
 
-    /// Return the most recently active session for a device.
+    /// Return the most recently active reported session for a device.
     /// Used as a fallback when the client omits PlaySessionId (e.g. DirectPlay).
     pub fn get_by_device(&self, device_id: &str) -> Option<PlaybackSession> {
         self.sessions
@@ -877,6 +988,8 @@ impl PlaybackSessionManager {
                 e.value()
                     .device_id
                     == device_id
+                    && e.value()
+                        .is_reported()
             })
             .max_by_key(|e| {
                 e.value()
@@ -954,21 +1067,35 @@ impl PlaybackSessionManager {
         self.update(id, |s| s.last_activity = Utc::now());
     }
 
+    /// A client's ping of its play session: a report, see `ping`.
+    pub fn ping_reported(&self, id: &str) {
+        self.update(id, |s| {
+            s.last_activity = Utc::now();
+            s.last_report = Some(std::time::Instant::now());
+        });
+    }
+
     /// Attach a transcode session. If no playback session exists yet (the client
     /// calls master.m3u8 before POST /sessions/playing), a stub is inserted so the
     /// transcode isn't lost. `insert` will later overwrite the stub fields while
     /// preserving the transcode.
     ///
-    /// When creating a stub, we inherit the `device_id` from the most recently
-    /// active session that currently has no transcode. This covers quality-switch
-    /// flows where the client sends a new play_session_id without first calling
-    /// POST /Sessions/Playing — without this, `get_sessions` can't find the new
-    /// transcode by device_id until the client reports playback again.
+    /// The stub records the requesting device. Returns false, attaching
+    /// nothing, once shutdown has begun (`stop_all`).
+    #[must_use]
     pub fn attach_transcode(
         &self,
         id: &str,
+        device_id: &str,
         ts: Arc<tokio::sync::RwLock<TranscodeSession>>,
-    ) {
+    ) -> bool {
+        let closed = self
+            .handoff
+            .lock()
+            .expect("handoff lock is not poisoned");
+        if *closed {
+            return false;
+        }
         if let Some(mut entry) = self
             .sessions
             .get_mut(id)
@@ -977,31 +1104,6 @@ impl PlaybackSessionManager {
                 .value_mut()
                 .transcode = Some(ts);
         } else {
-            // Inherit device_id from the freshest transcodeless session so that
-            // get_sessions can find this stub by device_id immediately.
-            let inherited_device_id = self
-                .sessions
-                .iter()
-                .filter(|e| {
-                    e.value()
-                        .transcode
-                        .is_none()
-                        && !e
-                            .value()
-                            .device_id
-                            .is_empty()
-                })
-                .max_by_key(|e| {
-                    e.value()
-                        .last_activity
-                })
-                .map(|e| {
-                    e.value()
-                        .device_id
-                        .clone()
-                })
-                .unwrap_or_default();
-
             self.sessions
                 .insert(
                     id.to_string(),
@@ -1012,7 +1114,7 @@ impl PlaybackSessionManager {
                         item_id: Uuid::nil(),
                         media_source_id: None,
                         played_stream: None,
-                        device_id: inherited_device_id,
+                        device_id: device_id.to_string(),
                         client_name: String::new(),
                         position_ticks: 0,
                         can_seek: true,
@@ -1028,17 +1130,176 @@ impl PlaybackSessionManager {
                         playlist_item_id: None,
                         started_at: Utc::now(),
                         last_activity: Utc::now(),
+                        last_report: None,
                         group_id: None,
                         item_kind: None,
                         torrents: Vec::new(),
                     },
                 );
         }
+        true
     }
 
-    /// Stop and remove the transcode from a session (e.g. on seek or client stop),
-    /// but keep the playback session itself alive.
-    pub async fn stop_transcode(&self, id: &str) {
+    /// Stop transcodes their client abandoned for a newer play session (a
+    /// retry or stream switch under a new PlaySessionId, often without
+    /// DELETE /Videos/ActiveEncodings). Within each group of one device's
+    /// transcodes of one item for one user, one is stopped once, since the
+    /// newest other of the group was created, its client requested nothing
+    /// (`TranscodeSession::left_for`) nor reported its play session as
+    /// played (`PlaybackSession::still_played`), and once it requested
+    /// nothing for two of the segments ffmpeg cut
+    /// (`TranscodeSession::abandoned_with_segments_of`). A retry's
+    /// predecessor goes quiet before the retry exists. Two players of the
+    /// item on a device (browser tabs share their DeviceId) each request
+    /// after the other started, and a paused one, which requests nothing,
+    /// still reports: jellyfin-web every 10 s, Android TV every 15 s, and
+    /// on resume, before its buffer runs low enough to request again; until
+    /// its first report after the other one switched streams, its last
+    /// report's pause keeps it. Unreported stubs are removed entirely.
+    ///
+    /// A client retrying every `r` s, each attempt stopped `w` + up to 2 s
+    /// (the sweep interval) after its last request, leaves at most
+    /// ⌈(w + 2 s) / r⌉ + 1 transcodes running: `w` is 12 s at 6 s segments,
+    /// 20 s for a copied video with 10 s keyframe intervals (twice the
+    /// longest segment, so two players of such a video don't stop each
+    /// other). Its last attempt stays until the idle reaper.
+    pub async fn supersede_abandoned_transcodes(&self, now: std::time::Instant) {
+        let attached: Vec<_> = self
+            .sessions
+            .iter()
+            .filter(|e| {
+                !e.value()
+                    .device_id
+                    .is_empty()
+            })
+            .filter_map(|e| {
+                Some((
+                    e.key()
+                        .clone(),
+                    e.value()
+                        .device_id
+                        .clone(),
+                    e.value()
+                        .transcode
+                        .clone()?,
+                ))
+            })
+            .collect();
+        let mut groups: std::collections::HashMap<_, Vec<_>> =
+            std::collections::HashMap::new();
+        for (id, device_id, ts) in attached {
+            let (key, created_at) = {
+                let s = ts
+                    .read()
+                    .await;
+                if s.stopped {
+                    continue;
+                }
+                ((device_id, s.user_id, s.item_id), s.created_at)
+            };
+            groups
+                .entry(key)
+                .or_default()
+                .push((id, ts, created_at));
+        }
+        for group in groups.into_values() {
+            for (id, ts, _) in &group {
+                let Some(newest_other) = group
+                    .iter()
+                    .filter(|(other, _, _)| other != id)
+                    .map(|(_, _, created_at)| *created_at)
+                    .max()
+                else {
+                    continue;
+                };
+                // Checked last: a request may have come in meanwhile.
+                let playlist = {
+                    let s = ts
+                        .read()
+                        .await;
+                    if !s.abandoned(now) || !s.left_for(newest_other) {
+                        continue;
+                    }
+                    s.variant_playlist_path()
+                };
+                // Segments ffmpeg cut longer than requested (a copied
+                // video's keyframe intervals) are requested less often.
+                let longest = tokio::fs::read_to_string(playlist)
+                    .await
+                    .map(|playlist| longest_segment(&playlist))
+                    .unwrap_or_default();
+                if !ts
+                    .read()
+                    .await
+                    .abandoned_with_segments_of(now, longest)
+                    || self
+                        .sessions
+                        .get(id)
+                        .is_some_and(|s| s.still_played(newest_other))
+                {
+                    continue;
+                }
+                info!(
+                    play_session_id = %id,
+                    "Stopping transcode abandoned for a newer play session of the item"
+                );
+                self.stop_superseded(id, ts, newest_other)
+                    .await;
+            }
+        }
+    }
+
+    /// Stop `ts` if `id` still holds it (a seek may have replaced it): an
+    /// unreported stub goes entirely, a reported session keeps its playback
+    /// state.
+    async fn stop_superseded(
+        &self,
+        id: &str,
+        ts: &Arc<tokio::sync::RwLock<TranscodeSession>>,
+        newest_other: std::time::Instant,
+    ) {
+        // A report sent meanwhile keeps it too.
+        let holds = |s: &PlaybackSession| {
+            !s.still_played(newest_other)
+                && s.transcode
+                    .as_ref()
+                    .is_some_and(|t| Arc::ptr_eq(t, ts))
+        };
+        let handoff = self
+            .handoff
+            .lock()
+            .expect("handoff lock is not poisoned");
+        let taken = if let Some((_, stub)) = self
+            .sessions
+            .remove_if(id, |_, s| !s.is_reported() && holds(s))
+        {
+            self.pending_torrents
+                .remove(id);
+            self.pending_play_methods
+                .remove(id);
+            stub.transcode
+        } else {
+            self.sessions
+                .get_mut(id)
+                .and_then(|mut e| {
+                    if holds(e.value()) {
+                        e.value_mut()
+                            .transcode
+                            .take()
+                    } else {
+                        None
+                    }
+                })
+        };
+        drop(handoff);
+        if let Some(ts) = taken {
+            self.kill_transcode(ts, StopMode::Detached)
+                .await;
+        }
+    }
+
+    /// Stop and remove the transcode from a session, keeping the session.
+    pub async fn stop_transcode(&self, id: &str, mode: StopMode) {
         let ts = self
             .sessions
             .get_mut(id)
@@ -1048,13 +1309,14 @@ impl PlaybackSessionManager {
                     .take()
             });
         if let Some(ts) = ts {
-            kill_transcode(ts).await;
+            self.kill_transcode(ts, mode)
+                .await;
         }
     }
 
     /// Stop the transcode (if any) and remove the playback session entirely.
     /// Returns the removed session so callers can read final position/item data.
-    pub async fn stop(&self, id: &str) -> Option<PlaybackSession> {
+    pub async fn stop(&self, id: &str, mode: StopMode) -> Option<PlaybackSession> {
         // Also release references captured before a playback-start report.
         let _handoff = self
             .handoff
@@ -1072,7 +1334,8 @@ impl PlaybackSessionManager {
             .transcode
             .clone()
         {
-            kill_transcode(ts).await;
+            self.kill_transcode(ts, mode)
+                .await;
         }
         Some(session)
     }
@@ -1155,6 +1418,71 @@ impl PlaybackSessionManager {
             .collect()
     }
 
+    /// Server shutdown: refuse new transcodes, stop every session, then
+    /// remove all transcode dirs, bounded by `STOP_WAIT` in total.
+    pub async fn stop_all(&self) {
+        let ids = {
+            let mut closed = self
+                .handoff
+                .lock()
+                .expect("handoff lock is not poisoned");
+            *closed = true;
+            self.active_session_ids()
+        };
+        let base_dir = self
+            .base_dir
+            .clone();
+        let stop = async {
+            futures::future::join_all(
+                ids.iter()
+                    .map(|id| self.stop(id, StopMode::Reaped)),
+            )
+            .await;
+            // Also the dirs of transcodes stopped earlier, whose background
+            // removal the exit would cut short.
+            let _ = tokio::task::spawn_blocking(move || {
+                for entry in std::fs::read_dir(base_dir)
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                {
+                    let _ = std::fs::remove_dir_all(entry.path());
+                }
+            })
+            .await;
+        };
+        if tokio::time::timeout(crate::playback::engine::STOP_WAIT, stop)
+            .await
+            .is_err()
+        {
+            warn!("timed out stopping playback sessions");
+        }
+    }
+
+    /// Undo `stop_all`'s refusal of new transcodes, for a process that keeps
+    /// serving after all (a restart that failed to spawn its successor).
+    pub fn reopen(&self) {
+        *self
+            .handoff
+            .lock()
+            .expect("handoff lock is not poisoned") = false;
+    }
+
+    /// Spawn a background task that stops abandoned transcodes every
+    /// `interval` (see `supersede_abandoned_transcodes`).
+    pub fn spawn_supersede_task(self, interval: Duration) -> JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            loop {
+                ticker
+                    .tick()
+                    .await;
+                self.supersede_abandoned_transcodes(std::time::Instant::now())
+                    .await;
+            }
+        })
+    }
+
     /// Spawn a background task that reaps sessions idle longer than `max_age`.
     pub fn spawn_cleanup_task(
         self,
@@ -1184,7 +1512,7 @@ impl PlaybackSessionManager {
                     .collect();
                 for id in stale {
                     info!("Cleaning up idle session: {}", id);
-                    self.stop(&id)
+                    self.stop(&id, StopMode::Detached)
                         .await;
                 }
                 // Requests that never received a playback-start report must
@@ -1200,6 +1528,82 @@ impl PlaybackSessionManager {
                     .retain(|_, (seen, _)| *seen >= cutoff);
             }
         })
+    }
+
+    /// Mark a transcode stopped and tell ffmpeg to die. Unless `Reaped`, its
+    /// reap (seconds if a thread is in ext4 writeback) and dir removal run
+    /// detached.
+    async fn kill_transcode(
+        &self,
+        ts: Arc<tokio::sync::RwLock<TranscodeSession>>,
+        mode: StopMode,
+    ) {
+        let wait = matches!(mode, StopMode::Reaped);
+        let (id, kill_tx, wait_done, output_dir) = {
+            let mut s = ts
+                .write()
+                .await;
+            s.stopped = true;
+            (
+                s.id.clone(),
+                s.kill_tx
+                    .take(),
+                s.wait_done
+                    .clone(),
+                s.output_dir
+                    .clone(),
+            )
+        };
+        // A failed send means that run's ffmpeg is already gone.
+        let killed = kill_tx.is_some_and(|kill_tx| {
+            kill_tx
+                .send(())
+                .is_ok()
+        });
+        let reaped = async move {
+            if killed {
+                let notified = wait_done.notified();
+                tokio::pin!(notified);
+                if tokio::time::timeout(
+                    crate::playback::engine::STOP_WAIT,
+                    &mut notified,
+                )
+                .await
+                .is_err()
+                {
+                    warn!(play_session_id = %id, "transcode did not stop in time");
+                    // Detached: removing the dir while ffmpeg still writes
+                    // to it would leave it half removed.
+                    if !wait {
+                        notified.await;
+                    }
+                }
+            }
+            id
+        };
+        if wait {
+            // The caller restarts or exits; it owns the dir.
+            reaped.await;
+            return;
+        }
+        let sessions = self.clone();
+        tokio::spawn(async move {
+            let id = reaped.await;
+            // Under the create lock, so a transcode the play session starts
+            // again cannot be attached to the dir while it is removed.
+            let _create = TRANSCODE_CREATE_LOCKS
+                .lock(id.clone())
+                .await;
+            if sessions
+                .get_transcode(&id)
+                .is_none()
+            {
+                let _ = tokio::task::spawn_blocking(move || {
+                    std::fs::remove_dir_all(output_dir)
+                })
+                .await;
+            }
+        });
     }
 }
 
@@ -1222,29 +1626,6 @@ fn retain_lease(
     {
         target.push(lease);
     }
-}
-
-/// Kill an ffmpeg process and wait for it to exit before returning.
-async fn kill_transcode(ts: Arc<tokio::sync::RwLock<TranscodeSession>>) {
-    let (kill_tx, wait_done, output_dir) = {
-        let mut s = ts
-            .write()
-            .await;
-        (
-            s.kill_tx
-                .take(),
-            s.wait_done
-                .clone(),
-            s.output_dir
-                .clone(),
-        )
-    };
-    if let Some(kill_tx) = kill_tx {
-        let notification = wait_done.notified();
-        let _ = kill_tx.send(());
-        notification.await;
-    }
-    let _ = std::fs::remove_dir_all(&output_dir);
 }
 
 /// Clamp a client-reported play method to what this user's permissions allow,
@@ -1331,6 +1712,7 @@ mod tests {
             playlist_item_id: None,
             started_at: Utc::now(),
             last_activity: Utc::now(),
+            last_report: None,
             transcode: None,
             group_id: None,
             item_kind: None,
@@ -1444,6 +1826,949 @@ mod tests {
             !sessions
                 .pending_play_methods
                 .contains_key(id)
+        );
+    }
+
+    fn attach(
+        sessions: &PlaybackSessionManager,
+        id: &str,
+        device_id: &str,
+        ts: Arc<tokio::sync::RwLock<TranscodeSession>>,
+    ) -> bool {
+        sessions.attach_transcode(id, device_id, ts)
+    }
+
+    /// A stopped transcode's dir is removed by a background task.
+    async fn removed(path: PathBuf) -> bool {
+        for _ in 0..500 {
+            if !path.exists() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        false
+    }
+
+    fn transcode(
+        base: &std::path::Path,
+        id: &str,
+        item_id: Uuid,
+    ) -> Arc<tokio::sync::RwLock<TranscodeSession>> {
+        transcode_of(base, id, Uuid::nil(), item_id)
+    }
+
+    fn transcode_of(
+        base: &std::path::Path,
+        id: &str,
+        user_id: Uuid,
+        item_id: Uuid,
+    ) -> Arc<tokio::sync::RwLock<TranscodeSession>> {
+        TranscodeSession::new(
+            id.to_string(),
+            user_id,
+            item_id,
+            item_id,
+            String::new(),
+            base.join(id),
+            "copy".to_string(),
+            "aac".to_string(),
+            None,
+            None,
+            false,
+            6,
+            Default::default(),
+            0,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    /// When a sweep checks: long after the transcodes of a test were created
+    /// (tests can't advance `Instant`).
+    fn later() -> std::time::Instant {
+        std::time::Instant::now() + Duration::from_secs(60)
+    }
+
+    /// `ts`'s client last requested a segment or playlist `at`.
+    async fn requested(
+        ts: &Arc<tokio::sync::RwLock<TranscodeSession>>,
+        at: std::time::Instant,
+    ) {
+        ts.read()
+            .await
+            .requests
+            .requested_at(at);
+    }
+
+    /// `ts` was created `at`.
+    async fn created(
+        ts: &Arc<tokio::sync::RwLock<TranscodeSession>>,
+        at: std::time::Instant,
+    ) {
+        ts.write()
+            .await
+            .created_at = at;
+    }
+
+    #[tokio::test]
+    async fn a_retry_supersedes_the_transcodes_it_abandoned() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions = PlaybackSessionManager::new(temp.path());
+        let user = Uuid::new_v4();
+        let item = Uuid::new_v4();
+        let now = later();
+
+        // The first attempt was reported as started, and reported progress
+        // until the client retried; its retries never were.
+        let mut reported = playback_session("reported", PlayMethod::Transcode);
+        reported.user_id = user;
+        reported.device_id = "phone".to_string();
+        reported.last_report = Some(now - Duration::from_secs(25));
+        sessions
+            .insert(reported)
+            .await;
+        let reported_ts = transcode_of(temp.path(), "reported", user, item);
+        created(&reported_ts, now - Duration::from_secs(30)).await;
+        requested(&reported_ts, now - Duration::from_secs(25)).await;
+        assert!(attach(&sessions, "reported", "phone", reported_ts.clone()));
+        // Never requested: the client failed on its master playlist.
+        let abandoned = transcode_of(temp.path(), "retry-1", user, item);
+        created(&abandoned, now - Duration::from_secs(24)).await;
+        assert!(attach(&sessions, "retry-1", "phone", abandoned.clone()));
+        // The attempt the client plays.
+        let playing = transcode_of(temp.path(), "retry-2", user, item);
+        created(&playing, now - Duration::from_secs(20)).await;
+        requested(&playing, now - Duration::from_secs(1)).await;
+        assert!(attach(&sessions, "retry-2", "phone", playing));
+        // Abandoned too, but alone in their groups: nothing replaced them.
+        let kept = [
+            // Another device on the item (live TV with several viewers).
+            ("other-device", "tv", user, item),
+            // Another user on the device and item.
+            ("other-user", "phone", Uuid::new_v4(), item),
+            // Another item on the device (a music client preloading).
+            ("other-item", "phone", user, Uuid::new_v4()),
+        ];
+        for (id, device, kept_user, kept_item) in kept {
+            let ts = transcode_of(temp.path(), id, kept_user, kept_item);
+            assert!(attach(&sessions, id, device, ts));
+        }
+
+        sessions
+            .supersede_abandoned_transcodes(now)
+            .await;
+
+        // An abandoned stub goes entirely.
+        assert!(
+            sessions
+                .get("retry-1")
+                .is_none()
+        );
+        assert!(
+            abandoned
+                .read()
+                .await
+                .stopped
+        );
+        assert!(
+            removed(
+                temp.path()
+                    .join("retry-1")
+            )
+            .await
+        );
+        // A reported session keeps its playback state, not its transcode.
+        assert!(
+            sessions
+                .get("reported")
+                .is_some()
+        );
+        assert!(
+            reported_ts
+                .read()
+                .await
+                .stopped
+        );
+        assert!(
+            sessions
+                .get_transcode("reported")
+                .is_none()
+        );
+        for id in ["retry-2", "other-device", "other-user", "other-item"] {
+            assert!(
+                sessions
+                    .get_transcode(id)
+                    .is_some(),
+                "{id}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_paused_player_next_to_a_playing_one_keeps_its_transcode() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions = PlaybackSessionManager::new(temp.path());
+        let user = Uuid::new_v4();
+        let item = Uuid::new_v4();
+        let now = later();
+        // Browser tabs share their DeviceId. Tab 1 has been paused for 40 s
+        // (requesting nothing with a full buffer) while tab 2, opened after
+        // tab 1, plays.
+        let tab1 = transcode_of(temp.path(), "tab-1", user, item);
+        created(&tab1, now - Duration::from_secs(55)).await;
+        assert!(attach(&sessions, "tab-1", "browser", tab1.clone()));
+        let tab2 = transcode_of(temp.path(), "tab-2", user, item);
+        created(&tab2, now - Duration::from_secs(50)).await;
+        requested(&tab2, now - Duration::from_secs(1)).await;
+        assert!(attach(&sessions, "tab-2", "browser", tab2.clone()));
+        requested(&tab1, now - Duration::from_secs(40)).await;
+
+        sessions
+            .supersede_abandoned_transcodes(now)
+            .await;
+
+        for (id, ts) in [("tab-1", &tab1), ("tab-2", &tab2)] {
+            assert!(
+                sessions
+                    .get_transcode(id)
+                    .is_some(),
+                "{id}"
+            );
+            assert!(
+                !ts.read()
+                    .await
+                    .stopped,
+                "{id}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_paused_player_keeps_its_transcode_when_another_switches_streams() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions = PlaybackSessionManager::new(temp.path());
+        let user = Uuid::new_v4();
+        let item = Uuid::new_v4();
+        let now = later();
+        // Tab 1 reported a pause 45 s ago and has requested nothing since.
+        let mut paused = playback_session("tab-1", PlayMethod::Transcode);
+        paused.user_id = user;
+        paused.item_id = item;
+        paused.device_id = "browser".to_string();
+        paused.is_paused = true;
+        paused.last_report = Some(now - Duration::from_secs(45));
+        sessions
+            .insert(paused)
+            .await;
+        let tab1 = transcode_of(temp.path(), "tab-1", user, item);
+        created(&tab1, now - Duration::from_secs(60)).await;
+        requested(&tab1, now - Duration::from_secs(50)).await;
+        assert!(attach(&sessions, "tab-1", "browser", tab1.clone()));
+        // Then tab 2 switched its audio track: a new transcode, which tab 1
+        // never requested after, as a retry's predecessor wouldn't either.
+        let switched = transcode_of(temp.path(), "tab-2-switched", user, item);
+        created(&switched, now - Duration::from_secs(40)).await;
+        requested(&switched, now - Duration::from_secs(1)).await;
+        assert!(attach(&sessions, "tab-2-switched", "browser", switched));
+
+        sessions
+            .supersede_abandoned_transcodes(now)
+            .await;
+        assert!(
+            !tab1
+                .read()
+                .await
+                .stopped
+        );
+        assert!(
+            sessions
+                .get_transcode("tab-1")
+                .is_some()
+        );
+
+        // Not paused and not reported since, it is taken for a retry's
+        // predecessor.
+        sessions.update("tab-1", |s| s.is_paused = false);
+        sessions
+            .supersede_abandoned_transcodes(now)
+            .await;
+        assert!(
+            tab1.read()
+                .await
+                .stopped
+        );
+        assert!(
+            sessions
+                .get("tab-1")
+                .is_some(),
+            "the reported session keeps its playback state"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_resumed_player_keeps_its_transcode_until_it_requests_again() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions = PlaybackSessionManager::new(temp.path());
+        let user = Uuid::new_v4();
+        let item = Uuid::new_v4();
+        let start = later();
+        let at = |secs: u64| start + Duration::from_secs(secs);
+        // Tab 1 pauses at 0 s with a full buffer, so requests nothing more.
+        let mut paused = playback_session("tab-1", PlayMethod::Transcode);
+        paused.user_id = user;
+        paused.item_id = item;
+        paused.device_id = "browser".to_string();
+        paused.is_paused = true;
+        paused.last_report = Some(at(0));
+        sessions
+            .insert(paused)
+            .await;
+        let tab1 = transcode_of(temp.path(), "tab-1", user, item);
+        created(&tab1, start - Duration::from_secs(30)).await;
+        requested(&tab1, at(0)).await;
+        assert!(attach(&sessions, "tab-1", "browser", tab1.clone()));
+        // Tab 2 switches its audio track at 10 s: a new transcode.
+        let switched = transcode_of(temp.path(), "tab-2-switched", user, item);
+        created(&switched, at(10)).await;
+        assert!(attach(
+            &sessions,
+            "tab-2-switched",
+            "browser",
+            switched.clone()
+        ));
+
+        // Sweeps every 2 s. Tab 1 resumes at 45 s (a report) and requests
+        // its next segment 8 s later, when its buffer runs low.
+        for t in (12..=70).step_by(2) {
+            requested(&switched, at(t)).await;
+            if t == 46 {
+                sessions.update("tab-1", |s| {
+                    s.is_paused = false;
+                    s.last_report = Some(at(45));
+                });
+            }
+            if t == 54 {
+                requested(&tab1, at(53)).await;
+            }
+            sessions
+                .supersede_abandoned_transcodes(at(t + 1))
+                .await;
+            assert!(
+                !tab1
+                    .read()
+                    .await
+                    .stopped,
+                "{t}"
+            );
+        }
+        assert!(
+            sessions
+                .get_transcode("tab-1")
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn two_players_with_long_segments_keep_their_transcodes() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions = PlaybackSessionManager::new(temp.path());
+        let user = Uuid::new_v4();
+        let item = Uuid::new_v4();
+        let start = later();
+        let at = |secs: u64| start + Duration::from_secs(secs);
+        // Two tabs copy a video with 16 s keyframe intervals, so each
+        // requests a segment every 16 s although 6 s segments were asked
+        // for; tab 2 opens 10 s after tab 1, while tab 1 waits 6 s more for
+        // its next request.
+        let tab1 = transcode_of(temp.path(), "tab-1", user, item);
+        created(&tab1, at(0)).await;
+        requested(&tab1, at(0)).await;
+        assert!(attach(&sessions, "tab-1", "browser", tab1.clone()));
+        let tab2 = transcode_of(temp.path(), "tab-2", user, item);
+        created(&tab2, at(10)).await;
+        requested(&tab2, at(10)).await;
+        assert!(attach(&sessions, "tab-2", "browser", tab2.clone()));
+        for id in ["tab-1", "tab-2"] {
+            std::fs::write(
+                temp.path()
+                    .join(id)
+                    .join("main.m3u8"),
+                "#EXTM3U\n#EXTINF:16.016000,\nsegment_00000.ts\n",
+            )
+            .unwrap();
+        }
+
+        // Sweeps every 2 s for 150 s.
+        for t in (10..=160).step_by(2) {
+            if t % 16 == 0 {
+                requested(&tab1, at(t)).await;
+            }
+            if t > 10 && (t - 10) % 16 == 0 {
+                requested(&tab2, at(t)).await;
+            }
+            sessions
+                .supersede_abandoned_transcodes(at(t + 1))
+                .await;
+        }
+
+        for (id, ts) in [("tab-1", &tab1), ("tab-2", &tab2)] {
+            assert!(
+                !ts.read()
+                    .await
+                    .stopped,
+                "{id}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_transcode_waiting_for_a_segment_is_not_superseded() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions = PlaybackSessionManager::new(temp.path());
+        let user = Uuid::new_v4();
+        let item = Uuid::new_v4();
+        let now = later();
+        // A universal audio request mints a PlaySessionId: a second request
+        // for the track still playing starts a second transcode.
+        let first = transcode_of(temp.path(), "first", user, item);
+        assert!(attach(&sessions, "first", "phone", first.clone()));
+        // Its last request is long past, but still waits for ffmpeg.
+        let request = first
+            .read()
+            .await
+            .requests
+            .begin();
+        let second = transcode_of(temp.path(), "second", user, item);
+        requested(&second, now - Duration::from_secs(1)).await;
+        assert!(attach(&sessions, "second", "phone", second));
+
+        sessions
+            .supersede_abandoned_transcodes(now)
+            .await;
+
+        assert!(
+            !first
+                .read()
+                .await
+                .stopped
+        );
+        for id in ["first", "second"] {
+            assert!(
+                sessions
+                    .get_transcode(id)
+                    .is_some(),
+                "{id}"
+            );
+        }
+        drop(request);
+    }
+
+    #[tokio::test]
+    async fn of_transcodes_created_at_once_the_unplayed_one_is_superseded() {
+        for played_id in ["a", "b"] {
+            let temp = tempfile::tempdir().unwrap();
+            let sessions = PlaybackSessionManager::new(temp.path());
+            let user = Uuid::new_v4();
+            let item = Uuid::new_v4();
+            let now = later();
+            // jellyfin-web retries twice at once (video error and hls.js
+            // fatal error): two masters attach, in either order; the client
+            // plays one.
+            let mut transcodes = Vec::new();
+            for id in ["a", "b"] {
+                let ts = transcode_of(temp.path(), id, user, item);
+                created(&ts, now - Duration::from_secs(20)).await;
+                if id == played_id {
+                    requested(&ts, now - Duration::from_secs(1)).await;
+                }
+                assert!(attach(&sessions, id, "browser", ts.clone()));
+                transcodes.push((id, ts));
+            }
+
+            sessions
+                .supersede_abandoned_transcodes(now)
+                .await;
+
+            for (id, ts) in transcodes {
+                let played = id == played_id;
+                assert_eq!(
+                    sessions
+                        .get_transcode(id)
+                        .is_some(),
+                    played,
+                    "{id}"
+                );
+                assert_eq!(
+                    ts.read()
+                        .await
+                        .stopped,
+                    !played,
+                    "{id}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_retry_loop_keeps_only_the_attempts_requested_lately() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions = PlaybackSessionManager::new(temp.path());
+        let user = Uuid::new_v4();
+        let item = Uuid::new_v4();
+        let now = later();
+        // A client retrying every 2 s under a new PlaySessionId, without
+        // DELETE /Videos/ActiveEncodings: each attempt is requested from its
+        // creation until the next one is created, then never again.
+        let ids: Vec<String> = (0..10)
+            .map(|k| format!("attempt-{k}"))
+            .collect();
+        for (k, id) in ids
+            .iter()
+            .enumerate()
+        {
+            let ts = transcode_of(temp.path(), id, user, item);
+            let last_request = now - Duration::from_secs(2 * k as u64);
+            created(&ts, last_request - Duration::from_secs(1)).await;
+            requested(&ts, last_request).await;
+            assert!(attach(&sessions, id, "phone", ts));
+        }
+
+        sessions
+            .supersede_abandoned_transcodes(now)
+            .await;
+
+        // Abandoned after 12 s, twice the 6 s segment length: only the
+        // attempts of the last 12 s remain.
+        let remaining: Vec<_> = ids
+            .iter()
+            .filter(|id| {
+                sessions
+                    .get_transcode(id)
+                    .is_some()
+            })
+            .collect();
+        assert_eq!(
+            remaining,
+            ids[..6]
+                .iter()
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// The play session `/Sessions` shows for `device` and the play session
+    /// of the transcode it shows.
+    async fn shown(
+        sessions: &PlaybackSessionManager,
+        device: &str,
+    ) -> Option<(String, Option<String>)> {
+        let all = sessions.get_all();
+        let device_sessions: Vec<_> = all
+            .iter()
+            .filter(|s| s.device_id == device)
+            .collect();
+        let (ps, ts) = now_playing(&device_sessions).await?;
+        let ts_id = match ts {
+            Some(ts) => Some(
+                ts.read()
+                    .await
+                    .id
+                    .clone(),
+            ),
+            None => None,
+        };
+        Some((
+            ps.play_session_id
+                .clone(),
+            ts_id,
+        ))
+    }
+
+    #[tokio::test]
+    async fn sessions_never_show_an_unreported_transcode_stub() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions = PlaybackSessionManager::new(temp.path());
+        let user = Uuid::new_v4();
+        let item = Uuid::new_v4();
+        let stub = transcode_of(temp.path(), "stub", user, item);
+        assert!(attach(&sessions, "stub", "phone", stub));
+
+        // Before a start report nothing plays, as on Jellyfin.
+        assert_eq!(shown(&sessions, "phone").await, None);
+
+        // A direct play reported while the stub is still around.
+        let mut direct = playback_session("direct", PlayMethod::DirectPlay);
+        direct.user_id = user;
+        direct.item_id = item;
+        direct.device_id = "phone".to_string();
+        sessions
+            .insert(direct)
+            .await;
+        assert_eq!(
+            shown(&sessions, "phone").await,
+            Some(("direct".to_string(), None))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_retry_without_a_start_report_shows_the_reported_item() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions = PlaybackSessionManager::new(temp.path());
+        let user = Uuid::new_v4();
+        let item = Uuid::new_v4();
+        let mut reported = playback_session("p1", PlayMethod::Transcode);
+        reported.user_id = user;
+        reported.item_id = item;
+        reported.device_id = "tv".to_string();
+        sessions
+            .insert(reported)
+            .await;
+        let p1 = transcode_of(temp.path(), "p1", user, item);
+        assert!(attach(&sessions, "p1", "tv", p1));
+        // The retry under a new PlaySessionId, which sends no start report,
+        // and a stub of another item.
+        let p2 = transcode_of(temp.path(), "p2", user, item);
+        assert!(attach(&sessions, "p2", "tv", p2));
+        let other = transcode_of(temp.path(), "other", user, Uuid::new_v4());
+        assert!(attach(&sessions, "other", "tv", other));
+
+        assert_eq!(
+            shown(&sessions, "tv").await,
+            Some(("p1".to_string(), Some("p1".to_string())))
+        );
+        // p1's transcode superseded: the retry's serves the reported item.
+        sessions
+            .stop_transcode("p1", StopMode::Detached)
+            .await;
+        assert_eq!(
+            shown(&sessions, "tv").await,
+            Some(("p1".to_string(), Some("p2".to_string())))
+        );
+        sessions
+            .stop("p2", StopMode::Detached)
+            .await;
+        assert_eq!(shown(&sessions, "tv").await, Some(("p1".to_string(), None)));
+    }
+
+    #[tokio::test]
+    async fn a_start_report_without_the_play_session_id_keeps_the_devices_stub() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions = PlaybackSessionManager::new(temp.path());
+        let ts = transcode(temp.path(), "hls", Uuid::new_v4());
+        assert!(attach(&sessions, "hls", "phone", ts.clone()));
+
+        // `start` makes up a PlaySessionId when the report has none.
+        let mut report = playback_session("generated", PlayMethod::Transcode);
+        report.user_id = Uuid::new_v4();
+        report.device_id = "phone".to_string();
+        sessions
+            .insert(report)
+            .await;
+
+        assert!(
+            sessions
+                .get_transcode("hls")
+                .is_some()
+        );
+        assert!(
+            !ts.read()
+                .await
+                .stopped
+        );
+        assert_eq!(
+            sessions
+                .get_by_device("phone")
+                .map(|s| s.play_session_id),
+            Some("generated".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stop_before_the_first_spawn_prevents_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions = PlaybackSessionManager::new(temp.path());
+        let ts = transcode(temp.path(), "early", Uuid::new_v4());
+        assert!(attach(&sessions, "early", "phone", ts.clone()));
+
+        sessions
+            .stop("early", StopMode::Detached)
+            .await;
+        crate::playback::engine::start_transcode(
+            ts.clone(),
+            crate::playback::engine::TranscodeParams {
+                output_dir: temp
+                    .path()
+                    .join("early"),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            ts.read()
+                .await
+                .state,
+            crate::playback::session::TranscodeState::Starting,
+            "no ffmpeg was started"
+        );
+        assert!(
+            removed(
+                temp.path()
+                    .join("early")
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stop_before_the_loop_spawns_ends_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions = PlaybackSessionManager::new(temp.path());
+        let ts = transcode(temp.path(), "live", Uuid::new_v4());
+        assert!(attach(&sessions, "live", "tv", ts.clone()));
+        let wait_done = ts
+            .read()
+            .await
+            .wait_done
+            .clone();
+        crate::playback::engine::start_transcode(
+            ts.clone(),
+            crate::playback::engine::TranscodeParams {
+                output_dir: temp
+                    .path()
+                    .join("live"),
+                is_live: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        // The loop task hasn't run yet (single-threaded runtime). Live, so a
+        // spawned ffmpeg would restart instead of ending the loop.
+        sessions
+            .stop("live", StopMode::Detached)
+            .await;
+        tokio::time::timeout(Duration::from_secs(5), wait_done.notified())
+            .await
+            .expect("the loop ended without spawning ffmpeg");
+        assert!(
+            removed(
+                temp.path()
+                    .join("live")
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_all_stops_every_transcode_and_refuses_new_ones() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions = PlaybackSessionManager::new(temp.path());
+        let ts = transcode(temp.path(), "running", Uuid::new_v4());
+        assert!(attach(&sessions, "running", "phone", ts.clone()));
+        // A transcode stopped earlier whose background removal hasn't run.
+        let earlier = temp
+            .path()
+            .join("earlier");
+        std::fs::create_dir_all(&earlier).unwrap();
+
+        sessions
+            .stop_all()
+            .await;
+
+        assert!(
+            ts.read()
+                .await
+                .stopped
+        );
+        assert!(
+            sessions
+                .get("running")
+                .is_none()
+        );
+        assert!(
+            !temp
+                .path()
+                .join("running")
+                .exists()
+        );
+        assert!(!earlier.exists());
+        let late = transcode(temp.path(), "late", Uuid::new_v4());
+        assert!(!attach(&sessions, "late", "phone", late));
+        assert!(
+            sessions
+                .get("late")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stop_during_transcode_creation_stops_the_new_transcode() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions = PlaybackSessionManager::new(temp.path());
+
+        // master.m3u8 for X is creating a transcode when DELETE
+        // ActiveEncodings for X arrives.
+        let creating = TRANSCODE_CREATE_LOCKS
+            .lock("x".to_string())
+            .await;
+        let stop = tokio::spawn({
+            let sessions = sessions.clone();
+            // As DELETE ActiveEncodings does.
+            async move {
+                let _create = TRANSCODE_CREATE_LOCKS
+                    .lock_if_exists(&"x".to_string())
+                    .await;
+                sessions
+                    .stop_transcode("x", StopMode::Detached)
+                    .await
+            }
+        });
+        tokio::task::yield_now().await;
+        assert!(!stop.is_finished(), "the stop waits for the creation");
+        let ts = transcode(temp.path(), "x", Uuid::new_v4());
+        assert!(attach(&sessions, "x", "phone", ts.clone()));
+        drop(creating);
+        stop.await
+            .unwrap();
+        assert!(
+            ts.read()
+                .await
+                .stopped
+        );
+        assert!(
+            sessions
+                .get_transcode("x")
+                .is_none()
+        );
+
+        // A later request reusing X is not affected.
+        let ts = transcode(temp.path(), "x", Uuid::new_v4());
+        assert!(attach(&sessions, "x", "phone", ts));
+        assert!(
+            sessions
+                .get_transcode("x")
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_supersede_returns_at_once_and_cleans_up_after_the_reap() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions = PlaybackSessionManager::new(temp.path());
+        let item = Uuid::new_v4();
+        let now = later();
+        let old = transcode(temp.path(), "old", item);
+        // A running ffmpeg whose loop never reports it reaped, like one with
+        // a thread stuck in the kernel after SIGKILL.
+        let (kill_tx, mut kill_rx) = tokio::sync::oneshot::channel();
+        old.write()
+            .await
+            .kill_tx = Some(kill_tx);
+        assert!(attach(&sessions, "old", "phone", old.clone()));
+        let new = transcode(temp.path(), "new", item);
+        requested(&new, now).await;
+        assert!(attach(&sessions, "new", "phone", new));
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            sessions.supersede_abandoned_transcodes(now),
+        )
+        .await
+        .expect("supersede returned without waiting");
+
+        assert!(
+            kill_rx
+                .try_recv()
+                .is_ok(),
+            "ffmpeg was told to die"
+        );
+        assert!(
+            old.read()
+                .await
+                .stopped
+        );
+        assert!(
+            sessions
+                .get("old")
+                .is_none()
+        );
+
+        // The dir stays while ffmpeg may still write to it...
+        let dir = temp
+            .path()
+            .join("old");
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(dir.exists());
+        // ...and goes once the loop reports ffmpeg reaped.
+        old.read()
+            .await
+            .wait_done
+            .notify_one();
+        assert!(removed(dir).await);
+    }
+
+    #[tokio::test]
+    async fn a_supersede_spares_the_transcode_a_seek_put_in_place() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions = PlaybackSessionManager::new(temp.path());
+        let item = Uuid::new_v4();
+        let abandoned = transcode(temp.path(), "seek", item);
+        assert!(attach(&sessions, "seek", "phone", abandoned.clone()));
+        // A seek restarted the play session's transcode after the sweep
+        // found the old one abandoned.
+        let restarted = transcode(temp.path(), "seek", item);
+        assert!(attach(&sessions, "seek", "phone", restarted.clone()));
+
+        sessions
+            .stop_superseded("seek", &abandoned, std::time::Instant::now())
+            .await;
+
+        assert!(
+            !restarted
+                .read()
+                .await
+                .stopped
+        );
+        assert!(
+            sessions
+                .get_transcode("seek")
+                .is_some_and(|ts| Arc::ptr_eq(&ts, &restarted))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_restart_reopens_transcoding() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions = PlaybackSessionManager::new(temp.path());
+        sessions
+            .stop_all()
+            .await;
+        let refused = transcode(temp.path(), "refused", Uuid::new_v4());
+        assert!(!attach(&sessions, "refused", "phone", refused));
+
+        // As /System/Restart does when the new process fails to spawn.
+        sessions.reopen();
+
+        let ts = transcode(temp.path(), "after", Uuid::new_v4());
+        assert!(attach(&sessions, "after", "phone", ts));
+        assert!(
+            sessions
+                .get_transcode("after")
+                .is_some()
         );
     }
 }

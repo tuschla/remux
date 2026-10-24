@@ -22,7 +22,9 @@ use crate::{
     db::auth,
     playback::session::TranscodeSession,
     playback_session,
-    playback_session::{PlayedStream, ServedPlayback},
+    playback_session::{
+        PlayedStream, ServedPlayback, StopMode, TRANSCODE_CREATE_LOCKS,
+    },
     services::{self, MediaResolveService},
     signals::{
         Event, PlaybackContext, PlaybackPosition, RemoteCommandInfo, RemotePlayInfo,
@@ -491,7 +493,7 @@ pub async fn ping_playback_session(
     state
         .ctx
         .sessions
-        .ping(&q.play_session_id);
+        .ping_reported(&q.play_session_id);
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
@@ -576,20 +578,15 @@ pub(crate) async fn build_session_list(
 
     let mut sessions = Vec::with_capacity(devices.len());
     for device in devices {
-        // Prefer a session that has an active transcode attached; fall back to
-        // any session for this device. This handles quality-switch windows where
-        // a new stub (with inherited device_id) coexists with the old session
-        // that had its transcode cleared.
-        let ps = playback_sessions
+        let device_sessions: Vec<_> = playback_sessions
             .iter()
             .filter(|s| s.device_id == device.id)
-            .max_by_key(|s| {
-                (
-                    s.transcode
-                        .is_some(),
-                    s.last_activity,
-                )
-            });
+            .collect();
+        let shown = playback_session::now_playing(&device_sessions).await;
+        let (ps, transcode) = match shown {
+            Some((ps, transcode)) => (Some(ps), transcode),
+            None => (None, None),
+        };
 
         // Load full media from DB if there's an active playback session.
         // Use get_by_filter so preload_parents runs and db_media_to_item can
@@ -735,10 +732,7 @@ pub(crate) async fn build_session_list(
         };
 
         // Attach TranscodingInfo with enriched metadata from probe data.
-        let transcode_guard = if let Some(ts) = ps.and_then(|ps| {
-            ps.transcode
-                .clone()
-        }) {
+        let transcode_guard = if let Some(ts) = transcode {
             Some(
                 ts.read_owned()
                     .await,
@@ -1483,11 +1477,16 @@ pub async fn delete_transcoding(
 ) -> Result<impl IntoResponse> {
     if let Some(play_session_id) = q.play_session_id {
         info!("Stopping transcode session: {}", play_session_id);
+        // Stop a transcode still being created for this session too.
+        let create = TRANSCODE_CREATE_LOCKS
+            .lock_if_exists(&play_session_id)
+            .await;
         state
             .ctx
             .sessions
-            .stop_transcode(&play_session_id)
+            .stop_transcode(&play_session_id, StopMode::Detached)
             .await;
+        drop(create);
         state
             .ctx
             .signals

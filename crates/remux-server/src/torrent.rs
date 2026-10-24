@@ -806,7 +806,7 @@ mod tests {
             .await;
         let weak = Arc::downgrade(&reader);
         sessions
-            .stop("viewer-a")
+            .stop("viewer-a", crate::playback_session::StopMode::Detached)
             .await;
         manager
             .delete_if_unused(hash)
@@ -842,7 +842,7 @@ mod tests {
             .retain_torrent("viewer-b", &manager, other)
             .await;
         sessions
-            .stop("viewer-b")
+            .stop("viewer-b", crate::playback_session::StopMode::Detached)
             .await;
         assert!(
             weak.upgrade()

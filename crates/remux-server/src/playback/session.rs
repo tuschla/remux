@@ -1,8 +1,11 @@
 use remux_sdks::remux::{AudioCodec, TranscodeReasons, VideoCodec};
 use std::{
     path::PathBuf,
-    sync::{Arc, atomic::AtomicU32},
-    time::Instant,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU32, Ordering},
+    },
+    time::{Duration, Instant},
 };
 use tokio::sync::{Notify, watch};
 use uuid::Uuid;
@@ -53,8 +56,95 @@ impl SegmentContainer {
     }
 }
 
+/// Least time without a segment or playlist request after which a client
+/// that left a transcode for a newer one has abandoned it. Once its buffer
+/// is full, a playing HLS client (hls.js) requests one segment per segment
+/// duration; twice that, and at least this, leaves room for jitter. The
+/// longer this wait, the more abandoned retries run at once (see
+/// `PlaybackSessionManager::supersede_abandoned_transcodes`).
+const ABANDONED_AFTER_MIN: Duration = Duration::from_secs(10);
+
+/// The segment and playlist requests of a transcode's client.
+#[derive(Debug, Default)]
+pub struct RequestActivity {
+    in_flight: AtomicU32,
+    times: Mutex<RequestTimes>,
+}
+
+#[derive(Debug, Default)]
+struct RequestTimes {
+    /// When the last request started.
+    started: Option<Instant>,
+    /// When the last request started or finished.
+    active: Option<Instant>,
+}
+
+impl RequestActivity {
+    /// Marks a request in flight until the returned guard drops: a client
+    /// waiting for a slow segment is still on this transcode.
+    pub fn begin(self: &Arc<Self>) -> ActiveRequest {
+        self.in_flight
+            .fetch_add(1, Ordering::Relaxed);
+        let now = Some(Instant::now());
+        *self.times() = RequestTimes {
+            started: now,
+            active: now,
+        };
+        ActiveRequest(self.clone())
+    }
+
+    pub fn in_flight(&self) -> bool {
+        self.in_flight
+            .load(Ordering::Relaxed)
+            > 0
+    }
+
+    /// When the last request started; `None` if there was none.
+    pub fn last_started(&self) -> Option<Instant> {
+        self.times()
+            .started
+    }
+
+    /// When the last request started or finished; `None` if there was none.
+    pub fn last_active(&self) -> Option<Instant> {
+        self.times()
+            .active
+    }
+
+    fn times(&self) -> std::sync::MutexGuard<'_, RequestTimes> {
+        self.times
+            .lock()
+            .expect("request activity lock is not poisoned")
+    }
+
+    /// Backdates the last request (tests can't advance `Instant`).
+    #[cfg(test)]
+    pub fn requested_at(&self, at: Instant) {
+        *self.times() = RequestTimes {
+            started: Some(at),
+            active: Some(at),
+        };
+    }
+}
+
+/// A request in flight; see `RequestActivity::begin`.
+pub struct ActiveRequest(Arc<RequestActivity>);
+
+impl Drop for ActiveRequest {
+    fn drop(&mut self) {
+        self.0
+            .times()
+            .active = Some(Instant::now());
+        self.0
+            .in_flight
+            .fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 pub struct TranscodeSession {
     pub id: String,
+    /// The user whose request created this transcode.
+    pub user_id: Uuid,
     pub item_id: Uuid,
     pub media_source_id: Uuid,
     pub output_dir: PathBuf,
@@ -73,6 +163,10 @@ pub struct TranscodeSession {
     /// Kill channel and done notifier for the ffmpeg subprocess.
     pub kill_tx: Option<tokio::sync::oneshot::Sender<()>>,
     pub wait_done: Arc<Notify>,
+    /// Set on stop; the transcode loop never (re)spawns ffmpeg once set.
+    pub stopped: bool,
+    /// Segment and playlist requests: one played elsewhere goes quiet.
+    pub requests: Arc<RequestActivity>,
     /// Index of the last segment the client has requested (0-based).
     pub last_segment_index: Arc<AtomicU32>,
     /// Start offset of this transcode in seconds (from start_time_ticks).
@@ -113,6 +207,7 @@ pub struct TranscodeSession {
 impl TranscodeSession {
     pub fn new(
         play_session_id: String,
+        user_id: Uuid,
         item_id: Uuid,
         media_source_id: Uuid,
         input_url: String,
@@ -142,6 +237,7 @@ impl TranscodeSession {
         let (state_tx, _) = watch::channel(TranscodeState::Starting);
         Arc::new(tokio::sync::RwLock::new(Self {
             id: play_session_id,
+            user_id,
             item_id,
             media_source_id,
             output_dir,
@@ -158,6 +254,8 @@ impl TranscodeSession {
             transcode_reasons,
             kill_tx: None,
             wait_done: Arc::new(Notify::new()),
+            stopped: false,
+            requests: Default::default(),
             last_segment_index: Arc::new(AtomicU32::new(0)),
             start_time_secs: 0,
             playback_offset_secs: Arc::new(AtomicU32::new(0)),
@@ -201,6 +299,47 @@ impl TranscodeSession {
         self.segment_container() == SegmentContainer::Fmp4
     }
 
+    /// Whether the client has made no segment or playlist request for long
+    /// enough to have abandoned this transcode, as of `now`, if its segments
+    /// are as long as requested. Alone this also holds for a paused player;
+    /// see `left_for`.
+    pub fn abandoned(&self, now: Instant) -> bool {
+        self.abandoned_with_segments_of(now, Duration::ZERO)
+    }
+
+    /// `abandoned`, for segments up to `longest_segment` long: with a copied
+    /// video, segments end at the source's keyframes, so a playing client
+    /// may request less often than the requested length suggests.
+    pub fn abandoned_with_segments_of(
+        &self,
+        now: Instant,
+        longest_segment: Duration,
+    ) -> bool {
+        let segment =
+            longest_segment.max(Duration::from_secs(u64::from(self.segment_length)));
+        let after = ABANDONED_AFTER_MIN.max(2 * segment);
+        let idle_since = self
+            .requests
+            .last_active()
+            .unwrap_or(self.created_at);
+        !self
+            .requests
+            .in_flight()
+            && now.saturating_duration_since(idle_since) >= after
+    }
+
+    /// Whether the client has requested nothing of this transcode since a
+    /// transcode created at `other_created_at` (another of its item, on its
+    /// device) began: a retry's predecessor goes quiet before the retry
+    /// exists, while a second player of the item (a browser tab) requested
+    /// after the other one started, however long it is paused since. A
+    /// transcode never requested lost to any other.
+    pub fn left_for(&self, other_created_at: Instant) -> bool {
+        self.requests
+            .last_started()
+            .is_none_or(|started| started < other_created_at)
+    }
+
     pub fn segment_path(&self, segment_id: &str) -> PathBuf {
         let ext = if self.use_fmp4() { "m4s" } else { "ts" };
         self.output_dir
@@ -225,5 +364,157 @@ impl TranscodeSession {
             self.media_source_id
                 .as_simple(),
         )
+    }
+}
+
+/// The longest `#EXTINF` duration of an HLS playlist (zero if none).
+pub fn longest_segment(playlist: &str) -> Duration {
+    playlist
+        .lines()
+        .filter_map(|line| {
+            let secs = line
+                .strip_prefix("#EXTINF:")?
+                .split(',')
+                .next()?
+                .trim()
+                .parse::<f64>()
+                .ok()?;
+            Duration::try_from_secs_f64(secs).ok()
+        })
+        .max()
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn session(base: &std::path::Path, segment_length: u32) -> TranscodeSession {
+        let ts = TranscodeSession::new(
+            "play-session".to_string(),
+            Uuid::nil(),
+            Uuid::nil(),
+            Uuid::nil(),
+            String::new(),
+            base.join("play-session"),
+            "copy".to_string(),
+            "aac".to_string(),
+            None,
+            None,
+            false,
+            segment_length,
+            Default::default(),
+            0,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        Arc::into_inner(ts)
+            .expect("only reference")
+            .into_inner()
+    }
+
+    #[test]
+    fn a_transcode_is_abandoned_after_two_segment_durations_without_requests() {
+        let temp = tempfile::tempdir().unwrap();
+        let start = Instant::now();
+        for (segment_length, after) in [(6, 12), (10, 20), (2, 10)] {
+            let ts = session(temp.path(), segment_length);
+            ts.requests
+                .requested_at(start);
+            let at = |secs| start + Duration::from_secs(secs);
+            assert!(!ts.abandoned(at(after - 1)), "{segment_length}");
+            assert!(ts.abandoned(at(after)), "{segment_length}");
+        }
+    }
+
+    #[test]
+    fn a_request_in_flight_keeps_its_transcode_from_being_abandoned() {
+        let temp = tempfile::tempdir().unwrap();
+        let ts = session(temp.path(), 6);
+        let much_later = Instant::now() + Duration::from_secs(60);
+        let request = ts
+            .requests
+            .begin();
+        assert!(
+            ts.requests
+                .in_flight()
+        );
+        assert!(!ts.abandoned(much_later));
+
+        // Idle again from the answer on.
+        drop(request);
+        assert!(
+            !ts.requests
+                .in_flight()
+        );
+        let answered = ts
+            .requests
+            .last_active()
+            .expect("a request was answered");
+        assert!(!ts.abandoned(answered + Duration::from_secs(11)));
+        assert!(ts.abandoned(answered + Duration::from_secs(12)));
+    }
+
+    #[test]
+    fn a_transcode_never_requested_is_idle_since_its_creation() {
+        let temp = tempfile::tempdir().unwrap();
+        let ts = session(temp.path(), 6);
+        assert!(!ts.abandoned(ts.created_at + Duration::from_secs(11)));
+        assert!(ts.abandoned(ts.created_at + Duration::from_secs(12)));
+        // It lost to any other transcode, older or newer.
+        assert!(ts.left_for(ts.created_at - Duration::from_secs(1)));
+        assert!(ts.left_for(ts.created_at + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn a_transcode_is_left_only_for_one_created_after_its_last_request() {
+        let temp = tempfile::tempdir().unwrap();
+        let ts = session(temp.path(), 6);
+        let start = Instant::now();
+        ts.requests
+            .requested_at(start);
+        assert!(ts.left_for(start + Duration::from_millis(1)));
+        assert!(!ts.left_for(start));
+        assert!(!ts.left_for(start - Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn longer_segments_than_requested_take_longer_to_abandon() {
+        let temp = tempfile::tempdir().unwrap();
+        let ts = session(temp.path(), 6);
+        let start = Instant::now();
+        ts.requests
+            .requested_at(start);
+        let at = |secs| start + Duration::from_secs(secs);
+        // A copied video with 16 s keyframe intervals.
+        let longest = Duration::from_secs(16);
+        assert!(ts.abandoned(at(12)));
+        assert!(!ts.abandoned_with_segments_of(at(31), longest));
+        assert!(ts.abandoned_with_segments_of(at(32), longest));
+        // Shorter segments than requested don't shorten the wait.
+        assert!(!ts.abandoned_with_segments_of(at(11), Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn longest_segment_reads_the_playlist_durations() {
+        let playlist = "#EXTM3U\n\
+            #EXT-X-VERSION:3\n\
+            #EXT-X-TARGETDURATION:17\n\
+            #EXTINF:16.016000,\n\
+            segment_00000.ts\n\
+            #EXTINF:4.170833,\n\
+            segment_00001.ts\n";
+        assert_eq!(longest_segment(playlist), Duration::from_secs_f64(16.016));
+        assert_eq!(longest_segment("#EXTM3U\n"), Duration::ZERO);
     }
 }

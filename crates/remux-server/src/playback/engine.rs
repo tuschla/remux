@@ -1305,6 +1305,9 @@ async fn run_ffmpeg(
     (result, stderr_out)
 }
 
+/// How long a stop waits for the transcode loop to reap a killed ffmpeg.
+pub(crate) const STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Start an HLS transcode job by spawning ffmpeg.
 /// If hardware-accelerated encoding fails, automatically retries once with
 /// software encoding so a broken HW driver doesn't permanently block playback.
@@ -1316,6 +1319,10 @@ pub async fn start_transcode(
         let mut s = session
             .write()
             .await;
+        // Stopped before it started: don't recreate the removed output dir.
+        if s.stopped {
+            return Ok(());
+        }
         s.state = TranscodeState::Running;
         let _ = s
             .state_tx
@@ -1345,6 +1352,13 @@ pub async fn start_transcode(
                 let mut s = session_clone
                     .write()
                     .await;
+                // Stopped while no ffmpeg ran (no kill_tx to signal).
+                if s.stopped {
+                    debug!(session_id = %s.id, "transcode stopped before ffmpeg (re)spawn");
+                    s.wait_done
+                        .notify_one();
+                    break;
+                }
                 s.start_time_secs = params
                     .start_time_ticks
                     .map(|t| (t / 10_000_000) as u32)
@@ -1411,6 +1425,14 @@ pub async fn start_transcode(
             let mut s = session_clone
                 .write()
                 .await;
+            // A segment restart that gave up waiting for this run started a
+            // newer one on this session: leave the session to it.
+            if s.kill_tx
+                .as_ref()
+                .is_some_and(|kill_tx| !kill_tx.is_closed())
+            {
+                break;
+            }
             s.kill_tx = None;
 
             // Live streams: auto-restart on unexpected exit; only stop when killed.
@@ -2888,6 +2910,7 @@ mod tests {
     fn hevc_session(video_codec: &str, tag: Option<&str>) -> TranscodeSession {
         TranscodeSession {
             id: "play-session".into(),
+            user_id: Uuid::nil(),
             item_id: Uuid::nil(),
             media_source_id: Uuid::nil(),
             output_dir: PathBuf::from("/tmp/test_master"),
@@ -2904,6 +2927,8 @@ mod tests {
             transcode_reasons: TranscodeReasons::default(),
             kill_tx: None,
             wait_done: Arc::new(tokio::sync::Notify::new()),
+            stopped: false,
+            requests: Default::default(),
             last_segment_index: Arc::new(AtomicU32::new(0)),
             start_time_secs: 0,
             playback_offset_secs: Arc::new(AtomicU32::new(0)),
@@ -3094,6 +3119,7 @@ mod tests {
     fn resumed_vod_playlist_advertises_start_offset_and_full_seek_map() {
         let session = TranscodeSession {
             id: "play-session".into(),
+            user_id: Uuid::nil(),
             item_id: Uuid::nil(),
             media_source_id: Uuid::nil(),
             output_dir: PathBuf::from("/tmp/test_playlist"),
@@ -3110,6 +3136,8 @@ mod tests {
             transcode_reasons: TranscodeReasons::default(),
             kill_tx: None,
             wait_done: Arc::new(tokio::sync::Notify::new()),
+            stopped: false,
+            requests: Default::default(),
             last_segment_index: Arc::new(AtomicU32::new(0)),
             start_time_secs: 30,
             playback_offset_secs: Arc::new(AtomicU32::new(0)),
