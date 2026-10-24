@@ -2287,7 +2287,9 @@ pub async fn start_transcode(
                 let mut s = session_clone
                     .write()
                     .await;
-                // Stopped while no ffmpeg ran (no kill_tx to signal).
+                // Stopped while no ffmpeg ran (no kill_tx to signal), e.g.
+                // between a seek restart's decision and here: don't start one
+                // it can't stop.
                 if s.stopped
                     .is_cancelled()
                 {
