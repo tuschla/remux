@@ -348,7 +348,7 @@ impl CatalogAddon for StremioAddon {
         &self,
         ctx: &AppContext,
         local_id: &str,
-    ) -> Result<Option<Pin<Box<dyn Stream<Item = db::Media> + Send>>>> {
+    ) -> Result<Option<Pin<Box<dyn Stream<Item = Result<db::Media>> + Send>>>> {
         let svc = self.service()?;
 
         let (kind, id) = local_id
@@ -398,17 +398,21 @@ impl CatalogAddon for StremioAddon {
         .await;
 
         let stream = stream
-            .map(move |mut meta| {
+            .map(move |meta| {
                 let svc = svc.clone();
                 let tmdb = tmdb_client.clone();
                 async move {
+                    let mut meta = match meta {
+                        Ok(meta) => meta,
+                        Err(e) => return Err(e),
+                    };
                     if meta.is_error() {
                         debug!(id = %meta.id, "catalog item is an error stub, skipping");
-                        return vec![];
+                        return Ok(vec![]);
                     }
                     if !resolve_imdb_id(&mut meta, Some(&svc), tmdb.as_ref()).await {
                         debug!(id = %meta.id, "could not resolve imdb_id, skipping");
-                        return vec![];
+                        return Ok(vec![]);
                     }
                     match db::stremio_meta_to_medias(meta) {
                         Ok(mut items) => {
@@ -422,17 +426,28 @@ impl CatalogAddon for StremioAddon {
                             if let Some(top) = items.first_mut() {
                                 top.parent_id = None;
                             }
-                            items
+                            Ok(items)
                         }
                         Err(e) => {
                             warn!(error = %e, "failed to convert stremio metadata, skipping");
-                            vec![]
+                            Ok(vec![])
                         }
                     }
                 }
             })
             .buffer_unordered(10)
-            .flat_map(futures::stream::iter);
+            // A failed page stays an `Err` item, so the import knows the
+            // catalog was cut short.
+            .flat_map(|items| match items {
+                Ok(items) => futures::stream::iter(
+                    items
+                        .into_iter()
+                        .map(Ok::<_, anyhow::Error>),
+                )
+                .left_stream(),
+                Err(e) => futures::stream::once(futures::future::ready(Err(e)))
+                    .right_stream(),
+            });
 
         Ok(Some(Box::pin(stream)))
     }

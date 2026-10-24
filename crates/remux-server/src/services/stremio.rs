@@ -11,7 +11,7 @@ use std::{
     pin::Pin,
     time::{Duration, Instant},
 };
-use tracing::{debug, error};
+use tracing::debug;
 
 /// A 404 on a paginated catalog page is the addon's normal "no more pages"
 /// signal, not an error — some addons (e.g. fankai) 404 past the last page
@@ -213,7 +213,7 @@ impl StremioService {
         id: String,
         supports_skip: bool,
         page_concurrency: usize,
-    ) -> Result<Pin<Box<dyn Stream<Item = sdks::stremio::Meta> + Send>>> {
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<sdks::stremio::Meta>> + Send>>> {
         let client = self
             .client
             .clone();
@@ -247,7 +247,12 @@ impl StremioService {
             "catalog first page"
         );
         if page_size == 0 || !supports_skip {
-            return Ok(Box::pin(stream::iter(first_page.metas)));
+            return Ok(Box::pin(stream::iter(
+                first_page
+                    .metas
+                    .into_iter()
+                    .map(Ok::<_, anyhow::Error>),
+            )));
         }
 
         let first = stream::once(future::ready(Ok(first_page)));
@@ -361,35 +366,45 @@ impl StremioService {
 
         let pages = first
             .chain(rest)
-            // `take_while` drops the first item it rejects rather than passing it
-            // downstream, so the 404-vs-error distinction has to happen here — by
-            // the time a later `filter_map`/`map` would see the `Err`, take_while
-            // has already stopped the stream without it.
-            .take_while(|result| {
+            // `scan` ends the stream at the first page it maps to `None`, so the
+            // 404-vs-error distinction has to happen here. A 404 or an empty page
+            // is the end of the catalog. Any other error is passed on as the last
+            // item: the caller has to know the catalog was cut short, not that it
+            // ended, or it would drop every item after the failed page.
+            .scan(false, |failed, result| {
+                if *failed {
+                    return future::ready(None);
+                }
                 future::ready(match result {
-                    Ok(response) => !response
-                        .metas
-                        .is_empty(),
-                    Err(e) if is_404(e) => {
+                    Ok(response) => {
+                        let metas = response.metas;
+                        if metas.is_empty() {
+                            None
+                        } else {
+                            Some(
+                                stream::iter(
+                                    metas
+                                        .into_iter()
+                                        .map(Ok::<_, anyhow::Error>),
+                                )
+                                .left_stream(),
+                            )
+                        }
+                    }
+                    Err(e) if is_404(&e) => {
                         debug!(
                             "stopping catalog pagination: reached end of catalog (404)"
                         );
-                        false
+                        None
                     }
                     Err(e) => {
-                        error!(
-                            "stopping catalog pagination due to unexpected error: {}",
-                            e
-                        );
-                        false
+                        *failed = true;
+                        Some(
+                            stream::once(future::ready(Err(anyhow::Error::from(e))))
+                                .right_stream(),
+                        )
                     }
                 })
-            })
-            .filter_map(|result| async move {
-                match result {
-                    Ok(response) => Some(stream::iter(response.metas)),
-                    Err(_) => None,
-                }
             })
             .flatten();
 
@@ -399,6 +414,8 @@ impl StremioService {
 
 #[cfg(test)]
 mod tests {
+    use futures::TryStreamExt;
+
     use super::*;
 
     #[test]
@@ -450,18 +467,19 @@ mod tests {
             .await
             .unwrap();
         let names: Vec<String> = stream
-            .map(|m| m.id)
-            .collect()
-            .await;
+            .map(|m| m.map(|m| m.id))
+            .try_collect()
+            .await
+            .unwrap();
 
         assert_eq!(names, vec!["a".to_string(), "b".to_string()]);
     }
 
-    /// Same as above but for a non-404 error (5xx) — must still stop cleanly
-    /// rather than hang or panic, even though it's not the expected
-    /// end-of-catalog signal.
+    /// A non-404 error (5xx) is not the end of the catalog: the stream must
+    /// still yield page 1's items, then end on that error so the caller can
+    /// tell a cut-short catalog from a complete one.
     #[tokio::test]
-    async fn get_catalog_stream_stops_cleanly_on_non_404_error() {
+    async fn get_catalog_stream_ends_on_non_404_error() {
         let server = httpmock::MockServer::start();
         mock_page(&server, "/catalog/movie/test.json", &["a", "b"]);
         server.mock(|when, then| {
@@ -474,11 +492,20 @@ mod tests {
             .get_catalog_stream("movie".to_string(), "test".to_string(), true, 3)
             .await
             .unwrap();
-        let names: Vec<String> = stream
-            .map(|m| m.id)
+        let mut items: Vec<Result<String>> = stream
+            .map(|m| m.map(|m| m.id))
             .collect()
             .await;
 
+        let last = items.pop();
+        assert!(
+            matches!(last, Some(Err(_))),
+            "a failed page must end the stream on an error"
+        );
+        let names: Vec<String> = items
+            .into_iter()
+            .map(|name| name.unwrap())
+            .collect();
         assert_eq!(names, vec!["a".to_string(), "b".to_string()]);
     }
 

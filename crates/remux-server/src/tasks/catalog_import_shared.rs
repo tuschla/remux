@@ -12,6 +12,11 @@ use crate::{AppContext, addons::ResolvedCatalog, db};
 ///
 /// Returns a map of `kind -> count` for top-level items imported.
 ///
+/// Members of the catalog's collection that this run didn't return are
+/// removed, unless the stream yielded an `Err`: then the catalog was cut
+/// short, so the items it did return are still added or updated but every
+/// existing member is kept.
+///
 /// Timing: this span plus its `stream_pull`/`id_resolve`/`write_relations`
 /// child spans below (and `process_meta_batch`'s own span, for whatever
 /// portion of this catalog's items are new) cover the whole pipeline from
@@ -29,7 +34,7 @@ pub async fn import_catalog_items<S>(
     progress: &ProgressReporter,
 ) -> Result<(HashMap<String, usize>, HashMap<String, usize>)>
 where
-    S: futures::Stream<Item = db::Media> + Unpin,
+    S: futures::Stream<Item = Result<db::Media>> + Unpin,
 {
     // Stop pulling from the underlying paginated stream once we have enough items.
     // Without this, the stream fetches ALL pages until empty even when max=50.
@@ -49,6 +54,7 @@ where
     let mut total = 0usize;
     let mut catalog_position = 0i64;
     let mut imported_ids: HashSet<Uuid> = HashSet::new();
+    let mut failure: Option<anyhow::Error> = None;
     let membership = catalog_membership(media_id);
 
     let collection_id: Uuid = match membership {
@@ -78,10 +84,19 @@ where
 
         let mut items: Vec<db::Media> = items
             .into_iter()
+            .filter_map(|item| match item {
+                Ok(item) => Some(item),
+                Err(e) => {
+                    if failure.is_none() {
+                        failure = Some(e);
+                    }
+                    None
+                }
+            })
             .take(remaining)
             .collect();
         if items.is_empty() {
-            break;
+            continue;
         }
 
         // Only process top-level content kinds.
@@ -481,8 +496,17 @@ where
         }
     }
 
-    // Remove items that were in this catalog before but weren't returned this run.
-    if collection_id != Uuid::nil() && !imported_ids.is_empty() {
+    // A cut-short catalog says nothing about the members it didn't return, so
+    // only a complete run may remove them.
+    if let Some(error) = &failure {
+        warn!(
+            catalog = media_id,
+            error = %error,
+            "catalog incomplete: a page failed, keeping existing members"
+        );
+    } else if collection_id != Uuid::nil() && !imported_ids.is_empty() {
+        // Remove items that were in this catalog before but weren't returned
+        // this run.
         let existing_members: Vec<Uuid> = sqlx::query_scalar(
             "SELECT right_media_id FROM media_relations WHERE left_media_id = ? AND role = 'catalog'",
         )
@@ -759,7 +783,7 @@ mod tests {
                 &catalog,
                 &catalog.catalog_id,
                 10,
-                futures::stream::iter([stub]),
+                futures::stream::iter([Ok(stub)]),
                 &progress,
             )
             .await
@@ -803,7 +827,7 @@ mod tests {
             &catalog,
             &catalog.catalog_id,
             10,
-            futures::stream::iter([fresh]),
+            futures::stream::iter([Ok(fresh)]),
             &progress,
         )
         .await
@@ -811,6 +835,138 @@ mod tests {
         assert_eq!(new_counts.get(&db::MediaKind::Series.to_string()), Some(&1));
         let members: Vec<Uuid> = sqlx::query_scalar("SELECT right_media_id FROM media_relations WHERE left_media_id = ? AND role = 'catalog'").bind(collection_id).fetch_all(&ctx.db).await.unwrap();
         assert_eq!(members, vec![fresh_id]);
+    }
+
+    /// A paged catalog whose page fails partway (5xx, timeout, rate limit)
+    /// ends its stream on an `Err`. The members that page would have
+    /// returned must survive until a complete run shows they are gone.
+    #[tokio::test]
+    async fn catalog_import_keeps_members_when_a_page_fails() {
+        async fn members(db: &sqlx::SqlitePool, collection_id: Uuid) -> Vec<Uuid> {
+            let mut ids: Vec<Uuid> = sqlx::query_scalar(
+                "SELECT right_media_id FROM media_relations WHERE left_media_id = ? AND role = 'catalog'",
+            )
+            .bind(collection_id)
+            .fetch_all(db)
+            .await
+            .unwrap();
+            ids.sort();
+            ids
+        }
+        fn sorted_ids(movies: &[db::Media]) -> Vec<Uuid> {
+            let mut ids: Vec<Uuid> = movies
+                .iter()
+                .map(|m| m.id)
+                .collect();
+            ids.sort();
+            ids
+        }
+
+        let (_server, guard) = crate::integration_test::new_test_server()
+            .await
+            .unwrap();
+        let ctx = &guard.0;
+        let addon_id = Uuid::new_v4();
+        let collection_id = Uuid::new_v5(&addon_id, b"paged");
+        let catalog = ResolvedCatalog {
+            provider_catalog_id: "paged".into(),
+            catalog_id: format!("addon:{addon_id}:paged"),
+            collection_id,
+            name: "Paged".into(),
+            media_kind: Some(db::MediaKind::Movie),
+            collection_media_kind: None,
+            enabled: true,
+            max_items: None,
+            tags: vec![],
+        };
+        let mut collection = db::Media {
+            id: collection_id,
+            kind: db::MediaKind::Collection,
+            title: "Paged".into(),
+            ..Default::default()
+        };
+        collection
+            .save(&ctx.db)
+            .await
+            .unwrap();
+        let mut movies = Vec::new();
+        for i in 0..4 {
+            let tmdb = 4_200_000 + i;
+            let mut movie = db::Media {
+                id: crate::common::stable_media_uuid(
+                    &db::MediaKind::Movie,
+                    &format!("tmdb:{tmdb}"),
+                ),
+                kind: db::MediaKind::Movie,
+                title: format!("Movie {i}"),
+                external_ids: db::ExternalIds {
+                    tmdb: Some(tmdb),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            movie
+                .save(&ctx.db)
+                .await
+                .unwrap();
+            movies.push(movie);
+        }
+        let progress = ProgressReporter::new(Default::default());
+
+        import_catalog_items(
+            ctx,
+            &catalog,
+            &catalog.catalog_id,
+            10,
+            futures::stream::iter(
+                movies
+                    .iter()
+                    .cloned()
+                    .map(Ok),
+            ),
+            &progress,
+        )
+        .await
+        .unwrap();
+        assert_eq!(members(&ctx.db, collection_id).await, sorted_ids(&movies));
+
+        // Page 1 (two movies) arrives, page 2 fails.
+        let (counts, _) = import_catalog_items(
+            ctx,
+            &catalog,
+            &catalog.catalog_id,
+            10,
+            futures::stream::iter(vec![
+                Ok(movies[0].clone()),
+                Ok(movies[1].clone()),
+                Err(anyhow::anyhow!("http error (status=500)")),
+            ]),
+            &progress,
+        )
+        .await
+        .unwrap();
+        assert_eq!(counts.get(&db::MediaKind::Movie.to_string()), Some(&2));
+        assert_eq!(
+            members(&ctx.db, collection_id).await,
+            sorted_ids(&movies),
+            "a failed page must not drop the members after it"
+        );
+
+        // A complete run still removes the members it no longer returns.
+        import_catalog_items(
+            ctx,
+            &catalog,
+            &catalog.catalog_id,
+            10,
+            futures::stream::iter([Ok(movies[0].clone()), Ok(movies[1].clone())]),
+            &progress,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            members(&ctx.db, collection_id).await,
+            sorted_ids(&movies[..2])
+        );
     }
 
     /// Local music emits an artist, its albums and their tracks in one chunk.
@@ -896,7 +1052,11 @@ mod tests {
             &catalog,
             &catalog.catalog_id,
             100,
-            futures::stream::iter(items),
+            futures::stream::iter(
+                items
+                    .into_iter()
+                    .map(Ok),
+            ),
             &progress,
         )
         .await
