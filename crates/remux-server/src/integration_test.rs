@@ -80,6 +80,22 @@ pub async fn new_test_server() -> Result<(TestServer, TestGuard)> {
     .await
 }
 
+/// Like [`new_test_server`], with every TMDB call going to `mock`.
+pub async fn ctx_with_tmdb(mock: &httpmock::MockServer) -> TestGuard {
+    new_test_server_with_config(Config {
+        database_url: Some("sqlite::memory:".into()),
+        torrent_http_port: None,
+        torrent_peer_port: None,
+        disable_dht: true,
+        disable_startup_tasks: true,
+        tmdb_base_url: mock.base_url(),
+        ..Default::default()
+    })
+    .await
+    .unwrap()
+    .1
+}
+
 /// Spins up a test server and authenticates as the seeded "test" user.
 /// Returns `(server, guard, access_token)`.
 pub async fn authenticated_server() -> (TestServer, TestGuard, String) {

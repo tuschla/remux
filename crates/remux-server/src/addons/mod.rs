@@ -1261,6 +1261,494 @@ fn apply_manifest_info(
 
 const MANIFEST_FETCH_CONCURRENCY: usize = 25;
 
+/// Most TMDB `/find` lookups in flight across all searches; queued ones wait
+/// in arrival order. That bounds concurrency, not rate: at ~30–50 ms an
+/// answer, 10 allow a few hundred requests a second against TMDB's ~40.
+/// Measured live: up to 31 lookups a search, a typed query peaking at 152
+/// TMDB requests in one second, no 429. Cached answers skip this queue.
+const SEARCH_FIND_CONCURRENCY: usize = 10;
+/// Most lookups queued for a permit across all searches; past it a search
+/// asks about no more. About what 10 permits answer within one 300 ms budget
+/// at ~40 ms each. Unbounded, a 35 s `/find` stall queued 1,253 lookups for
+/// long-gone keystrokes, which fresh searches then waited behind.
+const SEARCH_FIND_QUEUE_MAX: usize = 64;
+/// How long one `/find` may take before its permit is given back. The shared
+/// 30 s request timeout let 10 lookups stalled on TMDB hold every permit,
+/// so fresh searches got no dedupe for ~30 s after TMDB recovered; their
+/// budget is 300 ms anyway.
+const SEARCH_FIND_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Bounds the `/find` lookups of all searches.
+struct SearchFindLimits {
+    /// Lookups in flight.
+    permits: Arc<tokio::sync::Semaphore>,
+    /// Lookups queued for a permit.
+    queue: Arc<tokio::sync::Semaphore>,
+    /// How long one lookup may take.
+    request_timeout: Duration,
+}
+
+impl SearchFindLimits {
+    fn new(permits: usize, queue: usize) -> Self {
+        Self {
+            permits: Arc::new(tokio::sync::Semaphore::new(permits)),
+            queue: Arc::new(tokio::sync::Semaphore::new(queue)),
+            request_timeout: SEARCH_FIND_REQUEST_TIMEOUT,
+        }
+    }
+}
+
+static SEARCH_FIND_LIMITS: std::sync::LazyLock<SearchFindLimits> =
+    std::sync::LazyLock::new(|| {
+        SearchFindLimits::new(SEARCH_FIND_CONCURRENCY, SEARCH_FIND_QUEUE_MAX)
+    });
+/// How long a search waits on its `/find` lookups.
+#[cfg(not(test))]
+const SEARCH_FIND_BUDGET: Duration = Duration::from_millis(300);
+/// Generous, so a loaded test host still sees every lookup land.
+#[cfg(test)]
+const SEARCH_FIND_BUDGET: Duration = Duration::from_secs(5);
+/// Outlives any one `/find`; the lookup clears it sooner.
+const SEARCH_FIND_RUNNING_TTL: Duration = Duration::from_secs(60);
+
+/// Most imdb ids `SEARCH_FIND_ANSWERS` holds, at a few dozen bytes each.
+const SEARCH_FIND_ANSWERS_MAX: u64 = 20_000;
+/// TMDB's `/find` answers for search dedupe, by imdb id. Held apart from the
+/// shared response cache: a library refresh fills that with season and
+/// details responses, which evicted 94% of these answers live and left
+/// searches to ask again within the budget.
+static SEARCH_FIND_ANSWERS: std::sync::LazyLock<remux_utils::Store> =
+    std::sync::LazyLock::new(|| remux_utils::Store::new(SEARCH_FIND_ANSWERS_MAX));
+
+/// The tmdb ids TMDB's `/find` places an imdb id as.
+#[derive(Clone, Copy, Debug, Default)]
+struct SearchFindAnswer {
+    movie: Option<i64>,
+    tv: Option<i64>,
+}
+
+impl SearchFindAnswer {
+    /// Keeps `found` in `SEARCH_FIND_ANSWERS` for as long as the response
+    /// cache would.
+    fn remember(imdb: &str, found: &sdks::tmdb::FindByIdResponse) -> Self {
+        let answer = Self {
+            movie: MediaResolveService::find_first_of_kind(found, false),
+            tv: MediaResolveService::find_first_of_kind(found, true),
+        };
+        SEARCH_FIND_ANSWERS.save(
+            imdb,
+            answer,
+            crate::services::resolve::find_cache_ttl(found),
+        );
+        answer
+    }
+
+    fn tmdb_id(self, is_tv: bool) -> Option<i64> {
+        if is_tv { self.tv } else { self.movie }
+    }
+}
+
+/// A running `/find`'s answer: the tmdb id, or `None` when TMDB doesn't place
+/// the imdb id as the searched kind or the lookup failed.
+type SearchFind = futures::future::Shared<tokio::sync::oneshot::Receiver<Option<i64>>>;
+/// What the store holds of a `SearchFind`, so the handles left are the
+/// lookup's own and those of the searches waiting on it.
+type WeakSearchFind =
+    futures::future::WeakShared<tokio::sync::oneshot::Receiver<Option<i64>>>;
+
+/// Store key holding the running `/find` for `imdb` as `kind`, which
+/// overlapping searches (keystrokes) join instead of sending it again.
+fn search_find_running_key(kind: &db::MediaKind, imdb: &str) -> String {
+    format!("search_find_running:{kind}:{imdb}")
+}
+
+/// `tt` and digits, as imdb ids are. An addon's id is spliced into the
+/// `/find` url path as is, so `tt1/../../movie/550` asked for another
+/// endpoint and `tt1375666?x=1` got Inception's answer.
+fn is_imdb_id(id: &str) -> bool {
+    id.strip_prefix("tt")
+        .is_some_and(|digits| {
+            !digits.is_empty()
+                && digits
+                    .bytes()
+                    .all(|b| b.is_ascii_digit())
+        })
+}
+
+/// Lowercased letters and digits: "The Wire!" and "the wire" match.
+fn title_key(title: &str) -> String {
+    title
+        .chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// The imdb ids of a Movie/Series search, deduped by
+/// `dedupe_holding_find_candidates_apart`, worth asking TMDB's `/find` about,
+/// so a Cinemeta-style copy (imdb id alone) can match the TMDB copy of the
+/// same title (tmdb id alone). Only `is_find_candidate` results, and only
+/// when a tmdb-only result is there to match, or for one sharing its imdb id
+/// with a result that has a tmdb id: the final dedupe merges those through
+/// the imdb id, and only the candidate's own tmdb id shows whether they are
+/// one title. A TMDB copy absorbed into such a result by the first dedupe,
+/// or none at all, otherwise left an imdb-only Interstellar hidden behind an
+/// Inception copy carrying its imdb id.
+///
+/// Merges drop no more results ahead of a result than there are imdb-only
+/// results ahead of it, so an imdb-only result can make the returned `limit`
+/// only while fewer than `limit` other results precede it; all of those are
+/// asked about. Ones the final dedupe would merge or titled like a tmdb-only
+/// result go first, being the likeliest twins should the budget run out.
+fn search_find_candidates<'a>(
+    kind: &db::MediaKind,
+    results: &'a [db::Media],
+    limit: usize,
+) -> Vec<&'a db::NonEmptyString> {
+    let mut tmdb_titles = std::collections::HashSet::new();
+    // Imdb ids of results that also have a tmdb id.
+    let mut linked_imdbs = std::collections::HashSet::new();
+    let mut candidates: Vec<(&db::NonEmptyString, String)> = Vec::new();
+    let mut others = 0;
+    for m in results {
+        let ids = &m.external_ids;
+        if is_find_candidate(kind, m) {
+            // Deduped among themselves, so each imdb id shows up once.
+            if let Some(imdb) = &ids.imdb
+                && others < limit
+            {
+                candidates.push((imdb, title_key(&m.title)));
+            }
+            continue;
+        }
+        if m.kind == *kind
+            && ids
+                .tmdb
+                .is_some()
+        {
+            match &ids.imdb {
+                Some(imdb) => {
+                    linked_imdbs.insert(imdb);
+                }
+                None => {
+                    tmdb_titles.insert(title_key(&m.title));
+                }
+            }
+        }
+        others += 1;
+    }
+    if tmdb_titles.is_empty() {
+        candidates.retain(|(imdb, _)| linked_imdbs.contains(imdb));
+    }
+    // Stable: position order within each group.
+    candidates.sort_by_key(|(imdb, title)| {
+        !(linked_imdbs.contains(imdb) || tmdb_titles.contains(title))
+    });
+    candidates
+        .into_iter()
+        .map(|(imdb, _)| imdb)
+        .collect()
+}
+
+/// Whether `/find` may give `m` a tmdb id in a search for `kind`: an imdb id
+/// alone, well-formed (see `is_imdb_id`). The answer is the searched kind's
+/// tmdb id, so only for results of that kind: a movie-typed meta in a Series
+/// search took The Wire's tv id 1438 and opened as the movie 1438.
+fn is_find_candidate(kind: &db::MediaKind, m: &db::Media) -> bool {
+    let ids = &m.external_ids;
+    m.kind == *kind
+        && ids
+            .tmdb
+            .is_none()
+        && ids
+            .imdb
+            .as_ref()
+            .is_some_and(|imdb| is_imdb_id(imdb))
+}
+
+/// `dedupe_by_identity`, except `/find` candidates merge only with each
+/// other. One sharing just its imdb id with a result that has a tmdb id may
+/// be another title under a wrong imdb id, which only its own `/find` answer
+/// tells: merged into an Inception copy carrying Interstellar's imdb id, an
+/// imdb-only Interstellar was never asked about and stayed hidden. The final
+/// dedupe, after the fill, groups them by what TMDB answered.
+fn dedupe_holding_find_candidates_apart(
+    kind: &db::MediaKind,
+    results: Vec<db::Media>,
+) -> Vec<db::Media> {
+    let mut positions: [Vec<usize>; 2] = Default::default();
+    let mut parts: [Vec<db::Media>; 2] = Default::default();
+    for (i, m) in results
+        .into_iter()
+        .enumerate()
+    {
+        let part = usize::from(is_find_candidate(kind, &m));
+        positions[part].push(i);
+        parts[part].push(m);
+    }
+    let mut kept: Vec<(usize, db::Media)> = Vec::new();
+    for (positions, part) in positions
+        .into_iter()
+        .zip(parts)
+    {
+        // Items with one id always group, and a group keeps its first item,
+        // so a kept item is the first with its id.
+        let mut first: HashMap<Uuid, usize> = HashMap::with_capacity(part.len());
+        for (&i, m) in positions
+            .iter()
+            .zip(&part)
+        {
+            first
+                .entry(m.id)
+                .or_insert(i);
+        }
+        kept.extend(
+            db::Media::dedupe_by_identity(part)
+                .into_iter()
+                .map(|m| (first[&m.id], m)),
+        );
+    }
+    kept.sort_unstable_by_key(|(i, _)| *i);
+    kept.into_iter()
+        .map(|(_, m)| m)
+        .collect()
+}
+
+/// TMDB's `(imdb, tmdb)` mapping for the `search_find_candidates` of a
+/// Movie/Series search. TMDB is asked rather than trusting an addon's cross
+/// id: Cinemeta's `moviedb_id` names the wrong title for some items.
+///
+/// Answers already known, misses included, are taken as is: from
+/// `SEARCH_FIND_ANSWERS`, else from the response cache, which also holds
+/// those of opened items. The rest are queued for a permit of `limits` while
+/// the queue has room; those landing within `budget` are used. A lookup that
+/// got its permit runs on past the budget, so a slow one still lands for the
+/// next keystroke, and one another search already started is joined, not
+/// resent. One still queued once no search waits on it is dropped unsent.
+async fn tmdb_ids_via_find(
+    kind: &db::MediaKind,
+    results: &[db::Media],
+    limit: usize,
+    budget: Duration,
+    limits: &SearchFindLimits,
+    ctx: &AppContext,
+) -> Vec<(db::NonEmptyString, i64)> {
+    let deadline = tokio::time::Instant::now() + budget;
+    let is_tv = *kind == db::MediaKind::Series;
+    let mut found = Vec::new();
+    let mut unknown = Vec::new();
+    for imdb in search_find_candidates(kind, results, limit) {
+        match SEARCH_FIND_ANSWERS.get::<SearchFindAnswer>(imdb.as_str()) {
+            Some(answer) => found.extend(
+                answer
+                    .tmdb_id(is_tv)
+                    .map(|tmdb| (imdb.clone(), tmdb)),
+            ),
+            None => unknown.push(imdb),
+        }
+    }
+    if unknown.is_empty() {
+        return found;
+    }
+    let Ok(Some(client)) = tokio::time::timeout_at(
+        deadline,
+        crate::common::tmdb_search_find_client(
+            &ctx.db,
+            &ctx.config
+                .tmdb_base_url,
+        ),
+    )
+    .await
+    else {
+        return found;
+    };
+    let mut owned = Vec::new();
+    let mut lookups = futures::stream::FuturesUnordered::new();
+    for imdb in unknown {
+        // Never queued behind lookups that still have to ask TMDB.
+        if let Some(cached) =
+            MediaResolveService::cached_find_by(imdb.to_string(), "imdb_id", &client)
+        {
+            found.extend(
+                SearchFindAnswer::remember(imdb, &cached)
+                    .tmdb_id(is_tv)
+                    .map(|tmdb| (imdb.clone(), tmdb)),
+            );
+            continue;
+        }
+        let key = search_find_running_key(kind, imdb);
+        let answer = loop {
+            if let Some(running) = ctx
+                .store
+                .get::<WeakSearchFind>(&key)
+            {
+                if let Some(running) = running.upgrade() {
+                    break Some(running);
+                }
+                // Left by a lookup that ended without clearing it.
+                ctx.store
+                    .delete(key.as_str());
+            }
+            let Ok(slot) = Arc::clone(&limits.queue).try_acquire_owned() else {
+                break None;
+            };
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let rx: SearchFind = futures::FutureExt::shared(rx);
+            let Some(weak) = rx.downgrade() else {
+                break None;
+            };
+            // Claims the key atomically.
+            if ctx
+                .store
+                .insert(&key, weak, SEARCH_FIND_RUNNING_TTL)
+            {
+                owned.push((imdb.clone(), key, tx, slot, rx.clone()));
+                break Some(rx);
+            }
+        };
+        if let Some(answer) = answer {
+            lookups.push(async move { (imdb, answer.await) });
+        }
+    }
+    if !owned.is_empty() {
+        let store = ctx
+            .store
+            .clone();
+        let permits = Arc::clone(&limits.permits);
+        let request_timeout = limits.request_timeout;
+        // Detached, so lookups outliving the budget still land.
+        tokio::spawn(async move {
+            // Permits are taken in candidate order: title matches first.
+            for (imdb, key, tx, slot, running) in owned {
+                let Ok(permit) = Arc::clone(&permits)
+                    .acquire_owned()
+                    .await
+                else {
+                    return;
+                };
+                drop(slot);
+                // `running` is the only handle left: every search waiting on
+                // it ran out of budget while it was queued. After a stall,
+                // sending those held up fresh searches' lookups for ~35 s.
+                if running.strong_count() == Some(1) {
+                    store.delete(key);
+                    continue;
+                }
+                let client = client.clone();
+                let store = store.clone();
+                tokio::spawn(async move {
+                    // Adds no load while TMDB is throttling the server.
+                    tokio::time::sleep(
+                        crate::common::tmdb_rate_limit()
+                            .remaining_cooldown()
+                            .await,
+                    )
+                    .await;
+                    // A timed-out lookup is no answer: nothing is cached or
+                    // remembered, so the next search asks again.
+                    let answer = tokio::time::timeout(
+                        request_timeout,
+                        MediaResolveService::find_by(
+                            imdb.to_string(),
+                            "imdb_id",
+                            &client,
+                        ),
+                    )
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+                    .map(|found| SearchFindAnswer::remember(&imdb, &found));
+                    drop(permit);
+                    store.delete(key);
+                    let _ = tx.send(answer.and_then(|a| a.tmdb_id(is_tv)));
+                    // Joinable until now, when the answer is remembered.
+                    drop(running);
+                });
+            }
+        });
+    }
+    while let Ok(Some((imdb, answer))) =
+        tokio::time::timeout_at(deadline, lookups.next()).await
+    {
+        if let Ok(Some(tmdb)) = answer {
+            found.push((imdb.clone(), tmdb));
+        }
+    }
+    found
+}
+
+/// A Movie/Series search's `results` with the tmdb ids TMDB's `/find` gives
+/// their imdb-only copies filled in, ready for the final dedupe; deduped
+/// first, so the lookups know which results can make `limit`.
+async fn link_via_find(
+    kind: &db::MediaKind,
+    results: Vec<db::Media>,
+    limit: usize,
+    ctx: &AppContext,
+) -> Vec<db::Media> {
+    let mut results = dedupe_holding_find_candidates_apart(kind, results);
+    let found = tmdb_ids_via_find(
+        kind,
+        &results,
+        limit,
+        SEARCH_FIND_BUDGET,
+        &SEARCH_FIND_LIMITS,
+        ctx,
+    )
+    .await;
+    // Both copies get the id the other carries, so either matches a stored
+    // row by whichever id that row has.
+    let mut linked = Vec::new();
+    for (imdb, tmdb) in found {
+        for (i, m) in results
+            .iter_mut()
+            .enumerate()
+        {
+            // `/find` placed the imdb id as the searched kind only.
+            if m.kind != *kind {
+                continue;
+            }
+            let ids = &mut m.external_ids;
+            if ids
+                .tmdb
+                .is_none()
+                && ids
+                    .imdb
+                    .as_ref()
+                    == Some(&imdb)
+            {
+                ids.tmdb = Some(tmdb);
+            } else if ids
+                .imdb
+                .is_none()
+                && ids.tmdb == Some(tmdb)
+            {
+                ids.imdb = Some(imdb.clone());
+            } else {
+                continue;
+            }
+            linked.push(i);
+        }
+    }
+    // Adopted again: the first adoption only knew each copy's own ids, so a
+    // stored imdb-only row hid behind the TMDB copy listed before it once the
+    // two were linked.
+    if !linked.is_empty() {
+        let mut relinked: Vec<db::Media> = linked
+            .iter()
+            .map(|&i| std::mem::take(&mut results[i]))
+            .collect();
+        db::Media::adopt_existing_rows(&ctx.db, &mut relinked).await;
+        for (i, m) in linked
+            .into_iter()
+            .zip(relinked)
+        {
+            results[i] = m;
+        }
+    }
+    results
+}
+
 #[derive(Clone)]
 pub struct AddonService {
     inner: Arc<ArcSwap<Vec<AddonRuntime>>>,
@@ -2877,7 +3365,7 @@ impl AddonService {
         }
         // `join_all` keeps priority order; on a duplicate the first
         // (higher-priority) copy wins below.
-        let mut results: Vec<db::Media> = futures::future::join_all(
+        let per_addon: Vec<Vec<db::Media>> = futures::future::join_all(
             searches
                 .iter()
                 .map(|(r, search)| async move {
@@ -2894,13 +3382,24 @@ impl AddonService {
                     vec![]
                 }),
         )
-        .await
-        .into_iter()
-        .flatten()
-        .collect();
+        .await;
+        let answered = per_addon
+            .iter()
+            .filter(|r| !r.is_empty())
+            .count();
+        let mut results: Vec<db::Media> = per_addon
+            .into_iter()
+            .flatten()
+            .collect();
         // Adopt before deduping: two addons' copies of a stored item end up
         // with the same id even when they carry different external ids.
         db::Media::adopt_existing_rows(&ctx.db, &mut results).await;
+        // An imdb-only copy and a tmdb-only copy only match once TMDB maps
+        // one onto the other. One addon doesn't list a title twice.
+        if answered >= 2 && matches!(kind, db::MediaKind::Movie | db::MediaKind::Series)
+        {
+            results = link_via_find(kind, results, limit, ctx).await;
+        }
         // Dedupe before truncating, so duplicates don't eat into the limit.
         let mut merged = db::Media::dedupe_by_identity(results);
         merged.truncate(limit);
@@ -5472,9 +5971,13 @@ mod tests {
     /// Results that share an external id only through a chain are one item:
     /// `{tmdb}`, `{tmdb, imdb}`, `{imdb}` collapses to the first, also when
     /// the linking result comes last and joins two earlier groups. An
-    /// unrelated result stays separate.
+    /// unrelated result stays separate. The imdb-only result is asked about
+    /// on `/find`, which TMDB answers consistently with the chain.
     #[tokio::test]
     async fn search_dedupes_results_linked_through_a_chain_of_ids() {
+        let tmdb = httpmock::MockServer::start();
+        mock_find(&tmdb, "tt9900101", &[9900101], &[]);
+        let guard = crate::integration_test::ctx_with_tmdb(&tmdb).await;
         let hit = |title: &str, tmdb: Option<i64>, imdb: Option<&str>| db::Media {
             id: Uuid::new_v4(),
             title: title.into(),
@@ -5500,7 +6003,13 @@ mod tests {
                 .map(|m| search_runtime(vec![m]))
                 .collect();
             runtimes.push(search_runtime(vec![other.clone()]));
-            assert_eq!(search_with(runtimes, 20).await, ["First", "Other"]);
+            let service = AddonService {
+                inner: Arc::new(ArcSwap::from_pointee(runtimes)),
+            };
+            assert_eq!(
+                search_titles(&service, &guard.0, "query", 20).await,
+                ["First", "Other"]
+            );
         }
     }
 
@@ -5549,5 +6058,895 @@ mod tests {
         )
         .await;
         assert_eq!(titles, ["Inception (TMDB)"]);
+    }
+
+    /// `/find/{imdb}` placing it as these movie and tv ids. Ids of their own
+    /// per test: the response cache is keyed on the url and httpmock reuses
+    /// servers.
+    fn mock_find<'a>(
+        server: &'a httpmock::MockServer,
+        imdb: &str,
+        movie: &[i64],
+        tv: &[i64],
+    ) -> httpmock::Mock<'a> {
+        let movie_results: Vec<_> = movie
+            .iter()
+            .map(|id| {
+                serde_json::json!({
+                    "id": id, "title": "Film", "adult": false, "original_language": "en"
+                })
+            })
+            .collect();
+        let tv_results: Vec<_> = tv
+            .iter()
+            .map(|id| serde_json::json!({"id": id, "name": "Show"}))
+            .collect();
+        server.mock(|when, then| {
+            when.path(format!("/find/{imdb}"))
+                .query_param("external_source", "imdb_id");
+            then.status(200)
+                .json_body(serde_json::json!({
+                    "movie_results": movie_results,
+                    "tv_results": tv_results
+                }));
+        })
+    }
+
+    /// TMDB-shaped: a tmdb id alone.
+    fn tmdb_only(kind: db::MediaKind, title: &str, tmdb: i64) -> db::Media {
+        db::Media {
+            id: Uuid::new_v4(),
+            title: title.into(),
+            kind,
+            external_ids: db::ExternalIds {
+                tmdb: Some(tmdb),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    /// Cinemeta-shaped: an imdb id alone.
+    fn imdb_only(kind: db::MediaKind, title: &str, imdb: &str) -> db::Media {
+        db::Media {
+            kind,
+            ..search_hit(title, imdb)
+        }
+    }
+
+    async fn search_kind(
+        ctx: &AppContext,
+        kind: db::MediaKind,
+        runtimes: Vec<AddonRuntime>,
+    ) -> Vec<db::Media> {
+        search_kind_limit(ctx, kind, runtimes, 20).await
+    }
+
+    async fn search_kind_limit(
+        ctx: &AppContext,
+        kind: db::MediaKind,
+        runtimes: Vec<AddonRuntime>,
+        limit: usize,
+    ) -> Vec<db::Media> {
+        AddonService {
+            inner: Arc::new(ArcSwap::from_pointee(runtimes)),
+        }
+        .search(&kind, "query", limit, ctx, None)
+        .await
+        .unwrap()
+    }
+
+    fn titles_of(results: &[db::Media]) -> Vec<&str> {
+        results
+            .iter()
+            .map(|m| {
+                m.title
+                    .as_str()
+            })
+            .collect()
+    }
+
+    /// A TMDB copy and a Cinemeta copy of one series merge through TMDB's
+    /// `/find` into the higher-priority copy, in either order.
+    #[tokio::test]
+    async fn search_merges_an_imdb_only_copy_through_tmdb_find() {
+        use db::MediaKind::Series;
+        let tmdb = httpmock::MockServer::start();
+        mock_find(&tmdb, "tt9870001", &[], &[9870001]);
+        let guard = crate::integration_test::ctx_with_tmdb(&tmdb).await;
+        let tmdb_copy =
+            || search_runtime(vec![tmdb_only(Series, "BoB (TMDB)", 9870001)]);
+        let cinemeta =
+            || search_runtime(vec![imdb_only(Series, "BoB (Cinemeta)", "tt9870001")]);
+
+        let results =
+            search_kind(&guard.0, Series, vec![tmdb_copy(), cinemeta()]).await;
+        assert_eq!(titles_of(&results), ["BoB (TMDB)"]);
+
+        let results =
+            search_kind(&guard.0, Series, vec![cinemeta(), tmdb_copy()]).await;
+        assert_eq!(titles_of(&results), ["BoB (Cinemeta)"]);
+        assert_eq!(
+            results[0]
+                .external_ids
+                .tmdb,
+            Some(9870001)
+        );
+        assert!(
+            guard
+                .0
+                .store
+                .get::<WeakSearchFind>(search_find_running_key(&Series, "tt9870001"))
+                .is_none(),
+            "a finished lookup clears its running marker"
+        );
+    }
+
+    /// An imdb id TMDB places only as another kind, or nowhere, merges
+    /// nothing.
+    #[tokio::test]
+    async fn search_keeps_imdb_only_copies_tmdb_does_not_place() {
+        use db::MediaKind::Movie;
+        let tmdb = httpmock::MockServer::start();
+        mock_find(&tmdb, "tt9870002", &[], &[9870002]);
+        mock_find(&tmdb, "tt9870003", &[], &[]);
+        let guard = crate::integration_test::ctx_with_tmdb(&tmdb).await;
+        let results = search_kind(
+            &guard.0,
+            Movie,
+            vec![
+                search_runtime(vec![tmdb_only(Movie, "Film (TMDB)", 9870002)]),
+                search_runtime(vec![
+                    imdb_only(Movie, "Film (Cinemeta)", "tt9870002"),
+                    imdb_only(Movie, "Other (Cinemeta)", "tt9870003"),
+                ]),
+            ],
+        )
+        .await;
+        assert_eq!(
+            titles_of(&results),
+            ["Film (TMDB)", "Film (Cinemeta)", "Other (Cinemeta)"]
+        );
+    }
+
+    /// A single answering addon has no other addon's copy to merge with, so
+    /// TMDB isn't asked. Across addons every imdb-only result is, more than
+    /// `SEARCH_FIND_CONCURRENCY` of them, so a twin listed last and titled
+    /// otherwise still merges. A repeat is answered from remembered answers.
+    #[tokio::test]
+    async fn search_asks_tmdb_find_about_every_result_across_addons() {
+        use db::MediaKind::Movie;
+        let tmdb = httpmock::MockServer::start();
+        let others = tmdb.mock(|when, then| {
+            when.path_contains("/find/tt98701");
+            then.status(200)
+                .json_body(serde_json::json!({"movie_results": [], "tv_results": []}));
+        });
+        let twin = tmdb.mock(|when, then| {
+            when.path("/find/tt9870299");
+            then.status(200)
+                .json_body(serde_json::json!({
+                    "movie_results": [{
+                        "id": 9870100, "title": "Film", "adult": false,
+                        "original_language": "en"
+                    }],
+                    "tv_results": []
+                }));
+        });
+        let guard = crate::integration_test::ctx_with_tmdb(&tmdb).await;
+        let tmdb_copy = || tmdb_only(Movie, "Twin (TMDB)", 9870100);
+        let cinemeta = |n: usize| {
+            let mut hits: Vec<db::Media> = (0..n)
+                .map(|i| {
+                    imdb_only(
+                        Movie,
+                        &format!("Cinemeta {i}"),
+                        &format!("tt98701{i:02}"),
+                    )
+                })
+                .collect();
+            hits.push(imdb_only(Movie, "Twin (Cinemeta)", "tt9870299"));
+            hits
+        };
+
+        let single = vec![
+            search_runtime([vec![tmdb_copy()], cinemeta(2)].concat()),
+            search_runtime(vec![]),
+        ];
+        assert_eq!(
+            search_kind(&guard.0, Movie, single)
+                .await
+                .len(),
+            4
+        );
+        others.assert_hits(0);
+        twin.assert_hits(0);
+
+        let n = SEARCH_FIND_CONCURRENCY + 5;
+        for _ in 0..2 {
+            let both = vec![
+                search_runtime(vec![tmdb_copy()]),
+                search_runtime(cinemeta(n)),
+            ];
+            let results = search_kind(&guard.0, Movie, both).await;
+            assert_eq!(results.len(), n + 1);
+            assert!(!titles_of(&results).contains(&"Twin (Cinemeta)"));
+        }
+        others.assert_hits(n);
+        twin.assert_hits(1);
+    }
+
+    /// Merges happen before `limit` cuts the results, and only imdb-only
+    /// results that can still make `limit` are asked about.
+    #[tokio::test]
+    async fn search_asks_tmdb_find_only_about_results_that_can_make_the_limit() {
+        use db::MediaKind::Movie;
+        let tmdb = httpmock::MockServer::start();
+        let twin = tmdb.mock(|when, then| {
+            when.path("/find/tt9870500");
+            then.status(200)
+                .json_body(serde_json::json!({
+                    "movie_results": [{
+                        "id": 9870500, "title": "Film", "adult": false,
+                        "original_language": "en"
+                    }],
+                    "tv_results": []
+                }));
+        });
+        let other = tmdb.mock(|when, then| {
+            when.path("/find/tt9870501");
+            then.status(200)
+                .json_body(serde_json::json!({"movie_results": [], "tv_results": []}));
+        });
+        let guard = crate::integration_test::ctx_with_tmdb(&tmdb).await;
+        let runtimes = || {
+            vec![
+                search_runtime(vec![
+                    tmdb_only(Movie, "A (TMDB)", 9870500),
+                    tmdb_only(Movie, "B (TMDB)", 9870599),
+                ]),
+                search_runtime(vec![
+                    imdb_only(Movie, "A (Cinemeta)", "tt9870500"),
+                    imdb_only(Movie, "C (Cinemeta)", "tt9870501"),
+                ]),
+            ]
+        };
+
+        // The two TMDB results fill a limit of two whatever TMDB answers.
+        let results = search_kind_limit(&guard.0, Movie, runtimes(), 2).await;
+        assert_eq!(titles_of(&results), ["A (TMDB)", "B (TMDB)"]);
+        twin.assert_hits(0);
+        other.assert_hits(0);
+
+        // With room for one more, "A (Cinemeta)" merges and "C (Cinemeta)"
+        // takes its place.
+        let results = search_kind_limit(&guard.0, Movie, runtimes(), 3).await;
+        assert_eq!(
+            titles_of(&results),
+            ["A (TMDB)", "B (TMDB)", "C (Cinemeta)"]
+        );
+        twin.assert_hits(1);
+        other.assert_hits(1);
+    }
+
+    /// Imdb-only results titled like a tmdb-only one are asked about first,
+    /// then the rest by position; without a tmdb-only result, none are.
+    #[test]
+    fn search_find_candidates_put_title_matches_first() {
+        use db::MediaKind::Movie;
+        let results = [
+            imdb_only(Movie, "Other", "tt1"),
+            tmdb_only(Movie, "The Target!", 1),
+            imdb_only(Movie, "Another", "tt2"),
+            imdb_only(Movie, "the target", "tt3"),
+        ];
+        let ids = |results: &[db::Media], limit: usize| -> Vec<String> {
+            search_find_candidates(&Movie, results, limit)
+                .into_iter()
+                .map(ToString::to_string)
+                .collect()
+        };
+        assert_eq!(ids(&results, 20), ["tt3", "tt1", "tt2"]);
+        // "The Target!" alone fills a limit of one for the results after it.
+        assert_eq!(ids(&results, 1), ["tt1"]);
+        assert!(ids(&[results[0].clone(), results[2].clone()], 20).is_empty());
+    }
+
+    /// Only results of the searched kind with a well-formed imdb id are
+    /// asked about; the rest stay, so they count as other results.
+    #[test]
+    fn search_find_candidates_skip_other_kinds_and_malformed_imdb_ids() {
+        use db::MediaKind::{Movie, Series};
+        let results = [
+            tmdb_only(Movie, "Target", 1),
+            imdb_only(Series, "Series-typed", "tt10"),
+            imdb_only(Movie, "Traversal", "tt1/../../movie/550"),
+            imdb_only(Movie, "Query", "tt1375666?x=1"),
+            imdb_only(Movie, "Fragment", "tt1375666#f"),
+            imdb_only(Movie, "Prefix only", "tt"),
+            imdb_only(Movie, "Well-formed", "tt11"),
+        ];
+        let ids = |kind: db::MediaKind, limit: usize| -> Vec<String> {
+            search_find_candidates(&kind, &results, limit)
+                .into_iter()
+                .map(ToString::to_string)
+                .collect()
+        };
+        assert_eq!(ids(Movie, 20), ["tt11"]);
+        assert!(ids(Movie, 6).is_empty());
+        // No tmdb-only Series result to match.
+        assert!(ids(Series, 20).is_empty());
+    }
+
+    fn find_running(ctx: &AppContext, kind: &db::MediaKind, imdb: &str) -> bool {
+        ctx.store
+            .get::<WeakSearchFind>(search_find_running_key(kind, imdb))
+            .is_some()
+    }
+
+    /// A lookup outliving the budget doesn't cost the answers that landed.
+    #[tokio::test]
+    async fn tmdb_ids_via_find_keeps_answers_that_beat_a_slow_one() {
+        use db::MediaKind::Movie;
+        let tmdb = httpmock::MockServer::start();
+        mock_find(&tmdb, "tt9870004", &[9870004], &[]);
+        tmdb.mock(|when, then| {
+            when.path("/find/tt9870005");
+            then.status(200)
+                .delay(Duration::from_secs(2))
+                .json_body(serde_json::json!({"movie_results": [], "tv_results": []}));
+        });
+        let guard = crate::integration_test::ctx_with_tmdb(&tmdb).await;
+        let results = [
+            tmdb_only(Movie, "Fast (TMDB)", 9870004),
+            imdb_only(Movie, "Slow (Cinemeta)", "tt9870005"),
+            imdb_only(Movie, "Fast (Cinemeta)", "tt9870004"),
+        ];
+        let budget = Duration::from_millis(250);
+        let limits =
+            SearchFindLimits::new(SEARCH_FIND_CONCURRENCY, SEARCH_FIND_QUEUE_MAX);
+        let found =
+            tmdb_ids_via_find(&Movie, &results, 20, budget, &limits, &guard.0).await;
+        let fast = db::NonEmptyString::try_new("tt9870004".to_string()).unwrap();
+        assert_eq!(found, [(fast, 9870004)]);
+    }
+
+    /// Cached answers, a cached miss included, are used without a permit:
+    /// with every permit held, as by slow lookups, only the uncached id
+    /// waits.
+    #[tokio::test]
+    async fn tmdb_ids_via_find_answers_from_the_cache_while_permits_are_taken() {
+        use db::MediaKind::Movie;
+        let tmdb = httpmock::MockServer::start();
+        let hit = mock_find(&tmdb, "tt9870700", &[9870700], &[]);
+        let miss = mock_find(&tmdb, "tt9870701", &[], &[]);
+        let uncached = mock_find(&tmdb, "tt9870702", &[9870702], &[]);
+        let guard = crate::integration_test::ctx_with_tmdb(&tmdb).await;
+        let client = crate::common::tmdb_search_find_client(
+            &guard
+                .0
+                .db,
+            &tmdb.base_url(),
+        )
+        .await
+        .unwrap();
+        for imdb in ["tt9870700", "tt9870701"] {
+            MediaResolveService::find_tmdb_id_by(
+                imdb.into(),
+                "imdb_id",
+                false,
+                &client,
+            )
+            .await
+            .unwrap();
+        }
+        let results = [
+            tmdb_only(Movie, "Hit (TMDB)", 9870700),
+            tmdb_only(Movie, "Uncached (TMDB)", 9870702),
+            imdb_only(Movie, "Uncached (Cinemeta)", "tt9870702"),
+            imdb_only(Movie, "Miss (Cinemeta)", "tt9870701"),
+            imdb_only(Movie, "Hit (Cinemeta)", "tt9870700"),
+        ];
+        // Limits of its own: holding the shared permits would hold up other
+        // tests' lookups.
+        let limits = SearchFindLimits::new(0, SEARCH_FIND_QUEUE_MAX);
+        let budget = Duration::from_millis(250);
+        let found =
+            tmdb_ids_via_find(&Movie, &results, 20, budget, &limits, &guard.0).await;
+        uncached.assert_hits(0);
+        let hit_id = db::NonEmptyString::try_new("tt9870700".to_string()).unwrap();
+        assert_eq!(found, [(hit_id, 9870700)]);
+        hit.assert_hits(1);
+        miss.assert_hits(1);
+    }
+
+    /// A lookup another search (keystroke) already started is joined, not
+    /// sent again: its answer merges this search's copies too.
+    #[tokio::test]
+    async fn search_joins_a_find_already_running() {
+        use db::MediaKind::Movie;
+        let tmdb = httpmock::MockServer::start();
+        let find = tmdb.mock(|when, then| {
+            when.path("/find/tt9870400");
+            then.status(200)
+                .json_body(serde_json::json!({"movie_results": [], "tv_results": []}));
+        });
+        let guard = crate::integration_test::ctx_with_tmdb(&tmdb).await;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        // The running lookup's own handle; the store holds a weak one.
+        let running: SearchFind = futures::FutureExt::shared(rx);
+        guard
+            .0
+            .store
+            .save(
+                search_find_running_key(&Movie, "tt9870400"),
+                running
+                    .downgrade()
+                    .unwrap(),
+                SEARCH_FIND_RUNNING_TTL,
+            );
+        let search = search_kind(
+            &guard.0,
+            Movie,
+            vec![
+                search_runtime(vec![tmdb_only(Movie, "Film (TMDB)", 9870400)]),
+                search_runtime(vec![imdb_only(Movie, "Film (Cinemeta)", "tt9870400")]),
+            ],
+        );
+        let (results, _) = tokio::join!(search, async move {
+            tokio::task::yield_now().await;
+            tx.send(Some(9870400))
+        });
+        assert_eq!(titles_of(&results), ["Film (TMDB)"]);
+        find.assert_hits(0);
+    }
+
+    /// A 429 on a lookup cools down only the lookups, not the TMDB search
+    /// they serve; the copies just stay apart.
+    #[tokio::test]
+    async fn search_find_rate_limit_leaves_the_tmdb_search_unthrottled() {
+        use db::MediaKind::Movie;
+        let tmdb = httpmock::MockServer::start();
+        let find = tmdb.mock(|when, then| {
+            when.path("/find/tt9870600");
+            then.status(429);
+        });
+        let guard = crate::integration_test::ctx_with_tmdb(&tmdb).await;
+        let results = search_kind(
+            &guard.0,
+            Movie,
+            vec![
+                search_runtime(vec![tmdb_only(Movie, "Film (TMDB)", 9870600)]),
+                search_runtime(vec![imdb_only(Movie, "Film (Cinemeta)", "tt9870600")]),
+            ],
+        )
+        .await;
+        assert_eq!(titles_of(&results), ["Film (TMDB)", "Film (Cinemeta)"]);
+        // Not retried, and the shared TMDB cooldown stays clear.
+        find.assert_hits(1);
+        assert_eq!(
+            crate::common::tmdb_rate_limit()
+                .remaining_cooldown()
+                .await,
+            Duration::ZERO
+        );
+    }
+
+    /// A result whose own kind isn't the searched one is never looked up nor
+    /// given the searched kind's ids: a movie-typed meta in a Series search
+    /// took the tv id and opened as the movie with that number. A tmdb-only
+    /// result of another kind sharing the number gets no imdb id either.
+    #[tokio::test]
+    async fn search_find_leaves_results_of_another_kind_alone() {
+        use db::MediaKind::{Movie, Series};
+        let tmdb = httpmock::MockServer::start();
+        let wire = mock_find(&tmdb, "tt9871001", &[], &[9871001]);
+        let interstellar = mock_find(&tmdb, "tt9871002", &[9871002], &[]);
+        let show = mock_find(&tmdb, "tt9871003", &[], &[9871003]);
+        let guard = crate::integration_test::ctx_with_tmdb(&tmdb).await;
+
+        let results = search_kind(
+            &guard.0,
+            Series,
+            vec![
+                search_runtime(vec![
+                    tmdb_only(Series, "The Wire (TMDB)", 9871001),
+                    tmdb_only(Series, "Show (TMDB)", 9871003),
+                    tmdb_only(Movie, "Film numbered like Show", 9871003),
+                ]),
+                search_runtime(vec![
+                    imdb_only(Movie, "The Wire (movie-typed)", "tt9871001"),
+                    imdb_only(Series, "Show (Cinemeta)", "tt9871003"),
+                ]),
+            ],
+        )
+        .await;
+        assert_eq!(
+            titles_of(&results),
+            [
+                "The Wire (TMDB)",
+                "Show (TMDB)",
+                "Film numbered like Show",
+                "The Wire (movie-typed)"
+            ]
+        );
+        wire.assert_hits(0);
+        show.assert_hits(1);
+        assert_eq!(
+            results[2]
+                .external_ids
+                .imdb,
+            None
+        );
+        assert_eq!(
+            results[3]
+                .external_ids
+                .tmdb,
+            None
+        );
+
+        let results = search_kind(
+            &guard.0,
+            Movie,
+            vec![
+                search_runtime(vec![tmdb_only(Movie, "Interstellar (TMDB)", 9871002)]),
+                search_runtime(vec![imdb_only(
+                    Series,
+                    "Interstellar (series-typed)",
+                    "tt9871002",
+                )]),
+            ],
+        )
+        .await;
+        assert_eq!(
+            titles_of(&results),
+            ["Interstellar (TMDB)", "Interstellar (series-typed)"]
+        );
+        interstellar.assert_hits(0);
+        assert_eq!(
+            results[1]
+                .external_ids
+                .tmdb,
+            None
+        );
+    }
+
+    /// A stored imdb-only row adopted by the Cinemeta copy is listed, not
+    /// the TMDB copy listed before it that `/find` links it to.
+    #[tokio::test]
+    async fn search_lists_the_stored_row_a_tmdb_find_links_to() {
+        use db::MediaKind::Movie;
+        let tmdb = httpmock::MockServer::start();
+        mock_find(&tmdb, "tt9871100", &[9871100], &[]);
+        let guard = crate::integration_test::ctx_with_tmdb(&tmdb).await;
+        let mut stored = imdb_only(Movie, "Heat (stored)", "tt9871100");
+        stored
+            .save(
+                &guard
+                    .0
+                    .db,
+            )
+            .await
+            .unwrap();
+        let results = search_kind(
+            &guard.0,
+            Movie,
+            vec![
+                search_runtime(vec![tmdb_only(Movie, "Heat (TMDB)", 9871100)]),
+                search_runtime(vec![imdb_only(Movie, "Heat (Cinemeta)", "tt9871100")]),
+            ],
+        )
+        .await;
+        assert_eq!(titles_of(&results), ["Heat (stored)"]);
+        assert_eq!(results[0].id, stored.id);
+    }
+
+    /// An imdb-only result sharing its imdb id with a copy carrying another
+    /// title's tmdb id isn't merged into it before `/find`: it is asked about
+    /// and reaches the final dedupe with its own tmdb id. Merged first, an
+    /// imdb-only Interstellar was never asked about and stayed hidden behind
+    /// an Inception copy carrying Interstellar's imdb id. The wrong copy
+    /// itself still collapses into the TMDB result it shares a tmdb id with.
+    #[tokio::test]
+    async fn link_via_find_asks_about_an_imdb_only_result_a_wrong_copy_shares() {
+        use db::MediaKind::Movie;
+        let tmdb = httpmock::MockServer::start();
+        let find = mock_find(&tmdb, "tt9871800", &[9871802], &[]);
+        let guard = crate::integration_test::ctx_with_tmdb(&tmdb).await;
+        let mut wrong_copy =
+            imdb_only(Movie, "Inception (Interstellar's imdb id)", "tt9871800");
+        wrong_copy
+            .external_ids
+            .tmdb = Some(9871801);
+        let results = vec![
+            tmdb_only(Movie, "Inception (TMDB)", 9871801),
+            wrong_copy,
+            imdb_only(Movie, "Interstellar (Cinemeta)", "tt9871800"),
+        ];
+        let results = link_via_find(&Movie, results, 20, &guard.0).await;
+        assert_eq!(
+            titles_of(&results),
+            ["Inception (TMDB)", "Interstellar (Cinemeta)"]
+        );
+        assert_eq!(
+            results[1]
+                .external_ids
+                .tmdb,
+            Some(9871802)
+        );
+        find.assert_hits(1);
+    }
+
+    /// Before `/find`, candidates merge with each other but not into a
+    /// result that has a tmdb id; everything else dedupes as usual, and kept
+    /// results stay in input order.
+    #[test]
+    fn dedupe_holding_find_candidates_apart_keeps_candidates_out_of_tmdb_groups() {
+        use db::MediaKind::Movie;
+        let mut linked = imdb_only(Movie, "Linked", "tt1");
+        linked
+            .external_ids
+            .tmdb = Some(1);
+        let results = vec![
+            tmdb_only(Movie, "Tmdb", 1),
+            imdb_only(Movie, "Imdb", "tt1"),
+            linked,
+            imdb_only(Movie, "Imdb again", "tt1"),
+            tmdb_only(Movie, "Tmdb again", 1),
+        ];
+        let kept = dedupe_holding_find_candidates_apart(&Movie, results);
+        assert_eq!(titles_of(&kept), ["Tmdb", "Imdb"]);
+    }
+
+    /// With no tmdb-only result, only imdb-only results sharing their imdb id
+    /// with a result that has a tmdb id are asked about.
+    #[test]
+    fn search_find_candidates_without_a_tmdb_only_result_ask_about_shared_imdb_ids() {
+        use db::MediaKind::Movie;
+        let mut linked = imdb_only(Movie, "Wrong copy", "tt1");
+        linked
+            .external_ids
+            .tmdb = Some(1);
+        let results = [
+            imdb_only(Movie, "Unrelated", "tt2"),
+            linked,
+            imdb_only(Movie, "Victim", "tt1"),
+        ];
+        let ids: Vec<String> = search_find_candidates(&Movie, &results, 20)
+            .into_iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(ids, ["tt1"]);
+    }
+
+    /// Round 5's F4O/F4X and absorbed-base shapes: an Inception copy
+    /// carrying Interstellar's imdb id, an imdb-only Interstellar, and no
+    /// tmdb-only result left after the first dedupe (none listed, or the TMDB
+    /// Inception listed after the wrong copy and absorbed into it). In every
+    /// order Interstellar is asked about and gets its own tmdb id, which the
+    /// final dedupe's conflict check keeps apart from the wrong copy's.
+    #[tokio::test]
+    async fn link_via_find_asks_about_an_imdb_only_result_with_no_tmdb_only_one_left() {
+        use db::MediaKind::Movie;
+        let tmdb = httpmock::MockServer::start();
+        let find = mock_find(&tmdb, "tt9871900", &[9871902], &[]);
+        let guard = crate::integration_test::ctx_with_tmdb(&tmdb).await;
+        let mut wrong_copy = imdb_only(Movie, "Inception (wrong imdb)", "tt9871900");
+        wrong_copy
+            .external_ids
+            .tmdb = Some(9871901);
+        let victim = || imdb_only(Movie, "Interstellar (imdb-only)", "tt9871900");
+        let base = || tmdb_only(Movie, "Inception (TMDB)", 9871901);
+        for results in [
+            vec![wrong_copy.clone(), victim()],
+            vec![victim(), wrong_copy.clone()],
+            vec![wrong_copy.clone(), base(), victim()],
+        ] {
+            let results = link_via_find(&Movie, results, 20, &guard.0).await;
+            let victim = results
+                .iter()
+                .find(|m| m.title == "Interstellar (imdb-only)")
+                .unwrap();
+            assert_eq!(
+                victim
+                    .external_ids
+                    .tmdb,
+                Some(9871902)
+            );
+            assert!(
+                results
+                    .iter()
+                    .any(|m| m
+                        .external_ids
+                        .tmdb
+                        == Some(9871901))
+            );
+        }
+        // Asked once, then remembered.
+        find.assert_hits(1);
+    }
+
+    /// `/find` answers are kept apart from the response cache, which a
+    /// library refresh churns: a lookup's answer is remembered, and one
+    /// remembered is used without asking TMDB.
+    #[tokio::test]
+    async fn search_find_answers_are_kept_apart_from_the_response_cache() {
+        use db::MediaKind::Series;
+        let tmdb = httpmock::MockServer::start();
+        let asked = mock_find(&tmdb, "tt9871200", &[], &[9871200]);
+        let remembered = mock_find(&tmdb, "tt9871201", &[], &[9871201]);
+        let guard = crate::integration_test::ctx_with_tmdb(&tmdb).await;
+        let runtimes = |imdb: &str, tmdb: i64| {
+            vec![
+                search_runtime(vec![tmdb_only(Series, "Show (TMDB)", tmdb)]),
+                search_runtime(vec![imdb_only(Series, "Show (Cinemeta)", imdb)]),
+            ]
+        };
+
+        let results =
+            search_kind(&guard.0, Series, runtimes("tt9871200", 9871200)).await;
+        assert_eq!(titles_of(&results), ["Show (TMDB)"]);
+        asked.assert_hits(1);
+        let answer = SEARCH_FIND_ANSWERS
+            .get::<SearchFindAnswer>("tt9871200")
+            .unwrap();
+        assert_eq!((answer.movie, answer.tv), (None, Some(9871200)));
+
+        // Not in the response cache, so only `SEARCH_FIND_ANSWERS` knows it.
+        SEARCH_FIND_ANSWERS.save(
+            "tt9871201",
+            SearchFindAnswer {
+                movie: None,
+                tv: Some(9871201),
+            },
+            Duration::from_secs(60),
+        );
+        let results =
+            search_kind(&guard.0, Series, runtimes("tt9871201", 9871201)).await;
+        assert_eq!(titles_of(&results), ["Show (TMDB)"]);
+        remembered.assert_hits(0);
+    }
+
+    /// A lookup still queued when its search stopped waiting is dropped
+    /// unsent and its running marker cleared; the next search asks again.
+    #[tokio::test]
+    async fn tmdb_ids_via_find_drops_a_queued_lookup_nobody_waits_for() {
+        use db::MediaKind::Movie;
+        let tmdb = httpmock::MockServer::start();
+        let find = mock_find(&tmdb, "tt9871300", &[9871300], &[]);
+        let guard = crate::integration_test::ctx_with_tmdb(&tmdb).await;
+        let results = [
+            tmdb_only(Movie, "Film (TMDB)", 9871300),
+            imdb_only(Movie, "Film (Cinemeta)", "tt9871300"),
+        ];
+        let limits = SearchFindLimits::new(0, SEARCH_FIND_QUEUE_MAX);
+        let budget = Duration::from_millis(100);
+        let found =
+            tmdb_ids_via_find(&Movie, &results, 20, budget, &limits, &guard.0).await;
+        assert!(found.is_empty());
+        assert!(find_running(&guard.0, &Movie, "tt9871300"));
+
+        limits
+            .permits
+            .add_permits(1);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while find_running(&guard.0, &Movie, "tt9871300") {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        find.assert_hits(0);
+
+        let budget = Duration::from_secs(5);
+        let found =
+            tmdb_ids_via_find(&Movie, &results, 20, budget, &limits, &guard.0).await;
+        let imdb = db::NonEmptyString::try_new("tt9871300".to_string()).unwrap();
+        assert_eq!(found, [(imdb, 9871300)]);
+        find.assert_hits(1);
+    }
+
+    /// Past the queue cap a search asks about no more.
+    #[tokio::test]
+    async fn tmdb_ids_via_find_queues_no_lookups_past_the_cap() {
+        use db::MediaKind::Movie;
+        let tmdb = httpmock::MockServer::start();
+        let first = mock_find(&tmdb, "tt9871400", &[9871400], &[]);
+        let second = mock_find(&tmdb, "tt9871401", &[9871401], &[]);
+        let guard = crate::integration_test::ctx_with_tmdb(&tmdb).await;
+        let results = [
+            tmdb_only(Movie, "A (TMDB)", 9871400),
+            tmdb_only(Movie, "B (TMDB)", 9871401),
+            imdb_only(Movie, "A (Cinemeta)", "tt9871400"),
+            imdb_only(Movie, "B (Cinemeta)", "tt9871401"),
+        ];
+        let limits = SearchFindLimits::new(0, 1);
+        let budget = Duration::from_millis(100);
+        let found =
+            tmdb_ids_via_find(&Movie, &results, 20, budget, &limits, &guard.0).await;
+        assert!(found.is_empty());
+        assert!(find_running(&guard.0, &Movie, "tt9871400"));
+        assert!(
+            !find_running(&guard.0, &Movie, "tt9871401"),
+            "queued past the cap"
+        );
+        first.assert_hits(0);
+        second.assert_hits(0);
+    }
+
+    /// A stalled lookup gives its permit back after the request timeout, so
+    /// the lookup queued behind it still answers within the budget, and the
+    /// timeout isn't remembered as a miss.
+    #[tokio::test]
+    async fn tmdb_ids_via_find_releases_the_permit_of_a_stalled_lookup() {
+        use db::MediaKind::Movie;
+        let tmdb = httpmock::MockServer::start();
+        tmdb.mock(|when, then| {
+            when.path("/find/tt9871700");
+            then.status(200)
+                .delay(Duration::from_secs(10))
+                .json_body(serde_json::json!({"movie_results": [], "tv_results": []}));
+        });
+        mock_find(&tmdb, "tt9871701", &[9871701], &[]);
+        let guard = crate::integration_test::ctx_with_tmdb(&tmdb).await;
+        let results = [
+            tmdb_only(Movie, "A (TMDB)", 9871700),
+            tmdb_only(Movie, "B (TMDB)", 9871701),
+            imdb_only(Movie, "Stalled (Cinemeta)", "tt9871700"),
+            imdb_only(Movie, "Queued (Cinemeta)", "tt9871701"),
+        ];
+        // One permit, so the second lookup waits for the stalled one.
+        let limits = SearchFindLimits {
+            request_timeout: Duration::from_millis(200),
+            ..SearchFindLimits::new(1, SEARCH_FIND_QUEUE_MAX)
+        };
+        let budget = Duration::from_secs(3);
+        let found =
+            tmdb_ids_via_find(&Movie, &results, 20, budget, &limits, &guard.0).await;
+        let queued = db::NonEmptyString::try_new("tt9871701".to_string()).unwrap();
+        assert_eq!(found, [(queued, 9871701)]);
+        assert!(
+            SEARCH_FIND_ANSWERS
+                .get::<SearchFindAnswer>("tt9871700")
+                .is_none()
+        );
+        assert!(!find_running(&guard.0, &Movie, "tt9871700"));
+    }
+
+    /// A 200 `/find` body without result keys, as a proxy wrapping an error
+    /// sends, is no answer: it isn't remembered as a miss, so the next
+    /// search asks again.
+    #[tokio::test]
+    async fn search_asks_again_after_a_find_body_without_result_keys() {
+        use db::MediaKind::Movie;
+        let tmdb = httpmock::MockServer::start();
+        let find = tmdb.mock(|when, then| {
+            when.path("/find/tt9871500");
+            then.status(200)
+                .json_body(serde_json::json!({"success": false, "status_code": 34}));
+        });
+        let guard = crate::integration_test::ctx_with_tmdb(&tmdb).await;
+        for _ in 0..2 {
+            let results = search_kind(
+                &guard.0,
+                Movie,
+                vec![
+                    search_runtime(vec![tmdb_only(Movie, "Film (TMDB)", 9871500)]),
+                    search_runtime(vec![imdb_only(
+                        Movie,
+                        "Film (Cinemeta)",
+                        "tt9871500",
+                    )]),
+                ],
+            )
+            .await;
+            assert_eq!(titles_of(&results), ["Film (TMDB)", "Film (Cinemeta)"]);
+        }
+        find.assert_hits(2);
+        assert!(
+            SEARCH_FIND_ANSWERS
+                .get::<SearchFindAnswer>("tt9871500")
+                .is_none()
+        );
     }
 }

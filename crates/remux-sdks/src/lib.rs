@@ -643,11 +643,17 @@ impl<A: Auth + Clone> RestClient<A> {
             .map(|arc| Arc::try_unwrap(arc).unwrap_or_else(|arc| (*arc).clone()))
     }
 
-    async fn execute_arc_observed<EP: Endpoint + Clone>(
-        &self,
-        endpoint: EP,
-        on_response: impl FnOnce(u16, &str),
-    ) -> Result<Arc<EP::Output>, ClientError> {
+    /// The cached response for `endpoint`, if any; never sends a request.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn cached<EP: Endpoint>(&self, endpoint: &EP) -> Option<Arc<EP::Output>> {
+        endpoint.cache_options()?;
+        HTTP_CACHE.get::<EP::Output>(cache_key::<EP::Output>(
+            self.url(endpoint)
+                .as_str(),
+        ))
+    }
+
+    fn url<EP: Endpoint>(&self, endpoint: &EP) -> url::Url {
         let path = endpoint.path();
         let mut url = self
             .base
@@ -666,6 +672,15 @@ impl<A: Auth + Clone> RestClient<A> {
                 .join("&");
             url.set_query(Some(&qs));
         }
+        url
+    }
+
+    async fn execute_arc_observed<EP: Endpoint + Clone>(
+        &self,
+        endpoint: EP,
+        on_response: impl FnOnce(u16, &str),
+    ) -> Result<Arc<EP::Output>, ClientError> {
+        let url = self.url(&endpoint);
 
         #[cfg(not(target_arch = "wasm32"))]
         let cache_key = endpoint
