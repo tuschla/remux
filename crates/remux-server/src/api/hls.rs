@@ -34,6 +34,18 @@ enum HlsSessionResult {
     Forbidden(&'static str),
 }
 
+/// HLS segment length in seconds when the client sends none.
+const DEFAULT_SEGMENT_LENGTH: u32 = 6;
+
+/// The client's `SegmentLength`. Zero or negative values get the default:
+/// segment indexes are computed by dividing by it.
+fn hls_segment_length(requested: Option<i32>) -> u32 {
+    requested
+        .and_then(|length| u32::try_from(length).ok())
+        .filter(|&length| length > 0)
+        .unwrap_or(DEFAULT_SEGMENT_LENGTH)
+}
+
 /// Shared session setup: look up or create the transcode session for an HLS
 /// request. Returns the session handle and the resolved play_session_id.
 async fn create_hls_session(
@@ -101,9 +113,7 @@ async fn create_hls_session(
     let video_codec = resolved_codecs.video;
     let audio_codec = resolved_codecs.audio;
     let burn_subtitle = resolved_codecs.burn_subtitle;
-    let segment_length = q
-        .segment_length
-        .unwrap_or(6) as u32;
+    let segment_length = hls_segment_length(q.segment_length);
 
     // Look up existing session or create a new one.
     // When the client seeks it sends the same PlaySessionId but with a new
@@ -858,6 +868,45 @@ fn should_serve_ffmpeg_variant_playlist(
     is_live
 }
 
+/// Prepare an ffmpeg-written variant playlist for the client.
+///
+/// Segment URLs are scoped to the playback session, matching Jellyfin's HLS
+/// URL shape; this keeps session lookup out of query-string rewriting, which
+/// is important for browser HLS clients. A completed EVENT playlist becomes
+/// VOD. A non-zero `discontinuity_sequence` is added as
+/// `#EXT-X-DISCONTINUITY-SEQUENCE`, which ffmpeg doesn't write.
+fn rewrite_ffmpeg_playlist(
+    content: &str,
+    psid: &str,
+    is_complete: bool,
+    discontinuity_sequence: u64,
+) -> String {
+    content
+        .lines()
+        .map(|line| {
+            if !line.starts_with('#')
+                && (line.ends_with(".ts") || line.ends_with(".m4s"))
+            {
+                format!("hls/{}/{}", psid, line)
+            } else if line.starts_with("#EXT-X-MAP:") && line.contains("\"init.mp4\"") {
+                // Scope the fMP4 init segment to the playback session too.
+                line.replace("\"init.mp4\"", &format!("\"hls/{}/init.mp4\"", psid))
+            } else if is_complete && line == "#EXT-X-PLAYLIST-TYPE:EVENT" {
+                "#EXT-X-PLAYLIST-TYPE:VOD".to_string()
+            } else if discontinuity_sequence > 0
+                && line.starts_with("#EXT-X-MEDIA-SEQUENCE:")
+            {
+                format!(
+                    "{line}\n#EXT-X-DISCONTINUITY-SEQUENCE:{discontinuity_sequence}"
+                )
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 async fn variant_hls_video_inner(
     state: AppState,
     q: api::HlsVideoQuery,
@@ -886,6 +935,12 @@ async fn variant_hls_video_inner(
         .requests
         .begin();
     let is_live = session_read.is_live;
+    // A live ffmpeg is stopped for a client that stops polling and restarted
+    // when it comes back (see `engine::spawn_live_maintenance`).
+    let live_activity = session_read
+        .live_activity
+        .clone();
+    live_activity.touch();
     let use_fmp4 = session_read.use_fmp4();
     let playlist_path = session_read.variant_playlist_path();
     let psid = session_read
@@ -894,7 +949,7 @@ async fn variant_hls_video_inner(
 
     // For live streams, fMP4 sessions, and resumed TS-HLS sessions we must
     // serve the ffmpeg-written playlist:
-    // - live streams need FFmpeg's EVENT playlist
+    // - live streams need FFmpeg's sliding-window playlist
     // - fMP4 segments snap to keyframe boundaries, so actual durations differ
     //   from the target and the playlist must reflect the real segment timing
     // - resumed TS-HLS sessions start ffmpeg at a non-zero segment number; a
@@ -906,7 +961,7 @@ async fn variant_hls_video_inner(
         session_read.start_time_secs,
     ) {
         drop(session_read);
-        // For live streams, serve FFmpeg's EVENT playlist directly.
+        // For live streams, serve FFmpeg's sliding-window playlist directly.
         // For fMP4 VOD, also use ffmpeg's playlist because fMP4 segments snap to
         // keyframe boundaries so actual durations differ from our target.
         // For resumed TS-HLS sessions, ffmpeg's playlist carries the correct
@@ -930,30 +985,17 @@ async fn variant_hls_video_inner(
         // EVENT→VOD so hls.js treats the stream as a completed VOD rather than
         // a live feed; leave live streams untouched.
         let is_complete = !is_live && content.contains("#EXT-X-ENDLIST");
-
-        // Scope each segment URL to the playback session, matching Jellyfin's
-        // HLS URL shape. This keeps session lookup out of query-string
-        // rewriting, which is important for browser HLS clients.
-        let content = content
-            .lines()
-            .map(|line| {
-                if !line.starts_with('#')
-                    && (line.ends_with(".ts") || line.ends_with(".m4s"))
-                {
-                    format!("hls/{}/{}", psid, line)
-                } else if line.starts_with("#EXT-X-MAP:")
-                    && line.contains("\"init.mp4\"")
-                {
-                    // Scope the fMP4 init segment to the playback session too.
-                    line.replace("\"init.mp4\"", &format!("\"hls/{}/init.mp4\"", psid))
-                } else if is_complete && line == "#EXT-X-PLAYLIST-TYPE:EVENT" {
-                    "#EXT-X-PLAYLIST-TYPE:VOD".to_string()
-                } else {
-                    line.to_string()
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
+        let discontinuity_sequence = if is_live {
+            live_activity.discontinuity_sequence(&content)
+        } else {
+            0
+        };
+        let content = rewrite_ffmpeg_playlist(
+            &content,
+            &psid,
+            is_complete,
+            discontinuity_sequence,
+        );
 
         return Ok(Response::builder()
             .status(StatusCode::OK)
@@ -1059,6 +1101,52 @@ fn get_current_transcoding_index(dir: &std::path::Path) -> Option<u32> {
     max_idx
 }
 
+/// How to answer a request for a segment that isn't on disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MissingSegment {
+    /// ffmpeg is about to write it.
+    Wait,
+    /// VOD seek: restart ffmpeg at the requested segment.
+    Restart,
+    /// Live segment that was already cleaned up or will never be written.
+    Gone,
+}
+
+/// Live sessions are never restarted: `-ss` on a live input produces nothing
+/// for a long time and resets the playlist under the player. A live segment
+/// below the newest one on disk was already cleaned up, so it gets an
+/// immediate 404 instead of a 60 s wait. ExoPlayer then fails fast and
+/// re-prepares at the live edge (Jellyfin Android TV retries with a new
+/// session); serving a different segment instead would break its timestamps.
+fn missing_segment_action(
+    is_live: bool,
+    requested_idx: u32,
+    current_idx: Option<u32>,
+    finished: bool,
+    segment_gap_threshold: u32,
+) -> MissingSegment {
+    if is_live {
+        return match current_idx {
+            _ if finished => MissingSegment::Gone,
+            Some(cur) if requested_idx < cur => MissingSegment::Gone,
+            _ => MissingSegment::Wait,
+        };
+    }
+    match current_idx {
+        // No segments on disk yet. If FFmpeg is still running, wait for it:
+        // killing it here causes an infinite restart cycle.
+        None if finished => MissingSegment::Restart,
+        None => MissingSegment::Wait,
+        // Seeking backward.
+        Some(cur) if requested_idx < cur => MissingSegment::Restart,
+        // Too far ahead.
+        Some(cur) if requested_idx.saturating_sub(cur) > segment_gap_threshold => {
+            MissingSegment::Restart
+        }
+        _ => MissingSegment::Wait,
+    }
+}
+
 /// Serve a complete on-disk file with a `Content-Length` header.
 ///
 /// HLS init/fragments are always fetched whole by players, so byte-range
@@ -1148,12 +1236,17 @@ async fn hls_segment_inner(
     // In flight until answered: a client waiting for a slow segment is
     // still on this transcode.
     let _request = match &session {
-        Some(s) => Some(
-            s.read()
-                .await
-                .requests
-                .begin(),
-        ),
+        Some(s) => {
+            let s = s
+                .read()
+                .await;
+            s.live_activity
+                .touch();
+            Some(
+                s.requests
+                    .begin(),
+            )
+        }
         None => None,
     };
 
@@ -1244,27 +1337,23 @@ async fn hls_segment_inner(
             let segment_length = s.segment_length;
             let current_idx = get_current_transcoding_index(&output_dir);
             let segment_gap_threshold = 24 / segment_length;
+            let action = missing_segment_action(
+                s.is_live,
+                requested_idx,
+                current_idx,
+                matches!(s.state, TranscodeState::Error(_) | TranscodeState::Complete),
+                segment_gap_threshold,
+            );
 
-            let needs_restart = match current_idx {
-                None => {
-                    // No segments on disk yet. If FFmpeg is still running
-                    // (Starting/Running), just fall through to the wait loop —
-                    // killing it here causes an infinite restart cycle.
-                    matches!(
-                        s.state,
-                        TranscodeState::Error(_) | TranscodeState::Complete
-                    )
-                }
-                Some(cur) if requested_idx < cur => true, // seeking backward
-                Some(cur)
-                    if requested_idx.saturating_sub(cur) > segment_gap_threshold =>
-                {
-                    true
-                } // too far ahead
-                _ => false, // within range — just wait for FFmpeg
-            };
+            if action == MissingSegment::Gone {
+                debug!(requested_idx, ?current_idx, "Live segment already removed");
+                None::<()>.context_not_found(&format!(
+                    "segment {} is no longer available",
+                    segment_id
+                ))?;
+            }
 
-            if needs_restart {
+            if action == MissingSegment::Restart {
                 // Guard against concurrent restart: only proceed if FFmpeg
                 // is actually running (kill_tx is Some). If another request
                 // already killed it and started a new one, just wait.
@@ -1423,6 +1512,7 @@ async fn hls_segment_inner(
                         h265_crf: encoding_opts
                             .h265_crf
                             .unwrap_or(28),
+                        // MissingSegment::Restart is VOD-only.
                         is_live: false,
                         normalize_audio_loudness: encoding_opts
                             .normalize_audio_loudness
@@ -1458,7 +1548,7 @@ async fn hls_segment_inner(
                         }
                     });
                 } // else: has_running_ffmpeg
-            } // needs_restart
+            } // MissingSegment::Restart
         }
     }
 
@@ -1603,6 +1693,66 @@ mod tests {
         // fMP4 now also uses synthetic VOD playlist — full seek bar from the start.
         assert!(!super::should_serve_ffmpeg_variant_playlist(false, true, 0));
         assert!(super::should_serve_ffmpeg_variant_playlist(true, false, 0));
+    }
+
+    #[test]
+    fn live_missing_segment_is_never_seek_restarted() {
+        use super::{MissingSegment::*, missing_segment_action};
+        // Requested segment already cleaned up: answer at once.
+        assert_eq!(missing_segment_action(true, 53, Some(64), false, 4), Gone);
+        // Next segments, even far ahead: wait for ffmpeg, never restart.
+        assert_eq!(missing_segment_action(true, 65, Some(64), false, 4), Wait);
+        assert_eq!(missing_segment_action(true, 90, Some(64), false, 4), Wait);
+        // ffmpeg restarting with an empty dir: wait.
+        assert_eq!(missing_segment_action(true, 0, None, false, 4), Wait);
+        // Live ffmpeg gave up: nothing more will be written.
+        assert_eq!(missing_segment_action(true, 65, Some(64), true, 4), Gone);
+        assert_eq!(missing_segment_action(true, 0, None, true, 4), Gone);
+    }
+
+    #[test]
+    fn vod_missing_segment_restarts_on_seek() {
+        use super::{MissingSegment::*, missing_segment_action};
+        assert_eq!(
+            missing_segment_action(false, 53, Some(64), false, 4),
+            Restart
+        );
+        assert_eq!(
+            missing_segment_action(false, 70, Some(64), false, 4),
+            Restart
+        );
+        assert_eq!(missing_segment_action(false, 66, Some(64), false, 4), Wait);
+        assert_eq!(missing_segment_action(false, 0, None, false, 4), Wait);
+        assert_eq!(missing_segment_action(false, 0, None, true, 4), Restart);
+    }
+
+    #[test]
+    fn segment_length_zero_or_negative_gets_the_default() {
+        use super::hls_segment_length;
+        assert_eq!(hls_segment_length(None), 6);
+        assert_eq!(hls_segment_length(Some(0)), 6);
+        assert_eq!(hls_segment_length(Some(-3)), 6);
+        assert_eq!(hls_segment_length(Some(1)), 1);
+        assert_eq!(hls_segment_length(Some(4)), 4);
+    }
+
+    #[test]
+    fn live_playlist_gets_the_discontinuity_sequence() {
+        use super::rewrite_ffmpeg_playlist;
+        let playlist = "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:6\n\
+                        #EXT-X-MEDIA-SEQUENCE:18\n\
+                        #EXTINF:6.000000,\nsegment_00018.ts\n";
+        assert_eq!(
+            rewrite_ffmpeg_playlist(playlist, "psid", false, 2),
+            "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:6\n\
+             #EXT-X-MEDIA-SEQUENCE:18\n#EXT-X-DISCONTINUITY-SEQUENCE:2\n\
+             #EXTINF:6.000000,\nhls/psid/segment_00018.ts"
+        );
+        // Nothing slid out: the tag's default of 0 applies.
+        assert!(
+            !rewrite_ffmpeg_playlist(playlist, "psid", false, 0)
+                .contains("DISCONTINUITY-SEQUENCE")
+        );
     }
 
     /// After a probe fallback the client may still name the stream whose

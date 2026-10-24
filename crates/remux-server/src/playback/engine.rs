@@ -6,10 +6,12 @@ use std::{
     process::Stdio,
     sync::{
         Arc,
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
     },
+    time::Duration,
 };
 use tokio::sync::RwLock;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::{
@@ -19,7 +21,9 @@ use crate::{
 };
 use remux_sdks::remux::{EncodingPreset, HardwareAccelerationType, VideoRangeType};
 
-use super::session::{SegmentContainer, TranscodeSession, TranscodeState};
+use super::session::{
+    LiveActivity, SegmentContainer, TranscodeSession, TranscodeState,
+};
 
 pub async fn detect_hardware_acceleration() -> HardwareAccelerationType {
     let detected = probe_hw_accel().await;
@@ -207,6 +211,536 @@ pub(crate) fn select_hw_accel(
 const MAX_BUFFER_SECS: u32 = 300;
 /// Seconds behind the playback position before a segment is eligible for deletion.
 const SEGMENT_KEEP_SECS: u32 = 30;
+/// Seconds of live output listed in the sliding-window live playlist. A
+/// jellyfin-web (hls.js) client that reports real positions can pause this
+/// long and resume in place, as with the EVENT playlist live TV had before,
+/// where the buffer throttle stopped ffmpeg `MAX_BUFFER_SECS` ahead.
+const LIVE_WINDOW_SECS: u32 = MAX_BUFFER_SECS;
+/// How far ffmpeg may get ahead of the newest segment the client requested,
+/// once the live source turned out to be read faster than real time (a file
+/// or VOD playlist; see `LiveRun`). Half the window: copying a file writes up
+/// to a minute of output per second and the throttle checks once a second, so
+/// the client's next segment stays listed. Also the lead over the wall clock
+/// that marks a source as read faster than real time: real live sources send
+/// a backlog on connect (the HLS demuxer starts 3 segments behind the live
+/// edge, servers burst their buffer), which must not mark them.
+const LIVE_THROTTLE_SECS: u32 = LIVE_WINDOW_SECS / 2;
+/// How often the live maintenance task throttles ffmpeg, deletes old segments
+/// and checks for an abandoned client.
+const LIVE_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(1);
+/// A live session without a playlist or segment request for this long has
+/// lost its client: players reload a live playlist every few seconds, also
+/// while paused. Its ffmpeg is stopped until the next request.
+const LIVE_IDLE: Duration = Duration::from_secs(120);
+/// ffmpeg (`-v error`) messages showing that a live input failed rather than
+/// ended. ffmpeg still exits with status 0 after them.
+const INPUT_ERROR_MESSAGES: &[&str] = &[
+    // fftools: any read error other than EOF; not fatal without `-xerror`.
+    "Error during demuxing",
+    // libavformat/http.c: the body ended before its Content-Length, or a body
+    // without Content-Length or chunked framing ended. Every end of such a
+    // live HTTP stream logs this, also a clean close by the server.
+    "Stream ends prematurely",
+];
+/// Log contexts of the network protocols and the HLS demuxer: their errors
+/// (connection reset, TLS, timeouts, segment failures) are input failures.
+const INPUT_ERROR_CONTEXTS: &[&str] =
+    &["[http @", "[https @", "[tcp @", "[tls @", "[hls @"];
+/// Upper bound for the upstream playlist read by `upstream_hls_playlist_ends`.
+const MAX_UPSTREAM_PLAYLIST_BYTES: usize = 2 * 1024 * 1024;
+
+/// Entries in the live playlist window (`-hls_list_size`).
+fn live_window_segments(segment_length: u32) -> u32 {
+    LIVE_WINDOW_SECS.div_ceil(segment_length)
+}
+
+/// Segments below this index can be deleted from a live session.
+///
+/// Live clients' reported positions can't be trusted (Jellyfin Android TV
+/// reports 0, then epoch-based values after an error), and a paused client
+/// stops requesting segments while ffmpeg keeps writing. So cleanup trails the
+/// playlist window, plus `SEGMENT_KEEP_SECS` for players still holding an
+/// older copy of the playlist. Segments behind that are no longer listed, so
+/// players don't request them.
+fn live_cleanup_cutoff(highest: u32, segment_length: u32) -> u32 {
+    highest.saturating_sub(
+        live_window_segments(segment_length) + SEGMENT_KEEP_SECS / segment_length,
+    )
+}
+
+/// Whether a live run that started writing at segment `first` and reached
+/// `highest` in `elapsed` got more than `LIVE_THROTTLE_SECS` ahead of the wall
+/// clock, which a live source can't, even with a backlog sent on connect.
+fn outran_the_clock(
+    first: u32,
+    highest: Option<u32>,
+    segment_length: u32,
+    elapsed: Duration,
+) -> bool {
+    let produced_secs = highest
+        .filter(|&h| h >= first)
+        .map_or(0, |h| u64::from(h - first + 1) * u64::from(segment_length));
+    produced_secs > elapsed.as_secs() + u64::from(LIVE_THROTTLE_SECS)
+}
+
+/// The ffmpeg runs of a live session, shared by the transcode loop and
+/// `spawn_live_maintenance`.
+///
+/// Xtream VOD, M3U entries pointing at files and VOD upstream playlists are TV
+/// channels too. Their URL, ffprobe duration or playlist type don't tell them
+/// apart from real live channels reliably, but their pace does: ffmpeg reads
+/// them faster than real time. Such a source is throttled to the client's
+/// requests. The mark only drives the throttle; whether the source ended is
+/// decided from how ffmpeg exited (`live_source_ended`).
+struct LiveRun {
+    /// First segment and start time of the current run.
+    current: std::sync::Mutex<(u32, std::time::Instant)>,
+    /// Some run outran the wall clock. Never reset: restarts read the same
+    /// source.
+    faster_than_realtime: AtomicBool,
+    /// The maintenance task stopped ffmpeg because the client went away.
+    idle_stopped: AtomicBool,
+}
+
+impl Default for LiveRun {
+    fn default() -> Self {
+        Self {
+            current: std::sync::Mutex::new((0, std::time::Instant::now())),
+            faster_than_realtime: AtomicBool::new(false),
+            idle_stopped: AtomicBool::new(false),
+        }
+    }
+}
+
+impl LiveRun {
+    /// A new ffmpeg run starts writing at `first_segment`.
+    fn start(&self, first_segment: u32) {
+        *self
+            .current
+            .lock()
+            .expect("live run lock is not poisoned") =
+            (first_segment, std::time::Instant::now());
+    }
+
+    /// Whether the source is read faster than real time, given the highest
+    /// segment on disk. Latches once the current run outran the clock.
+    fn faster_than_realtime(&self, highest: Option<u32>, segment_length: u32) -> bool {
+        if self
+            .faster_than_realtime
+            .load(Ordering::Relaxed)
+        {
+            return true;
+        }
+        let (first, started) = *self
+            .current
+            .lock()
+            .expect("live run lock is not poisoned");
+        let outran =
+            outran_the_clock(first, highest, segment_length, started.elapsed());
+        if outran {
+            self.faster_than_realtime
+                .store(true, Ordering::Relaxed);
+        }
+        outran
+    }
+}
+
+/// Throttle a live ffmpeg by the newest segment the client requested
+/// (`requested`), never by reported positions (#146).
+///
+/// Only a source read faster than real time is paused. A real live source
+/// can't get ahead of a client that follows the live edge, and a paused
+/// client must not stop it either: a stopped live ffmpeg freezes the playlist
+/// and ExoPlayer fails with PlaylistStuckException. Its client can pause for
+/// the length of the window instead.
+fn live_throttle(
+    highest: Option<u32>,
+    requested: u32,
+    segment_length: u32,
+    paused: bool,
+    faster_than_realtime: bool,
+) -> Option<ThrottleSignal> {
+    let ahead = highest
+        .map_or(0, |h| h.saturating_sub(requested))
+        .saturating_mul(segment_length);
+    if !paused && faster_than_realtime && ahead >= LIVE_THROTTLE_SECS {
+        Some(ThrottleSignal::Pause { ahead })
+    } else if paused && ahead < LIVE_THROTTLE_SECS.saturating_sub(segment_length * 2) {
+        Some(ThrottleSignal::Resume { ahead })
+    } else {
+        None
+    }
+}
+
+/// What follows a live ffmpeg run.
+#[derive(Debug, PartialEq, Eq)]
+enum LiveRunEnd {
+    /// The session was stopped.
+    Stopped,
+    /// The client went away: wait for its next request, then restart.
+    Idle,
+    /// The source ended: end the playlist.
+    Ended,
+    /// Upstream failure: restart ffmpeg.
+    Restart,
+}
+
+/// Decide what follows a live ffmpeg run. `source_ended` is
+/// `live_source_ended`; every other exit restarts. A source that ended wins
+/// over an idle stop that raced its exit.
+fn live_run_end(
+    stopped: bool,
+    idle_stopped: bool,
+    killed: bool,
+    source_ended: bool,
+) -> LiveRunEnd {
+    if stopped {
+        LiveRunEnd::Stopped
+    } else if source_ended {
+        LiveRunEnd::Ended
+    } else if idle_stopped {
+        LiveRunEnd::Idle
+    } else if killed {
+        LiveRunEnd::Stopped
+    } else {
+        LiveRunEnd::Restart
+    }
+}
+
+/// Whether ffmpeg's stderr (`-v error`) shows that the input failed; see
+/// `INPUT_ERROR_MESSAGES` and `INPUT_ERROR_CONTEXTS`. Decoder errors don't
+/// count: a damaged frame doesn't end the input.
+fn stderr_reports_input_error(stderr: &str) -> bool {
+    stderr
+        .lines()
+        .map(str::trim_start)
+        .any(|line| {
+            INPUT_ERROR_MESSAGES
+                .iter()
+                .any(|message| line.contains(message))
+                || INPUT_ERROR_CONTEXTS
+                    .iter()
+                    .any(|context| line.starts_with(context))
+        })
+}
+
+/// Whether a live ffmpeg run that exited by itself read its source to the end.
+///
+/// The exit must be clean: status 0 without input errors in stderr. Over HTTP
+/// that already rules out every end of a body without Content-Length or
+/// chunked framing (ffmpeg logs `Stream ends prematurely` for those) and a
+/// body cut short of its Content-Length. A live server can still end a
+/// chunked body cleanly, and the HLS demuxer exits cleanly when a live
+/// playlist disappears, so the input must also have an end
+/// (`live_input_ends`).
+async fn live_source_ended(
+    status: Option<&std::process::ExitStatus>,
+    stderr: &str,
+    input_url: &str,
+) -> bool {
+    status.is_some_and(std::process::ExitStatus::success)
+        && !stderr_reports_input_error(stderr)
+        && live_input_ends(input_url).await
+}
+
+/// Whether the input has an end: a local file, an HTTP resource with a length
+/// (`probe_input_end`), or an HLS playlist with `#EXT-X-ENDLIST` or
+/// `PLAYLIST-TYPE:VOD`. Asked after ffmpeg exited, so the request doesn't
+/// compete with ffmpeg for a provider's connection limit. Unreachable
+/// upstreams and other protocols (RTSP, UDP, …) count as live.
+///
+/// A live HLS publisher that reconnects writes `#EXT-X-ENDLIST` for a moment,
+/// which ends the channel if read then; main does the same.
+async fn live_input_ends(input_url: &str) -> bool {
+    match url::Url::parse(input_url) {
+        Ok(url) if matches!(url.scheme(), "http" | "https") => {}
+        Ok(url) if url.scheme() == "file" => return true,
+        // A Windows drive letter parses as a one-letter scheme.
+        Ok(url)
+            if url
+                .scheme()
+                .len()
+                > 1 =>
+        {
+            return false;
+        }
+        _ => return true,
+    }
+    if is_hls_input_url(input_url) {
+        return upstream_hls_playlist_ends(input_url).await;
+    }
+    probe_input_end(input_url).await
+}
+
+/// Tries of the length probe: providers with a connection limit refuse a new
+/// connection for a moment after ffmpeg's closed.
+const LENGTH_PROBE_ATTEMPTS: u32 = 3;
+const LENGTH_PROBE_BACKOFF: Duration = Duration::from_secs(2);
+/// Bound for all tries; the live restart waits for the answer.
+const LENGTH_PROBE_BUDGET: Duration = Duration::from_secs(8);
+
+/// Whether a response status (`None`: transport error) to the length probe is
+/// worth another try: a provider's connection limit (403, 429, 509) or a
+/// temporary outage (503) rather than an answer about the resource.
+///
+/// A provider that keeps refusing for longer than the tries (about 4 s, e.g.
+/// a 10 s linger after a connection closed) makes a file count as live: it
+/// restarts and replays, up to the restart cap.
+fn length_probe_retries(status: Option<u16>) -> bool {
+    matches!(status, None | Some(403 | 429 | 503 | 509))
+}
+
+/// What the length probe learned about an HTTP input.
+enum ProbedInput {
+    /// An HLS playlist behind a URL without .m3u8 (by its content type).
+    Hls,
+    /// Whether it declares a length (`declares_length`).
+    Length(bool),
+}
+
+/// Ask an HTTP input for its length with `Range: bytes=0-0`, retried per
+/// `length_probe_retries`. An HLS playlist found that way is judged like an
+/// `.m3u8` input.
+async fn probe_input_end(input_url: &str) -> bool {
+    let tries = async {
+        for attempt in 0..LENGTH_PROBE_ATTEMPTS {
+            if attempt > 0 {
+                tokio::time::sleep(LENGTH_PROBE_BACKOFF).await;
+            }
+            let response = UPSTREAM_CLIENT
+                .get(input_url)
+                .header(reqwest::header::RANGE, "bytes=0-0")
+                .send()
+                .await;
+            match response {
+                Ok(response)
+                    if !length_probe_retries(Some(
+                        response
+                            .status()
+                            .as_u16(),
+                    )) =>
+                {
+                    return probe_response(&response);
+                }
+                _ => {}
+            }
+        }
+        ProbedInput::Length(false)
+    };
+    match tokio::time::timeout(LENGTH_PROBE_BUDGET, tries).await {
+        Ok(ProbedInput::Hls) => upstream_hls_playlist_ends(input_url).await,
+        Ok(ProbedInput::Length(declared)) => declared,
+        Err(_) => false,
+    }
+}
+
+fn probe_response(response: &reqwest::Response) -> ProbedInput {
+    if !response
+        .status()
+        .is_success()
+    {
+        return ProbedInput::Length(false);
+    }
+    let header = |name: reqwest::header::HeaderName| {
+        response
+            .headers()
+            .get(name)
+            .and_then(|value: &reqwest::header::HeaderValue| {
+                value
+                    .to_str()
+                    .ok()
+            })
+    };
+    if header(reqwest::header::CONTENT_TYPE).is_some_and(is_hls_content_type) {
+        return ProbedInput::Hls;
+    }
+    ProbedInput::Length(declares_length(
+        response
+            .status()
+            .as_u16(),
+        header(reqwest::header::CONTENT_RANGE),
+        header(reqwest::header::CONTENT_LENGTH),
+    ))
+}
+
+/// Whether a response to `Range: bytes=0-0` gives the resource's length: a
+/// 206 with `Content-Range: bytes 0-0/<length>`, or a 200 (Range ignored) with
+/// a `Content-Length`. Live streams have neither, or a bogus length that
+/// ffmpeg can't have reached when it stopped short of it.
+fn declares_length(
+    status: u16,
+    content_range: Option<&str>,
+    content_length: Option<&str>,
+) -> bool {
+    match status {
+        206 => content_range
+            .and_then(|range| range.rsplit_once('/'))
+            .is_some_and(|(_, total)| {
+                total
+                    .trim()
+                    .parse::<u64>()
+                    .is_ok()
+            }),
+        200 => content_length.is_some_and(|length| {
+            length
+                .trim()
+                .parse::<u64>()
+                .is_ok()
+        }),
+        _ => false,
+    }
+}
+
+fn is_hls_content_type(content_type: &str) -> bool {
+    content_type
+        .to_ascii_lowercase()
+        .contains("mpegurl")
+}
+
+/// What an HLS playlist says about the end of its stream.
+#[derive(Debug, PartialEq, Eq)]
+enum HlsPlaylistEnd {
+    /// VOD: `#EXT-X-ENDLIST` or `#EXT-X-PLAYLIST-TYPE:VOD`.
+    Ends,
+    /// Live or EVENT playlist without an end yet.
+    Open,
+    /// Master playlist: the URI of its first variant.
+    Variant(String),
+}
+
+fn hls_playlist_end(playlist: &str) -> HlsPlaylistEnd {
+    let mut variant_next = false;
+    for line in playlist
+        .lines()
+        .map(str::trim)
+    {
+        if line == "#EXT-X-ENDLIST" || line == "#EXT-X-PLAYLIST-TYPE:VOD" {
+            return HlsPlaylistEnd::Ends;
+        }
+        if line.starts_with("#EXT-X-STREAM-INF") {
+            variant_next = true;
+        } else if variant_next && !line.is_empty() && !line.starts_with('#') {
+            return HlsPlaylistEnd::Variant(line.to_owned());
+        }
+    }
+    HlsPlaylistEnd::Open
+}
+
+static UPSTREAM_CLIENT: std::sync::LazyLock<reqwest::Client> =
+    std::sync::LazyLock::new(|| {
+        reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(3))
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("failed to build upstream client")
+    });
+
+/// Whether an upstream HLS playlist is VOD, following a master playlist to
+/// its first variant. An unreachable or oversized playlist counts as live.
+async fn upstream_hls_playlist_ends(url: &str) -> bool {
+    let mut url = url.to_owned();
+    // The master playlist and one variant.
+    for _ in 0..2 {
+        let Some(playlist) = fetch_upstream_playlist(&url).await else {
+            return false;
+        };
+        match hls_playlist_end(&playlist) {
+            HlsPlaylistEnd::Ends => return true,
+            HlsPlaylistEnd::Open => return false,
+            HlsPlaylistEnd::Variant(uri) => {
+                match url::Url::parse(&url).and_then(|base| base.join(&uri)) {
+                    Ok(variant) => url = variant.into(),
+                    Err(_) => return false,
+                }
+            }
+        }
+    }
+    false
+}
+
+async fn fetch_upstream_playlist(url: &str) -> Option<String> {
+    let mut response = UPSTREAM_CLIENT
+        .get(url)
+        .send()
+        .await
+        .ok()?
+        .error_for_status()
+        .ok()?;
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .ok()?
+    {
+        body.extend_from_slice(&chunk);
+        if body.len() > MAX_UPSTREAM_PLAYLIST_BYTES {
+            return None;
+        }
+    }
+    String::from_utf8(body).ok()
+}
+
+/// Append `#EXT-X-ENDLIST` to the live playlist of a source that ended, so
+/// players finish playback instead of polling for segments that never come.
+/// Appending keeps the file whole for concurrent playlist reads.
+fn end_live_playlist(playlist: &std::path::Path) -> std::io::Result<()> {
+    use std::io::Write;
+    let content = std::fs::read_to_string(playlist)?;
+    if content.contains("#EXT-X-ENDLIST") {
+        return Ok(());
+    }
+    let separator = if content.ends_with('\n') { "" } else { "\n" };
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(playlist)?
+        .write_all(format!("{separator}#EXT-X-ENDLIST\n").as_bytes())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ThrottleSignal {
+    Pause { ahead: u32 },
+    Resume { ahead: u32 },
+}
+
+/// What one buffer-monitor tick does to ffmpeg and its output dir.
+#[derive(Debug, PartialEq, Eq)]
+struct MonitorStep {
+    signal: Option<ThrottleSignal>,
+    /// Delete segments below this index.
+    delete_below: Option<u32>,
+}
+
+/// One VOD buffer-monitor tick. `highest` is the highest segment index on
+/// disk; `playback_secs` is how far the client has played relative to the
+/// start of this run (from progress reports); `cleanup_due` is set every 30
+/// ticks.
+fn monitor_step(
+    highest: Option<u32>,
+    start_index: u32,
+    segment_length: u32,
+    playback_secs: u32,
+    paused: bool,
+    cleanup_due: bool,
+) -> MonitorStep {
+    let buffered_secs =
+        buffered_secs_from_segments(highest, start_index, segment_length);
+    let ahead = buffered_secs.saturating_sub(playback_secs);
+
+    let signal = if !paused && ahead >= MAX_BUFFER_SECS {
+        Some(ThrottleSignal::Pause { ahead })
+    } else if paused && ahead < MAX_BUFFER_SECS.saturating_sub(segment_length * 2) {
+        Some(ThrottleSignal::Resume { ahead })
+    } else {
+        None
+    };
+    // Delete segments more than SEGMENT_KEEP_SECS behind the playback position.
+    let delete_below = (cleanup_due && playback_secs > SEGMENT_KEEP_SECS)
+        .then(|| (playback_secs - SEGMENT_KEEP_SECS) / segment_length);
+    MonitorStep {
+        signal,
+        delete_below,
+    }
+}
 
 fn ffmpeg_bin() -> String {
     std::env::var("FFMPEG_PATH").unwrap_or_else(|_| "ffmpeg".into())
@@ -220,8 +754,10 @@ fn send_signal(pid: u32, sig: libc::c_int) {
 #[cfg(not(unix))]
 fn send_signal(_pid: u32, _sig: i32) {}
 
-/// Spawn the buffer-throttle task. It pauses/resumes ffmpeg so it never
-/// encodes more than MAX_BUFFER_SECS ahead of what the client has requested.
+/// Spawn the VOD buffer-throttle task. It pauses/resumes ffmpeg so it never
+/// encodes more than MAX_BUFFER_SECS ahead of what the client has requested,
+/// and deletes old segments. See `monitor_step`. Live sessions use
+/// `spawn_live_maintenance` instead.
 ///
 /// `start_index` is this run's `-start_number` (see `segment_start_index`):
 /// segment file names are numbered from the seek position, not from 0, so
@@ -249,39 +785,33 @@ fn spawn_buffer_monitor(
             ticks += 1;
 
             let pid = ffmpeg_pid.load(Ordering::Relaxed);
-            let buffered_secs = buffered_secs_from_segments(
+            let step = monitor_step(
                 highest_segment_index(&output_dir),
                 start_index,
                 segment_length,
+                playback_offset_secs.load(Ordering::Relaxed),
+                paused,
+                ticks % 30 == 0,
             );
-            // playback_offset_secs is how far the client has actually played
-            // relative to the start of this transcode session (from progress reports).
-            let playback_secs = playback_offset_secs.load(Ordering::Relaxed);
-
-            let ahead = buffered_secs.saturating_sub(playback_secs);
-
-            if pid != 0 && !paused && ahead >= MAX_BUFFER_SECS {
-                debug!(play_session_id, pid, ahead, "Buffer full — pausing ffmpeg");
-                #[cfg(unix)]
-                send_signal(pid, libc::SIGSTOP);
-                paused = true;
-            } else if pid != 0
-                && paused
-                && ahead < MAX_BUFFER_SECS.saturating_sub(segment_length * 2)
-            {
-                debug!(
-                    play_session_id,
-                    pid, ahead, "Buffer drained — resuming ffmpeg"
-                );
-                #[cfg(unix)]
-                send_signal(pid, libc::SIGCONT);
-                paused = false;
+            match step.signal {
+                Some(ThrottleSignal::Pause { ahead }) if pid != 0 => {
+                    debug!(play_session_id, pid, ahead, "Buffer full — pausing ffmpeg");
+                    #[cfg(unix)]
+                    send_signal(pid, libc::SIGSTOP);
+                    paused = true;
+                }
+                Some(ThrottleSignal::Resume { ahead }) if pid != 0 => {
+                    debug!(
+                        play_session_id,
+                        pid, ahead, "Buffer drained — resuming ffmpeg"
+                    );
+                    #[cfg(unix)]
+                    send_signal(pid, libc::SIGCONT);
+                    paused = false;
+                }
+                _ => {}
             }
-
-            // Every 30 seconds, delete segments that are more than SEGMENT_KEEP_SECS
-            // behind the current playback position.
-            if ticks % 30 == 0 && playback_secs > SEGMENT_KEEP_SECS {
-                let cutoff_idx = (playback_secs - SEGMENT_KEEP_SECS) / segment_length;
+            if let Some(cutoff_idx) = step.delete_below {
                 delete_old_segments(&output_dir, cutoff_idx);
             }
         }
@@ -295,6 +825,137 @@ fn spawn_buffer_monitor(
             }
         }
     });
+}
+
+/// Session-level upkeep of a live session, for as long as the session lasts
+/// rather than per ffmpeg run (a run can end within seconds):
+/// - pauses ffmpeg reading a source faster than real time once it is
+///   `LIVE_THROTTLE_SECS` ahead of the client's requests (`live_throttle`);
+/// - deletes segments behind the playlist window (`live_cleanup_cutoff`);
+/// - records the playlist's discontinuities before they slide out of the
+///   window (`LiveActivity::discontinuity_sequence`);
+/// - stops the ffmpeg of a source read in real time once the client has made
+///   no playlist or segment request for `LIVE_IDLE`, setting
+///   `LiveRun::idle_stopped` for the transcode loop.
+///
+/// Live clients' reported positions are ignored: Jellyfin Android TV reports
+/// 0, then epoch-based values after an error. `start_index` is the session's
+/// first segment. Runs until `ended` is cancelled.
+fn spawn_live_maintenance(
+    session: Arc<RwLock<TranscodeSession>>,
+    start_index: u32,
+    run: Arc<LiveRun>,
+    ffmpeg_pid: Arc<AtomicU32>,
+    ended: CancellationToken,
+) {
+    tokio::spawn(async move {
+        let (output_dir, segment_length, requested, activity) = {
+            let s = session
+                .read()
+                .await;
+            (
+                s.output_dir
+                    .clone(),
+                s.segment_length,
+                s.last_segment_index
+                    .clone(),
+                s.live_activity
+                    .clone(),
+            )
+        };
+        // The ffmpeg this task paused; a restarted one runs.
+        let mut paused_pid = 0;
+        loop {
+            tokio::select! {
+                _ = ended.cancelled() => break,
+                _ = tokio::time::sleep(LIVE_MAINTENANCE_INTERVAL) => {}
+            }
+            let highest = highest_segment_index(&output_dir);
+            // 0 between runs; kill(0, …) would signal our process group.
+            let pid = ffmpeg_pid.load(Ordering::Relaxed);
+            let faster_than_realtime =
+                run.faster_than_realtime(highest, segment_length);
+            let signal = live_throttle(
+                highest,
+                requested
+                    .load(Ordering::Relaxed)
+                    .max(start_index),
+                segment_length,
+                pid != 0 && pid == paused_pid,
+                faster_than_realtime,
+            );
+            match signal {
+                Some(ThrottleSignal::Pause { ahead }) if pid != 0 => {
+                    debug!(
+                        pid,
+                        ahead, "Live source ahead of the client — pausing ffmpeg"
+                    );
+                    #[cfg(unix)]
+                    send_signal(pid, libc::SIGSTOP);
+                    paused_pid = pid;
+                }
+                // Only signalled while paused, so `pid` is the paused ffmpeg.
+                Some(ThrottleSignal::Resume { ahead }) => {
+                    debug!(pid, ahead, "Live client caught up — resuming ffmpeg");
+                    #[cfg(unix)]
+                    send_signal(pid, libc::SIGCONT);
+                    paused_pid = 0;
+                }
+                _ => {}
+            }
+            if let Some(highest) = highest {
+                delete_old_segments(
+                    &output_dir,
+                    live_cleanup_cutoff(highest, segment_length),
+                );
+            }
+            if let Ok(playlist) =
+                tokio::fs::read_to_string(output_dir.join("main.m3u8")).await
+            {
+                activity.discontinuity_sequence(&playlist);
+            }
+            // A source read faster than real time is paused by the throttle
+            // once its client is gone, which costs no CPU, and the session
+            // reaper ends it. Stopping it instead would replay it from the
+            // start when the client returns: live inputs get no `-ss`.
+            if !faster_than_realtime && activity.idle_for() >= LIVE_IDLE {
+                let mut s = session
+                    .write()
+                    .await;
+                if let Some(kill_tx) = s
+                    .kill_tx
+                    .take()
+                {
+                    info!(
+                        session_id = %s.id,
+                        idle_secs = LIVE_IDLE.as_secs(),
+                        "No live playlist or segment request — stopping ffmpeg"
+                    );
+                    run.idle_stopped
+                        .store(true, Ordering::Relaxed);
+                    // run_ffmpeg resumes a paused ffmpeg before killing it.
+                    let _ = kill_tx.send(());
+                }
+            }
+        }
+    });
+}
+
+/// Wait for the client of an idle live session to request the playlist or a
+/// segment again. False if the session was stopped first.
+async fn wait_for_live_client(
+    activity: &LiveActivity,
+    stopped: &CancellationToken,
+) -> bool {
+    loop {
+        if activity.idle_for() < LIVE_IDLE {
+            return true;
+        }
+        tokio::select! {
+            _ = stopped.cancelled() => return false,
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+        }
+    }
 }
 
 /// Parses the numeric index out of a segment filename — `segment_00042.ts`,
@@ -1184,15 +1845,39 @@ pub(crate) fn build_hls_args(params: &TranscodeParams) -> Vec<String> {
             .into_owned(),
     ]);
 
-    // Keep all segments for the playback session. This is also Jellyfin's
-    // live-TV HLS behavior: EVENT playlists grow for the duration of a live
-    // session and let clients start from its beginning.
-    args.extend([
-        "-hls_playlist_type".into(),
-        "event".into(),
-        "-hls_list_size".into(),
-        "0".into(),
-    ]);
+    if params.is_live {
+        // Sliding window: segments behind it are deleted (see
+        // `live_cleanup_cutoff`), so an EVENT playlist would list missing
+        // segments. omit_endlist: an ffmpeg exit must not end playback for the
+        // client; the transcode loop ends the playlist itself when the source
+        // turns out to end (`live_run_end`).
+        //
+        // A restarted ffmpeg (crash, HW→SW fallback) finds the previous run's
+        // playlist: append_list continues it (next segment number,
+        // EXT-X-DISCONTINUITY) instead of resetting it, which ExoPlayer
+        // reports as PlaylistStuckException. Only on restarts, so a fresh
+        // playlist doesn't start with a discontinuity. A source that sends a
+        // backlog on connect appends that backlog again on every restart.
+        let hls_flags = if playlist.exists() {
+            "append_list+omit_endlist"
+        } else {
+            "omit_endlist"
+        };
+        args.extend([
+            "-hls_list_size".into(),
+            live_window_segments(params.segment_length).to_string(),
+            "-hls_flags".into(),
+            hls_flags.into(),
+        ]);
+    } else {
+        // Keep all segments for the playback session.
+        args.extend([
+            "-hls_playlist_type".into(),
+            "event".into(),
+            "-hls_list_size".into(),
+            "0".into(),
+        ]);
+    }
 
     if is_hevc_copy {
         // Apple HLS spec: HEVC must be delivered in fMP4/CMAF segments, not MPEG-TS.
@@ -1320,7 +2005,9 @@ pub async fn start_transcode(
             .write()
             .await;
         // Stopped before it started: don't recreate the removed output dir.
-        if s.stopped {
+        if s.stopped
+            .is_cancelled()
+        {
             return Ok(());
         }
         s.state = TranscodeState::Running;
@@ -1338,22 +2025,59 @@ pub async fn start_transcode(
         let mut sw_fallback = false;
         let mut live_restarts = 0u32;
         const MAX_LIVE_RESTARTS: u32 = 10;
+        let (stopped, live_activity) = {
+            let s = session_clone
+                .read()
+                .await;
+            (
+                s.stopped
+                    .clone(),
+                s.live_activity
+                    .clone(),
+            )
+        };
+        // Ends the live maintenance task together with this loop.
+        let ended = stopped.child_token();
+        let _ended_on_exit = ended
+            .clone()
+            .drop_guard();
+        let ffmpeg_pid = Arc::new(AtomicU32::new(0));
+        let live_run = Arc::new(LiveRun::default());
+        let start_index =
+            segment_start_index(params.start_time_ticks, params.segment_length);
+        if params.is_live {
+            spawn_live_maintenance(
+                session_clone.clone(),
+                start_index,
+                live_run.clone(),
+                ffmpeg_pid.clone(),
+                ended,
+            );
+        }
 
         loop {
             let args = build_hls_args(&params);
             debug!("ffmpeg args: {}", args.join(" "));
-
+            if params.is_live {
+                // Where this run starts writing (append_list continues after
+                // the previous run), for `LiveRun::faster_than_realtime`.
+                live_run.start(
+                    highest_segment_index(&params.output_dir)
+                        .map_or(start_index, |highest| highest + 1),
+                );
+            }
             let (kill_tx, kill_rx) = tokio::sync::oneshot::channel::<()>();
             let (monitor_stop_tx, monitor_stop_rx) =
                 tokio::sync::oneshot::channel::<()>();
 
-            let ffmpeg_pid = Arc::new(AtomicU32::new(0));
             let output_dir = {
                 let mut s = session_clone
                     .write()
                     .await;
                 // Stopped while no ffmpeg ran (no kill_tx to signal).
-                if s.stopped {
+                if s.stopped
+                    .is_cancelled()
+                {
                     debug!(session_id = %s.id, "transcode stopped before ffmpeg (re)spawn");
                     s.wait_done
                         .notify_one();
@@ -1364,17 +2088,21 @@ pub async fn start_transcode(
                     .map(|t| (t / 10_000_000) as u32)
                     .unwrap_or(0);
                 s.kill_tx = Some(kill_tx);
-                spawn_buffer_monitor(
-                    s.output_dir
-                        .clone(),
-                    s.segment_length,
-                    segment_start_index(params.start_time_ticks, s.segment_length),
-                    s.playback_offset_secs
-                        .clone(),
-                    ffmpeg_pid.clone(),
-                    monitor_stop_rx,
-                    s.id.clone(),
-                );
+                // Live sessions are throttled by `spawn_live_maintenance`, by
+                // requested segments rather than reported positions.
+                if !params.is_live {
+                    spawn_buffer_monitor(
+                        s.output_dir
+                            .clone(),
+                        s.segment_length,
+                        segment_start_index(params.start_time_ticks, s.segment_length),
+                        s.playback_offset_secs
+                            .clone(),
+                        ffmpeg_pid.clone(),
+                        monitor_stop_rx,
+                        s.id.clone(),
+                    );
+                }
                 s.output_dir
                     .clone()
             };
@@ -1390,10 +2118,11 @@ pub async fn start_transcode(
                 env_overrides,
                 kill_rx,
                 monitor_stop_tx,
-                ffmpeg_pid,
+                ffmpeg_pid.clone(),
                 output_dir,
             )
             .await;
+            ffmpeg_pid.store(0, Ordering::Relaxed);
 
             let using_hw = params
                 .accelerator
@@ -1409,9 +2138,12 @@ pub async fn start_transcode(
                     stderr = stderr_out.trim(),
                     "HW-accelerated transcode failed — retrying with software encoding"
                 );
-                // Clean partial output so the retry starts fresh.
-                let _ = std::fs::remove_dir_all(&params.output_dir);
-                let _ = std::fs::create_dir_all(&params.output_dir);
+                // Clean partial output so the retry starts fresh. Live keeps
+                // it: the retry appends to the playlist the client is following.
+                if !params.is_live {
+                    let _ = std::fs::remove_dir_all(&params.output_dir);
+                    let _ = std::fs::create_dir_all(&params.output_dir);
+                }
                 params.accelerator = Box::new(NoAccel);
                 // VPP tonemap can't run without HW; preserve the user's intent by
                 // activating software tonemapping so HDR content isn't washed out.
@@ -1421,6 +2153,21 @@ pub async fn start_transcode(
                 sw_fallback = true;
                 continue;
             }
+
+            // Decided before taking the session lock: it may ask the upstream.
+            let source_ended = params.is_live
+                && !stopped.is_cancelled()
+                && live_source_ended(
+                    result
+                        .as_ref()
+                        .and_then(|r| {
+                            r.as_ref()
+                                .ok()
+                        }),
+                    &stderr_out,
+                    &params.input_url,
+                )
+                .await;
 
             let mut s = session_clone
                 .write()
@@ -1435,24 +2182,58 @@ pub async fn start_transcode(
             }
             s.kill_tx = None;
 
-            // Live streams: auto-restart on unexpected exit; only stop when killed.
+            // Live: restart on upstream failures, wait for a client that went
+            // away, and end the playlist when the source ended.
             if params.is_live {
-                match result {
-                    None => {
+                let end = live_run_end(
+                    stopped.is_cancelled(),
+                    live_run
+                        .idle_stopped
+                        .swap(false, Ordering::Relaxed),
+                    result.is_none(),
+                    source_ended,
+                );
+                match end {
+                    LiveRunEnd::Stopped => {
                         debug!(session_id = %s.id, "live stream killed by session stop");
                         s.wait_done
                             .notify_one();
                         break;
                     }
-                    Some(r) => {
-                        let (status_str, stderr_str) = match &r {
-                            Ok(st) => (
-                                format!("{st}"),
+                    LiveRunEnd::Idle => {
+                        let session_id =
+                            s.id.clone();
+                        drop(s);
+                        if !wait_for_live_client(&live_activity, &stopped).await {
+                            debug!(session_id = %session_id, "idle live stream stopped");
+                            break;
+                        }
+                        info!(session_id = %session_id, "Live client is back — restarting ffmpeg");
+                        continue;
+                    }
+                    LiveRunEnd::Ended => {
+                        info!(session_id = %s.id, "Live source ended — ending the playlist");
+                        if let Err(e) = end_live_playlist(&s.variant_playlist_path()) {
+                            warn!(session_id = %s.id, error = %e, "failed to end the live playlist");
+                        }
+                        s.state = TranscodeState::Complete;
+                        let _ = s
+                            .state_tx
+                            .send(TranscodeState::Complete);
+                        s.wait_done
+                            .notify_one();
+                        break;
+                    }
+                    LiveRunEnd::Restart => {
+                        let (status_str, stderr_str) = match &result {
+                            Some(Err(e)) => ("error".to_string(), e.to_string()),
+                            Some(Ok(status)) => (
+                                format!("{status}"),
                                 stderr_out
                                     .trim()
                                     .to_string(),
                             ),
-                            Err(e) => ("error".to_string(), e.to_string()),
+                            None => ("killed".to_string(), String::new()),
                         };
                         if live_restarts < MAX_LIVE_RESTARTS {
                             live_restarts += 1;
@@ -1464,8 +2245,11 @@ pub async fn start_transcode(
                                 "live stream ffmpeg exited unexpectedly, restarting"
                             );
                             drop(s);
-                            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                            continue;
+                            // A session stopped meanwhile gets no new ffmpeg.
+                            tokio::select! {
+                                _ = stopped.cancelled() => break,
+                                _ = tokio::time::sleep(Duration::from_secs(3)) => continue,
+                            }
                         } else {
                             let err_msg = format!(
                                 "live stream ffmpeg exited after {MAX_LIVE_RESTARTS} restarts \
@@ -2907,6 +3691,344 @@ mod tests {
         assert!(!args_contains(&args, "-ss"));
     }
 
+    #[test]
+    fn live_hls_writes_a_sliding_window_playlist() {
+        let dir = tempfile::tempdir().unwrap();
+        let params = TranscodeParams {
+            is_live: true,
+            start_time_ticks: Some(299 * 10_000_000),
+            ..default_hls(
+                dir.path()
+                    .to_path_buf(),
+            )
+        };
+        let args = build_hls_args(&params);
+        // 300 s window of 6 s segments.
+        assert_eq!(arg_after(&args, "-hls_list_size"), Some("50"));
+        // Fresh session: no leading discontinuity from append_list.
+        assert_eq!(arg_after(&args, "-hls_flags"), Some("omit_endlist"));
+        assert!(!args_contains(&args, "-hls_playlist_type"));
+        assert!(!args_contains(&args, "-ss"));
+        assert_eq!(arg_after(&args, "-start_number"), Some("49"));
+    }
+
+    #[test]
+    fn live_hls_restart_appends_to_the_existing_playlist() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path()
+                .join("main.m3u8"),
+            "#EXTM3U\n",
+        )
+        .unwrap();
+        let params = TranscodeParams {
+            is_live: true,
+            start_time_ticks: Some(299 * 10_000_000),
+            ..default_hls(
+                dir.path()
+                    .to_path_buf(),
+            )
+        };
+        let args = build_hls_args(&params);
+        assert_eq!(
+            arg_after(&args, "-hls_flags"),
+            Some("append_list+omit_endlist")
+        );
+        // Restarts reuse these params, so -start_number never exceeds the
+        // playlist's MEDIA-SEQUENCE and append_list continues the numbering.
+        assert_eq!(arg_after(&args, "-start_number"), Some("49"));
+    }
+
+    #[test]
+    fn vod_hls_keeps_the_full_event_playlist() {
+        let args = build_hls_args(&default_hls(PathBuf::from("/tmp/test_vod")));
+        assert_eq!(arg_after(&args, "-hls_playlist_type"), Some("event"));
+        assert_eq!(arg_after(&args, "-hls_list_size"), Some("0"));
+        assert!(!args_contains(&args, "-hls_flags"));
+    }
+
+    #[test]
+    fn live_window_covers_five_minutes() {
+        assert_eq!(live_window_segments(6), 50);
+        assert_eq!(live_window_segments(4), 75);
+        assert_eq!(live_window_segments(1), 300);
+    }
+
+    #[test]
+    fn live_cleanup_cutoff_trails_the_playlist_window() {
+        // 50 listed segments plus 5 (30 s) for older playlist copies.
+        assert_eq!(live_cleanup_cutoff(110, 6), 55);
+        // Early in the session nothing is old enough.
+        assert_eq!(live_cleanup_cutoff(54, 6), 0);
+        assert_eq!(live_cleanup_cutoff(0, 6), 0);
+    }
+
+    #[test]
+    fn live_cleanup_bounds_disk_use() {
+        // A paused client with ffmpeg far ahead: only the window plus margin
+        // stays on disk.
+        let dir = tempfile::tempdir().unwrap();
+        for idx in 0..120 {
+            std::fs::write(
+                dir.path()
+                    .join(format!("segment_{idx:05}.ts")),
+                b"x",
+            )
+            .unwrap();
+        }
+        let output_dir = dir
+            .path()
+            .to_path_buf();
+        let highest = highest_segment_index(&output_dir).unwrap();
+        delete_old_segments(&output_dir, live_cleanup_cutoff(highest, 6));
+        let mut left: Vec<u32> = std::fs::read_dir(&output_dir)
+            .unwrap()
+            .filter_map(|e| {
+                segment_index(
+                    &e.unwrap()
+                        .file_name()
+                        .to_string_lossy(),
+                )
+            })
+            .collect();
+        left.sort_unstable();
+        assert_eq!(left, (64..120).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn vod_monitor_throttles_on_reported_position() {
+        // Segment 49 on disk = 300 s buffered, nothing played: pause.
+        assert_eq!(
+            monitor_step(Some(49), 0, 6, 0, false, false).signal,
+            Some(ThrottleSignal::Pause { ahead: 300 })
+        );
+        // Client caught up to 60 s: resume.
+        assert_eq!(
+            monitor_step(Some(49), 0, 6, 60, true, false).signal,
+            Some(ThrottleSignal::Resume { ahead: 240 })
+        );
+        // Cleanup keeps 30 s behind the reported position.
+        assert_eq!(
+            monitor_step(Some(49), 0, 6, 60, false, true).delete_below,
+            Some(5)
+        );
+    }
+
+    #[test]
+    fn a_run_faster_than_real_time_outran_the_clock() {
+        let secs = Duration::from_secs;
+        // A 330 s file copied in 2 s.
+        assert!(outran_the_clock(0, Some(54), 6, secs(2)));
+        // Live: real time plus the HLS demuxer's start 3 segments back.
+        assert!(!outran_the_clock(0, Some(20), 6, secs(100)));
+        assert!(!outran_the_clock(0, Some(2), 6, secs(1)));
+        // A live server's 90 s backlog on connect, also after 10 minutes.
+        assert!(!outran_the_clock(0, Some(14), 6, secs(1)));
+        assert!(!outran_the_clock(0, Some(114), 6, secs(600)));
+        // A restarted run that wrote nothing.
+        assert!(!outran_the_clock(30, None, 6, secs(1)));
+        assert!(!outran_the_clock(30, Some(29), 6, secs(1)));
+        // A restarted run counts from its own first segment.
+        assert!(!outran_the_clock(30, Some(64), 6, secs(150)));
+        assert!(outran_the_clock(30, Some(64), 6, secs(10)));
+    }
+
+    #[test]
+    fn live_run_latches_a_source_read_faster_than_real_time() {
+        let run = LiveRun::default();
+        run.start(10);
+        // 18 s written just after the start: a live burst.
+        assert!(!run.faster_than_realtime(Some(12), 6));
+        // 330 s written at once.
+        assert!(run.faster_than_realtime(Some(64), 6));
+        // A restarted run reads the same source.
+        run.start(65);
+        assert!(run.faster_than_realtime(None, 6));
+    }
+
+    #[test]
+    fn live_throttle_only_pauses_a_source_read_faster_than_real_time() {
+        use super::ThrottleSignal::*;
+        // (highest, requested, segment_length, paused, faster_than_realtime)
+        // Real live with a paused client (or one reporting position 0): never
+        // paused, however far ahead (#146).
+        assert_eq!(live_throttle(Some(100), 20, 6, false, false), None);
+        // A file: paused 150 s ahead of the newest requested segment.
+        assert_eq!(
+            live_throttle(Some(45), 20, 6, false, true),
+            Some(Pause { ahead: 150 })
+        );
+        assert_eq!(live_throttle(Some(44), 20, 6, false, true), None);
+        // Resumed once the client caught up by two segments.
+        assert_eq!(live_throttle(Some(45), 22, 6, true, true), None);
+        assert_eq!(
+            live_throttle(Some(45), 23, 6, true, true),
+            Some(Resume { ahead: 132 })
+        );
+        // A client ahead of ffmpeg, or no segments yet.
+        assert_eq!(live_throttle(Some(45), 50, 6, false, true), None);
+        assert_eq!(live_throttle(None, 0, 6, false, true), None);
+        // Epoch-based start numbers don't overflow.
+        assert_eq!(
+            live_throttle(Some(u32::MAX), 0, 6, false, true),
+            Some(Pause { ahead: u32::MAX })
+        );
+    }
+
+    #[test]
+    fn live_run_end_only_ends_a_source_that_ended() {
+        use super::LiveRunEnd::*;
+        // (stopped, idle_stopped, killed, source_ended)
+        assert_eq!(live_run_end(true, false, true, false), Stopped);
+        assert_eq!(live_run_end(true, false, false, true), Stopped);
+        assert_eq!(live_run_end(false, false, false, true), Ended);
+        // Any other exit restarts: upstream drops exit 0 too.
+        assert_eq!(live_run_end(false, false, false, false), Restart);
+        // Wait for the client, then restart.
+        assert_eq!(live_run_end(false, true, true, false), Idle);
+        assert_eq!(live_run_end(false, true, false, false), Idle);
+        // The source ended while the idle stop raced its exit.
+        assert_eq!(live_run_end(false, true, false, true), Ended);
+        assert_eq!(live_run_end(false, false, true, false), Stopped);
+    }
+
+    #[test]
+    fn stderr_input_errors_tell_drops_from_ends() {
+        // Upstream drops (round-3 logs, ffmpeg 8 at `-v error`).
+        for stderr in [
+            "[http @ 0x55d0c8a1b2c0] Stream ends prematurely at 4705076, should be 18446744073709551615\n",
+            "[in#0/mpegts @ 0x55d0c8a1b2c0] Error during demuxing: Input/output error\n",
+            "[in#0/matroska,webm @ 0x5612] Error during demuxing: Connection reset by peer\n",
+            "[tls @ 0x5612] Error in the pull function.\n",
+            "[tcp @ 0x5612] Connection to tcp://iptv.example:80 failed: Connection refused\n",
+            "[hls @ 0x5612] Error when loading first segment 'seg9.ts'\n",
+        ] {
+            assert!(stderr_reports_input_error(stderr), "{stderr}");
+        }
+        // A file read to its end logs nothing; decoder errors don't end it.
+        for stderr in [
+            "",
+            "[h264 @ 0x5612] error while decoding MB 12 40, bytestream -7\n",
+            "[aac @ 0x5612] channel element 0.0 is not allocated\n",
+        ] {
+            assert!(!stderr_reports_input_error(stderr), "{stderr}");
+        }
+    }
+
+    #[test]
+    fn declares_length_reads_range_responses() {
+        // (status, Content-Range, Content-Length)
+        assert!(declares_length(206, Some("bytes 0-0/345627810"), Some("1")));
+        assert!(declares_length(200, None, Some("345627810")));
+        // Live: unknown total, no length (chunked or close-delimited).
+        assert!(!declares_length(206, Some("bytes 0-0/*"), Some("1")));
+        assert!(!declares_length(200, None, None));
+        assert!(!declares_length(302, None, Some("0")));
+    }
+
+    #[test]
+    fn hls_content_types_are_recognised() {
+        assert!(is_hls_content_type("application/vnd.apple.mpegurl"));
+        assert!(is_hls_content_type("Application/X-MpegURL; charset=utf-8"));
+        assert!(is_hls_content_type("audio/mpegurl"));
+        assert!(!is_hls_content_type("video/mp2t"));
+    }
+
+    #[test]
+    fn hls_playlist_end_reads_vod_live_and_master_playlists() {
+        assert_eq!(
+            hls_playlist_end(
+                "#EXTM3U\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXTINF:6,\nseg0.ts\n#EXT-X-ENDLIST\n"
+            ),
+            HlsPlaylistEnd::Ends
+        );
+        assert_eq!(
+            hls_playlist_end("#EXTM3U\n#EXTINF:6,\nseg0.ts\n#EXT-X-ENDLIST\n"),
+            HlsPlaylistEnd::Ends
+        );
+        // Live, and EVENT without ENDLIST.
+        assert_eq!(
+            hls_playlist_end("#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:9\n#EXTINF:6,\nseg9.ts\n"),
+            HlsPlaylistEnd::Open
+        );
+        assert_eq!(
+            hls_playlist_end(
+                "#EXTM3U\n#EXT-X-PLAYLIST-TYPE:EVENT\n#EXTINF:6,\nseg0.ts\n"
+            ),
+            HlsPlaylistEnd::Open
+        );
+        assert_eq!(
+            hls_playlist_end(
+                "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=800000\r\nlow/index.m3u8\r\n\
+                 #EXT-X-STREAM-INF:BANDWIDTH=2000000\nhigh/index.m3u8\n"
+            ),
+            HlsPlaylistEnd::Variant("low/index.m3u8".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn local_inputs_end_and_streaming_protocols_dont() {
+        assert!(live_input_ends("/media/clips/promo.ts").await);
+        assert!(live_input_ends("file:///media/clips/promo.ts").await);
+        assert!(live_input_ends(r"C:\media\promo.ts").await);
+        assert!(!live_input_ends("rtsp://camera.example/stream").await);
+        assert!(!live_input_ends("udp://239.0.0.1:1234").await);
+    }
+
+    #[test]
+    fn length_probe_retries_connection_limits_and_transport_errors() {
+        // Transport error; connection limit; outage.
+        for status in [None, Some(403), Some(429), Some(503), Some(509)] {
+            assert!(length_probe_retries(status), "{status:?}");
+        }
+        // Answers about the resource itself.
+        for status in [Some(200), Some(206), Some(404), Some(416), Some(500)] {
+            assert!(!length_probe_retries(status), "{status:?}");
+        }
+        // All tries fit the budget, without counting request time.
+        assert!(
+            LENGTH_PROBE_BACKOFF * (LENGTH_PROBE_ATTEMPTS - 1) < LENGTH_PROBE_BUDGET
+        );
+    }
+
+    #[tokio::test]
+    async fn a_clean_exit_with_input_errors_or_a_failed_status_is_no_end() {
+        let clean = std::process::ExitStatus::default();
+        let local = "/media/clips/promo.ts";
+        assert!(live_source_ended(Some(&clean), "", local).await);
+        assert!(
+            !live_source_ended(
+                Some(&clean),
+                "[in#0/mpegts @ 0x1] Error during demuxing: Input/output error\n",
+                local,
+            )
+            .await
+        );
+        // Killed, or status != 0.
+        assert!(!live_source_ended(None, "", local).await);
+        // Real live over RTSP that closed cleanly.
+        assert!(!live_source_ended(Some(&clean), "", "rtsp://camera.example/s").await);
+    }
+
+    #[test]
+    fn end_live_playlist_appends_endlist_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let playlist = dir
+            .path()
+            .join("main.m3u8");
+        std::fs::write(
+            &playlist,
+            "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:5\n#EXTINF:6.0,\nsegment_00005.ts",
+        )
+        .unwrap();
+        end_live_playlist(&playlist).unwrap();
+        end_live_playlist(&playlist).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&playlist).unwrap(),
+            "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:5\n#EXTINF:6.0,\nsegment_00005.ts\n#EXT-X-ENDLIST\n"
+        );
+    }
+
     fn hevc_session(video_codec: &str, tag: Option<&str>) -> TranscodeSession {
         TranscodeSession {
             id: "play-session".into(),
@@ -2927,8 +4049,9 @@ mod tests {
             transcode_reasons: TranscodeReasons::default(),
             kill_tx: None,
             wait_done: Arc::new(tokio::sync::Notify::new()),
-            stopped: false,
+            stopped: Default::default(),
             requests: Default::default(),
+            live_activity: Default::default(),
             last_segment_index: Arc::new(AtomicU32::new(0)),
             start_time_secs: 0,
             playback_offset_secs: Arc::new(AtomicU32::new(0)),
@@ -3136,8 +4259,9 @@ mod tests {
             transcode_reasons: TranscodeReasons::default(),
             kill_tx: None,
             wait_done: Arc::new(tokio::sync::Notify::new()),
-            stopped: false,
+            stopped: Default::default(),
             requests: Default::default(),
+            live_activity: Default::default(),
             last_segment_index: Arc::new(AtomicU32::new(0)),
             start_time_secs: 30,
             playback_offset_secs: Arc::new(AtomicU32::new(0)),

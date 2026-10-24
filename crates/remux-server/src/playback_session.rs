@@ -25,8 +25,9 @@ pub struct PlayedStream {
     pub automatic_audio: Option<i64>,
 }
 
-/// Per play session: held while creating its transcode, so stops and dir
-/// removal never miss one still being created.
+/// Per play session: held while creating its transcode or restarting it for a
+/// segment-driven seek, so stops and dir removal never miss one still being
+/// created and two racing requests can't each spawn their own ffmpeg.
 pub(crate) static TRANSCODE_CREATE_LOCKS: crate::keyed_lock::KeyedLock<String> =
     crate::keyed_lock::KeyedLock::new();
 
@@ -178,7 +179,12 @@ pub(crate) async fn now_playing<'a>(
         let t = ts
             .read()
             .await;
-        if !t.stopped && t.item_id == shown.item_id && t.user_id == shown.user_id {
+        if !t
+            .stopped
+            .is_cancelled()
+            && t.item_id == shown.item_id
+            && t.user_id == shown.user_id
+        {
             return Some((shown, Some(ts.clone())));
         }
     }
@@ -1265,7 +1271,9 @@ impl PlaybackSessionManager {
                 let s = ts
                     .read()
                     .await;
-                if s.stopped {
+                if s.stopped
+                    .is_cancelled()
+                {
                     continue;
                 }
                 ((device_id, s.user_id, s.item_id), s.created_at)
@@ -1876,7 +1884,8 @@ impl PlaybackSessionManager {
             let mut s = ts
                 .write()
                 .await;
-            s.stopped = true;
+            s.stopped
+                .cancel();
             (
                 s.id.clone(),
                 s.kill_tx
@@ -1971,7 +1980,11 @@ async fn left_for_playback(
         let s = ts
             .read()
             .await;
-        if s.stopped || !s.left_for(since) || !s.abandoned(now) {
+        if s.stopped
+            .is_cancelled()
+            || !s.left_for(since)
+            || !s.abandoned(now)
+        {
             return false;
         }
         s.variant_playlist_path()
@@ -2358,6 +2371,7 @@ mod tests {
                 .read()
                 .await
                 .stopped
+                .is_cancelled()
         );
         assert!(
             removed(
@@ -2377,6 +2391,7 @@ mod tests {
                 .read()
                 .await
                 .stopped
+                .is_cancelled()
         );
         assert!(
             sessions
@@ -2426,7 +2441,8 @@ mod tests {
             assert!(
                 !ts.read()
                     .await
-                    .stopped,
+                    .stopped
+                    .is_cancelled(),
                 "{id}"
             );
         }
@@ -2468,6 +2484,7 @@ mod tests {
                 .read()
                 .await
                 .stopped
+                .is_cancelled()
         );
         assert!(
             sessions
@@ -2485,6 +2502,7 @@ mod tests {
             tab1.read()
                 .await
                 .stopped
+                .is_cancelled()
         );
         assert!(
             sessions
@@ -2546,7 +2564,8 @@ mod tests {
                 !tab1
                     .read()
                     .await
-                    .stopped,
+                    .stopped
+                    .is_cancelled(),
                 "{t}"
             );
         }
@@ -2604,7 +2623,8 @@ mod tests {
             assert!(
                 !ts.read()
                     .await
-                    .stopped,
+                    .stopped
+                    .is_cancelled(),
                 "{id}"
             );
         }
@@ -2640,6 +2660,7 @@ mod tests {
                 .read()
                 .await
                 .stopped
+                .is_cancelled()
         );
         for id in ["first", "second"] {
             assert!(
@@ -2690,7 +2711,8 @@ mod tests {
                 assert_eq!(
                     ts.read()
                         .await
-                        .stopped,
+                        .stopped
+                        .is_cancelled(),
                     !played,
                     "{id}"
                 );
@@ -2863,6 +2885,7 @@ mod tests {
             !ts.read()
                 .await
                 .stopped
+                .is_cancelled()
         );
         assert_eq!(
             sessions
@@ -2957,6 +2980,7 @@ mod tests {
                 .read()
                 .await
                 .stopped
+                .is_cancelled()
         );
     }
 
@@ -3014,7 +3038,8 @@ mod tests {
             assert_eq!(
                 ts.read()
                     .await
-                    .stopped,
+                    .stopped
+                    .is_cancelled(),
                 left,
                 "{id}"
             );
@@ -3158,6 +3183,7 @@ mod tests {
                 .read()
                 .await
                 .stopped
+                .is_cancelled()
         );
         // Nothing older is left to measure against that start.
         sessions
@@ -3345,6 +3371,7 @@ mod tests {
                 .read()
                 .await
                 .stopped
+                .is_cancelled()
         );
         assert!(
             removed(
@@ -3462,6 +3489,7 @@ mod tests {
             ts.read()
                 .await
                 .stopped
+                .is_cancelled()
         );
         assert!(
             sessions
@@ -3517,6 +3545,7 @@ mod tests {
             ts.read()
                 .await
                 .stopped
+                .is_cancelled()
         );
         assert!(
             sessions
@@ -3569,6 +3598,7 @@ mod tests {
             old.read()
                 .await
                 .stopped
+                .is_cancelled()
         );
         assert!(
             sessions
@@ -3613,6 +3643,7 @@ mod tests {
                 .read()
                 .await
                 .stopped
+                .is_cancelled()
         );
         assert!(
             sessions
