@@ -1287,6 +1287,22 @@ pub(crate) enum ProbeOutcome {
     Probed,
 }
 
+/// [`StreamDescriptor::is_alive`](crate::stream::StreamDescriptor::is_alive)
+/// for a stored source; one without a descriptor counts as alive.
+pub(crate) async fn source_is_alive(stream: &db::Media) -> bool {
+    match stream
+        .stream_info
+        .as_ref()
+    {
+        Some(si) => {
+            si.descriptor
+                .is_alive()
+                .await
+        }
+        None => true,
+    }
+}
+
 /// Resolve probe data for a single source: cache hit → skip → live probe with fallback.
 pub(crate) async fn probe_stream(
     stream: &db::Media,
@@ -1328,18 +1344,7 @@ pub(crate) async fn probe_stream(
         });
     if let Some(cached) = &stream.probe_data {
         if reuses_cached_probe(stream, cached, store) {
-            let alive = match stream
-                .stream_info
-                .as_ref()
-                .map(|si| &si.descriptor)
-            {
-                Some(d) => {
-                    d.is_alive()
-                        .await
-                }
-                None => true,
-            };
-            if alive {
+            if source_is_alive(stream).await {
                 debug!(id = %stream.id, "probe cache hit, url alive");
                 let mut info = api::MediaSourceInfo::from(stream.clone());
                 apply_video_bitrate_fallback(&mut info.media_streams, info.bitrate);
@@ -1387,6 +1392,17 @@ pub(crate) async fn probe_stream(
     match result {
         Ok((info, effective)) => Ok((info, effective, ProbeOutcome::Probed)),
         Err(error) if can_fallback_to_stale => {
+            // A source that now answers as gone (an error clip, 4xx/5xx)
+            // must not come back with its old metadata; a slow one may.
+            if let Some(si) = &stream.stream_info
+                && si
+                    .descriptor
+                    .availability()
+                    .await
+                    == Some(false)
+            {
+                return Err(error);
+            }
             warn!(
                 id = %stream.id,
                 error = ?error,
@@ -2417,6 +2433,69 @@ mod probe_tests {
         assert!(!reuses_cached_probe(&stream, &cached, &store));
         store.save(mismatched_probe_key(&stream), (), MISMATCHED_PROBE_TTL);
         assert!(reuses_cached_probe(&stream, &cached, &store));
+    }
+
+    #[tokio::test]
+    async fn failed_refresh_does_not_revive_an_error_clip() {
+        let server = httpmock::MockServer::start();
+        server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/blocked");
+            then.status(307)
+                .header("Location", "/static/unavailable_for_legal_reasons.mp4");
+        });
+        server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/static/unavailable_for_legal_reasons.mp4");
+            then.status(200)
+                .body("not a video");
+        });
+        let db = test_db().await;
+        let store = remux_utils::Store::new(16);
+        // RemuxDB metadata lacking RefFrames: re-probed, kept if that fails.
+        let stale = api::MediaSourceInfo {
+            media_streams: vec![MediaStream {
+                type_: Some(MediaStreamType::Video),
+                codec: Some("h264".to_string()),
+                ..Default::default()
+            }],
+            remux: Some(api::MediaSourceRemuxInfo {
+                source: Some(api::ProbeOrigin::RemuxDb),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let probe = async |url: String| {
+            let mut stream = http_media(&url);
+            stream.probe_data = Some(stale.clone());
+            probe_stream(
+                &stream,
+                Some(url),
+                false,
+                10,
+                false,
+                0,
+                &[],
+                false,
+                3000,
+                &db,
+                &store,
+            )
+            .await
+        };
+
+        // ffprobe fails on both; only the clip loses its stale metadata. An
+        // unreachable source (no answer) may be slow, not gone.
+        assert!(
+            probe(server.url("/blocked"))
+                .await
+                .is_err()
+        );
+        assert!(
+            probe("http://127.0.0.1:1/movie.mkv".to_string())
+                .await
+                .is_ok()
+        );
     }
 }
 
