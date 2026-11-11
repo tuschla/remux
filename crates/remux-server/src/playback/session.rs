@@ -1,7 +1,8 @@
 use remux_sdks::remux::{AudioCodec, TranscodeReasons, VideoCodec};
 use std::{
+    collections::BTreeSet,
     path::PathBuf,
-    sync::{Arc, atomic::AtomicU32},
+    sync::{Arc, Mutex, atomic::AtomicU32},
     time::Instant,
 };
 use tokio::sync::{Notify, watch};
@@ -63,6 +64,47 @@ impl SegmentContainer {
     }
 }
 
+/// Media sequence numbers of a live playlist's segments that follow an
+/// `#EXT-X-DISCONTINUITY`, kept after they slide out of the playlist.
+#[derive(Default)]
+pub struct LiveDiscontinuities(Mutex<BTreeSet<u64>>);
+
+impl LiveDiscontinuities {
+    /// `#EXT-X-DISCONTINUITY-SEQUENCE` of a live playlist (RFC 8216 §6.2.2),
+    /// which ffmpeg doesn't write: the discontinuities seen in earlier
+    /// playlists that slid out of this one.
+    pub fn sequence(&self, playlist: &str) -> u64 {
+        let mut seen = self
+            .0
+            .lock()
+            .expect("discontinuities lock is not poisoned");
+        let mut media_sequence: u64 = 0;
+        let mut next = 0;
+        let mut after_discontinuity = false;
+        for line in playlist
+            .lines()
+            .map(str::trim)
+        {
+            if let Some(n) = line.strip_prefix("#EXT-X-MEDIA-SEQUENCE:") {
+                media_sequence = n
+                    .parse()
+                    .unwrap_or(0);
+                next = media_sequence;
+            } else if line == "#EXT-X-DISCONTINUITY" {
+                after_discontinuity = true;
+            } else if !line.is_empty() && !line.starts_with('#') {
+                if after_discontinuity {
+                    seen.insert(next);
+                    after_discontinuity = false;
+                }
+                next += 1;
+            }
+        }
+        seen.range(..media_sequence)
+            .count() as u64
+    }
+}
+
 pub struct TranscodeSession {
     pub id: String,
     /// The user whose request created this transcode.
@@ -95,6 +137,8 @@ pub struct TranscodeSession {
     /// Set when the session is stopped, so ffmpeg is never (re)spawned
     /// afterwards.
     pub stopped: bool,
+    /// Used by live sessions only.
+    pub live_discontinuities: Arc<LiveDiscontinuities>,
     /// Index of the last segment the client has requested (0-based).
     pub last_segment_index: Arc<AtomicU32>,
     /// Start offset of this transcode in seconds (from start_time_ticks).
@@ -186,6 +230,7 @@ impl TranscodeSession {
             kill_tx: None,
             wait_done: Arc::new(Notify::new()),
             stopped: false,
+            live_discontinuities: Arc::default(),
             last_segment_index: Arc::new(AtomicU32::new(0)),
             start_time_secs: 0,
             playback_offset_secs: Arc::new(AtomicU32::new(0)),
