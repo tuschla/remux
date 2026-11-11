@@ -1296,6 +1296,9 @@ async fn variant_hls_video_inner(
         .read()
         .await;
     let is_live = session_read.is_live;
+    let live_discontinuities = session_read
+        .live_discontinuities
+        .clone();
     let use_fmp4 = session_read.use_fmp4();
     let playlist_path = session_read.variant_playlist_path();
     let psid = session_read
@@ -1340,6 +1343,12 @@ async fn variant_hls_video_inner(
         // EVENT→VOD so hls.js treats the stream as a completed VOD rather than
         // a live feed; leave live streams untouched.
         let is_complete = !is_live && content.contains("#EXT-X-ENDLIST");
+        // ffmpeg doesn't write EXT-X-DISCONTINUITY-SEQUENCE.
+        let discontinuity_sequence = if is_live {
+            live_discontinuities.sequence(&content)
+        } else {
+            0
+        };
 
         // Scope each segment URL to the playback session, matching Jellyfin's
         // HLS URL shape. This keeps session lookup out of query-string
@@ -1358,6 +1367,12 @@ async fn variant_hls_video_inner(
                     line.replace("\"init.mp4\"", &format!("\"hls/{}/init.mp4\"", psid))
                 } else if is_complete && line == "#EXT-X-PLAYLIST-TYPE:EVENT" {
                     "#EXT-X-PLAYLIST-TYPE:VOD".to_string()
+                } else if discontinuity_sequence > 0
+                    && line.starts_with("#EXT-X-MEDIA-SEQUENCE:")
+                {
+                    format!(
+                        "{line}\n#EXT-X-DISCONTINUITY-SEQUENCE:{discontinuity_sequence}"
+                    )
                 } else {
                     line.to_string()
                 }
@@ -2756,5 +2771,96 @@ mod tests {
         assert!(!super::audio_track_changed(None, Some(1), Some(1)));
         assert!(super::audio_track_changed(None, Some(1), Some(2)));
         assert!(!super::audio_track_changed(Some(1), None, Some(-1)));
+    }
+
+    /// A live session whose ffmpeg output the test writes itself.
+    async fn attach_live_session(
+        ctx: &crate::AppContext,
+        play_session_id: &str,
+    ) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let session = super::TranscodeSession::new(
+            play_session_id.into(),
+            uuid::Uuid::nil(),
+            uuid::Uuid::nil(),
+            uuid::Uuid::nil(),
+            "http://iptv.invalid/channel.ts".into(),
+            dir.path()
+                .to_path_buf(),
+            "copy".into(),
+            "aac".into(),
+            None,
+            None,
+            false,
+            6,
+            Default::default(),
+            0,
+            true,
+            Some("h264".into()),
+            Some("aac".into()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        ctx.sessions
+            .attach_transcode(play_session_id, "device", session)
+            .await;
+        dir
+    }
+
+    #[tokio::test]
+    async fn live_playlist_counts_discontinuities_that_slid_out() {
+        let (server, guard) = crate::integration_test::new_test_server()
+            .await
+            .unwrap();
+        let dir = attach_live_session(&guard.0, "live-discontinuity").await;
+        let playlist = dir
+            .path()
+            .join("main.m3u8");
+        let url = format!(
+            "/videos/{}/main.m3u8?PlaySessionId=live-discontinuity",
+            uuid::Uuid::nil()
+        );
+
+        // ffmpeg restarted with append_list: segment 17 follows a discontinuity.
+        std::fs::write(
+            &playlist,
+            "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXT-X-MEDIA-SEQUENCE:15\n\
+             #EXTINF:6.0,\nsegment_00015.ts\n#EXTINF:6.0,\nsegment_00016.ts\n\
+             #EXT-X-DISCONTINUITY\n#EXTINF:6.0,\nsegment_00017.ts\n",
+        )
+        .unwrap();
+        let served = server
+            .get(&url)
+            .await
+            .text();
+        assert!(
+            !served.contains("#EXT-X-DISCONTINUITY-SEQUENCE"),
+            "{served}"
+        );
+
+        // The window slid past segment 17.
+        std::fs::write(
+            &playlist,
+            "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXT-X-MEDIA-SEQUENCE:18\n\
+             #EXTINF:6.0,\nsegment_00018.ts\n#EXTINF:6.0,\nsegment_00019.ts\n",
+        )
+        .unwrap();
+        let served = server
+            .get(&url)
+            .await
+            .text();
+        assert!(
+            served.contains(
+                "#EXT-X-MEDIA-SEQUENCE:18\n#EXT-X-DISCONTINUITY-SEQUENCE:1\n"
+            ),
+            "{served}"
+        );
     }
 }
