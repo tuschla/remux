@@ -387,6 +387,9 @@ pub async fn report_playback_progress(
             crate::services::StreamService::played_release(
                 &state.ctx,
                 psid,
+                &session
+                    .device
+                    .id,
                 item_id,
                 data.media_source_id
                     .as_deref()
@@ -412,7 +415,42 @@ pub async fn report_playback_progress(
             )
             .await
             .context_internal("failed to update progress")?;
-        if let Some(before) = before.as_ref() {
+        // jellyfin-web reports a track switch under the new HLS session, which
+        // never saw the track switched from: the device's playback of the item
+        // under the old session did.
+        let switched_from = before
+            .as_ref()
+            .is_none_or(|b| {
+                b.audio_stream_index
+                    .is_none()
+                    && b.subtitle_stream_index
+                        .is_none()
+            })
+            .then(|| {
+                state
+                    .ctx
+                    .sessions
+                    .get_all()
+                    .into_iter()
+                    .filter(|s| {
+                        s.device_id
+                            == session
+                                .device
+                                .id
+                            && s.play_session_id != *psid
+                            && Some(s.item_id) == item_id
+                    })
+                    .max_by_key(|s| s.last_activity)
+            })
+            .flatten()
+            .map(|mut replaced| {
+                replaced.play_session_id = psid.clone();
+                replaced
+            });
+        if let Some(before) = switched_from
+            .as_ref()
+            .or(before.as_ref())
+        {
             crate::services::StreamService::remember_track_choice(
                 &state.ctx,
                 &session.user,
@@ -569,6 +607,41 @@ pub async fn report_playback_stopped(
             )
             .await
             .context_internal("failed to record stop")?;
+        // Jellyfin clients re-key a playback when they switch streams (say a
+        // direct play reported without a PlaySessionId, then HLS under the
+        // switch's) and report its stop under the new id, which never had a
+        // start report: HLS left a transcode stub there, unclaimed or claimed
+        // by progress after the playback it replaces started. Then the
+        // device's playback of the item is the one stopping; left running, it
+        // would pass for one in progress.
+        let user_id = session
+            .user
+            .id;
+        if let Some(replaced) = state
+            .ctx
+            .sessions
+            .get_by_device(
+                &session
+                    .device
+                    .id,
+            )
+            .filter(|replaced| {
+                replaced.user_id == user_id
+                    && Some(replaced.item_id) == changed_item_id
+                    && playback
+                        .as_ref()
+                        .is_some_and(|playback| {
+                            playback.user_id != user_id
+                                || replaced.started_at < playback.started_at
+                        })
+            })
+        {
+            state
+                .ctx
+                .sessions
+                .stop(&replaced.play_session_id)
+                .await;
+        }
         state
             .ctx
             .signals
@@ -2546,6 +2619,28 @@ mod e2e_tests {
             ctx.sessions
                 .attach_transcode("after", "test-device", ts)
                 .await
+        );
+    }
+
+    /// A stop for a play session that already ended (here replaced by a
+    /// restart of the item before the stop arrived) leaves the restarted
+    /// playback running.
+    #[tokio::test]
+    async fn a_late_stop_leaves_the_restarted_playback_running() {
+        let (server, guard, token) = authenticated_server().await;
+        let ctx = &guard.0;
+        let auth = auth_header_with_token(&token);
+        let item = Uuid::new_v4();
+        let first = json!({ "ItemId": item, "PlaySessionId": "first" });
+        report(&server, &auth, "/sessions/playing", first.clone()).await;
+        let restart = json!({ "ItemId": item, "PlaySessionId": "restart" });
+        report(&server, &auth, "/sessions/playing", restart).await;
+        report(&server, &auth, "/sessions/playing/stopped", first).await;
+
+        assert!(
+            ctx.sessions
+                .get("restart")
+                .is_some()
         );
     }
 }

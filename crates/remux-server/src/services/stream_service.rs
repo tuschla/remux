@@ -1338,6 +1338,7 @@ impl StreamService {
                 Self::track_language(
                     ctx,
                     psid,
+                    &before.device_id,
                     item_id,
                     before
                         .media_source_id
@@ -1356,6 +1357,7 @@ impl StreamService {
             Some(index) => Self::track_language(
                 ctx,
                 psid,
+                &before.device_id,
                 item_id,
                 before
                     .media_source_id
@@ -1418,6 +1420,7 @@ impl StreamService {
     async fn track_language(
         ctx: &AppContext,
         play_session_id: &str,
+        device_id: &str,
         item_id: Uuid,
         media_source_id: Option<&str>,
         index: i32,
@@ -1439,8 +1442,13 @@ impl StreamService {
         }
         // No PlaybackInfo answered this session (a client that skipped it):
         // the probed release is the best there is.
-        let release =
-            Self::played_release(ctx, play_session_id, item_id, media_source_id)?;
+        let release = Self::played_release(
+            ctx,
+            play_session_id,
+            device_id,
+            item_id,
+            media_source_id,
+        )?;
         let release = db::Media::get_by_id(&ctx.db, &release)
             .await
             .ok()??;
@@ -1456,16 +1464,23 @@ impl StreamService {
     /// The release (stream) `play_session_id` plays for `item_id`: the one its
     /// PlaybackInfo answer selected, else the source the client named. The
     /// reported `MediaSourceId` alone is not enough, as auto-play answers
-    /// stamp the first source with the item id.
+    /// stamp the first source with the item id. webOS and jellyfin-web's
+    /// direct play report an empty PlaySessionId: their release is the one
+    /// the device was answered.
     pub fn played_release(
         ctx: &AppContext,
         play_session_id: &str,
+        device_id: &str,
         item_id: Uuid,
         media_source_id: Option<&str>,
     ) -> Option<Uuid> {
         Self::selected_stream_for(ctx, play_session_id, item_id).or_else(|| {
             let source = media_source_id.and_then(|id| Uuid::parse_str(id).ok())?;
-            Self::selected_stream_for(ctx, play_session_id, source).or(Some(source))
+            Self::selected_stream_for(ctx, play_session_id, source)
+                .or_else(|| {
+                    Self::device_selected_stream_for(ctx, device_id, item_id, source)
+                })
+                .or(Some(source))
         })
     }
 
@@ -1498,6 +1513,10 @@ impl StreamService {
                 chrono::Utc::now() - session.last_activity < RUNNING_RELEASE_WINDOW
             })?;
         Self::selected_stream_for(ctx, &running.play_session_id, item_id)
+            // Started without a PlaySessionId (webOS, jellyfin-web direct play).
+            .or_else(|| {
+                Self::device_selected_stream_for(ctx, device_id, item_id, item_id)
+            })
     }
 
     /// Persist the resolved stream UUID in the device-preference store (24 h TTL).

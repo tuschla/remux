@@ -5468,6 +5468,237 @@ mod tests {
         );
     }
 
+    /// A movie with two releases laying the same two audio languages out in
+    /// opposite order: "Release 0" (stored first) Italian then Japanese,
+    /// "Release 1" (higher bitrate, so ranked first) Japanese then Italian.
+    /// No track is a container default, so nothing remembered plays track 1.
+    async fn seed_releases(
+        ctx: &crate::AppContext,
+    ) -> (crate::db::Media, [uuid::Uuid; 2]) {
+        let owner = crate::integration_test::seed_movie(ctx).await;
+        let mut releases = [uuid::Uuid::nil(); 2];
+        for (idx, (bitrate, languages)) in
+            [(8_000_000, ["ita", "jpn"]), (20_000_000, ["jpn", "ita"])]
+                .into_iter()
+                .enumerate()
+        {
+            let mut stream = insert_test_source(ctx).await;
+            stream.title = format!("Release {idx}");
+            stream
+                .stream_info
+                .as_mut()
+                .unwrap()
+                .descriptor =
+                crate::stream::StreamDescriptor::Local(format!("{idx}.mkv").into());
+            let probe = stream
+                .probe_data
+                .as_mut()
+                .unwrap();
+            probe.bitrate = Some(bitrate);
+            // Keep the video stream, replace the untagged audio track.
+            probe
+                .media_streams
+                .truncate(1);
+            probe
+                .media_streams
+                .extend(
+                    languages
+                        .into_iter()
+                        .zip(1..)
+                        .map(|(language, index)| crate::api::MediaStream {
+                            codec: Some("aac".to_string()),
+                            type_: Some(crate::api::MediaStreamType::Audio),
+                            index,
+                            language: Some(language.to_string()),
+                            ..Default::default()
+                        }),
+                );
+            stream
+                .save(&ctx.db)
+                .await
+                .unwrap();
+            // `Media::save` doesn't update `parent_id`.
+            sqlx::query("UPDATE media SET parent_id = ?, idx = ? WHERE id = ?")
+                .bind(owner.id)
+                .bind(idx as i64)
+                .bind(stream.id)
+                .execute(&ctx.db)
+                .await
+                .unwrap();
+            releases[idx] = stream.id;
+        }
+        // Within the streams TTL, so no addon refresh drops the rows above.
+        sqlx::query("UPDATE media SET streams_refreshed_at = ? WHERE id = ?")
+            .bind(chrono::Utc::now().naive_utc() - chrono::Duration::seconds(30))
+            .bind(owner.id)
+            .execute(&ctx.db)
+            .await
+            .unwrap();
+        (owner, releases)
+    }
+
+    async fn playback_info_for(
+        server: &axum_test::TestServer,
+        auth: &HeaderValue,
+        item_id: uuid::Uuid,
+        body: serde_json::Value,
+    ) -> serde_json::Value {
+        server
+            .post(&format!("/items/{item_id}/playbackinfo"))
+            .add_header(http::header::AUTHORIZATION, auth.clone())
+            .json(&body)
+            .await
+            .json()
+    }
+
+    async fn report(
+        server: &axum_test::TestServer,
+        auth: &HeaderValue,
+        path: &str,
+        body: &serde_json::Value,
+    ) {
+        server
+            .post(path)
+            .add_header(http::header::AUTHORIZATION, auth.clone())
+            .json(body)
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
+    }
+
+    /// jellyfin-web plays the release listed under the item id with the track
+    /// picked on the item page, reporting an empty PlaySessionId: the index is
+    /// remembered with that release.
+    #[tokio::test]
+    async fn an_index_reported_without_a_session_id_stays_with_its_release() {
+        let (server, guard, token) = authenticated_server().await;
+        let auth = HeaderValue::from_str(&auth_header_with_token(&token)).unwrap();
+        let (owner, releases) = seed_releases(&guard.0).await;
+
+        let info = playback_info_for(
+            &server,
+            &auth,
+            owner.id,
+            json!({ "MediaSourceId": owner.id.to_string(), "AudioStreamIndex": 2 }),
+        )
+        .await;
+        assert_eq!(info["MediaSources"][0]["Name"], "Release 1", "{info}");
+        let played = json!({
+            "ItemId": owner.id.to_string(),
+            "MediaSourceId": owner.id.to_string(),
+            "PlaySessionId": "",
+            "PositionTicks": 100_000_000i64,
+            "AudioStreamIndex": 2
+        });
+        for path in ["/sessions/playing", "/sessions/playing/progress"] {
+            report(&server, &auth, path, &played).await;
+        }
+
+        let info = playback_info_for(
+            &server,
+            &auth,
+            owner.id,
+            json!({ "MediaSourceId": releases[1].to_string() }),
+        )
+        .await;
+        assert_eq!(
+            info["MediaSources"][0]["DefaultAudioStreamIndex"], 2,
+            "{info}"
+        );
+    }
+
+    /// Sets the bitrate PlaybackInfo ranks `release` by.
+    async fn set_bitrate(ctx: &crate::AppContext, release: uuid::Uuid, bitrate: i64) {
+        let mut release = crate::db::Media::get_by_id(&ctx.db, &release)
+            .await
+            .unwrap()
+            .unwrap();
+        release
+            .probe_data
+            .as_mut()
+            .unwrap()
+            .bitrate = Some(bitrate);
+        release
+            .save(&ctx.db)
+            .await
+            .unwrap();
+    }
+
+    /// jellyfin-web starts a direct play without a PlaySessionId, switches
+    /// audio on the release listed under the item id, and reports the rest
+    /// under the PlaySessionId of the switch's HLS stream. The switch stays on
+    /// the playing release, the language picked follows to the other release,
+    /// and the stop ends the playback, so the next play ranks again.
+    #[tokio::test]
+    async fn a_track_switch_after_a_play_without_a_session_id() {
+        let (server, guard, token) = authenticated_server().await;
+        let auth = HeaderValue::from_str(&auth_header_with_token(&token)).unwrap();
+        let (owner, releases) = seed_releases(&guard.0).await;
+
+        let info = playback_info_for(&server, &auth, owner.id, json!({})).await;
+        assert_eq!(info["MediaSources"][0]["Name"], "Release 1", "{info}");
+        // Japanese on release 1.
+        report(
+            &server,
+            &auth,
+            "/sessions/playing",
+            &json!({
+                "ItemId": owner.id.to_string(),
+                "MediaSourceId": owner.id.to_string(),
+                "PlaySessionId": "",
+                "PositionTicks": 0,
+                "AudioStreamIndex": 1
+            }),
+        )
+        .await;
+        // Release 0 now has the higher bitrate, so it would rank first.
+        set_bitrate(&guard.0, releases[1], 4_000_000).await;
+
+        // Italian.
+        let switch =
+            json!({ "MediaSourceId": owner.id.to_string(), "AudioStreamIndex": 2 });
+        let switched =
+            playback_info_for(&server, &auth, owner.id, switch.clone()).await;
+        assert_eq!(
+            switched["MediaSources"][0]["Name"], "Release 1",
+            "{switched}"
+        );
+        let psid = switched["PlaySessionId"]
+            .as_str()
+            .unwrap();
+        server
+            .get(&format!(
+                "/videos/{id}/master.m3u8?PlaySessionId={psid}&MediaSourceId={id}&AudioStreamIndex=2",
+                id = owner.id
+            ))
+            .add_header(http::header::AUTHORIZATION, auth.clone())
+            .await
+            .assert_status_ok();
+        let rekeyed = json!({
+            "ItemId": owner.id.to_string(),
+            "MediaSourceId": owner.id.to_string(),
+            "PlaySessionId": psid,
+            "PositionTicks": 100_000_000i64,
+            "AudioStreamIndex": 2
+        });
+        for path in ["/sessions/playing/progress", "/sessions/playing/stopped"] {
+            report(&server, &auth, path, &rekeyed).await;
+        }
+
+        let replay = playback_info_for(&server, &auth, owner.id, switch).await;
+        assert_eq!(replay["MediaSources"][0]["Name"], "Release 0", "{replay}");
+        let other = playback_info_for(
+            &server,
+            &auth,
+            owner.id,
+            json!({ "MediaSourceId": releases[0].to_string() }),
+        )
+        .await;
+        assert_eq!(
+            other["MediaSources"][0]["DefaultAudioStreamIndex"], 1,
+            "Italian on release 0: {other}"
+        );
+    }
+
     /// With `RememberAudioSelections=false`, a track switch during playback must
     /// NOT be persisted and must NOT be recalled on the next PlaybackInfo request.
     #[tokio::test]
