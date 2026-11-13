@@ -1469,8 +1469,8 @@ impl StreamService {
         })
     }
 
-    /// The release `device_id` is playing for `item_id` right now, when a
-    /// PlaybackInfo for that item should stay on it.
+    /// The release `user_id` is playing for `item_id` on `device_id` right
+    /// now, when a PlaybackInfo for that item should stay on it.
     ///
     /// Auto-play answers stamp the first source's id with the item id, so a
     /// client that changes audio track or restarts mid-playback asks again with
@@ -1484,6 +1484,7 @@ impl StreamService {
     pub fn running_release(
         ctx: &AppContext,
         device_id: &str,
+        user_id: Uuid,
         item_id: Uuid,
         requested: Option<Uuid>,
     ) -> Option<Uuid> {
@@ -1492,7 +1493,7 @@ impl StreamService {
         }
         let running = ctx
             .sessions
-            .get_by_device(device_id)
+            .get_by_device(device_id, Some(user_id))
             .filter(|session| session.item_id == item_id)
             .filter(|session| {
                 chrono::Utc::now() - session.last_activity < RUNNING_RELEASE_WINDOW
