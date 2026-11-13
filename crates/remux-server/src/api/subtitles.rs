@@ -304,7 +304,7 @@ fn build_subtitle_extraction_args(
         "-copyts".to_string(),
     ];
     args.extend(
-        ffmpeg_http_input_args(input_url)
+        ffmpeg_http_input_args(input_url, true)
             .iter()
             .map(|s| s.to_string()),
     );
@@ -1163,7 +1163,7 @@ async fn subtitles_stream_inner(
         cmd.hide_console();
         cmd.kill_on_drop(true);
         cmd.args(["-copyts"]);
-        cmd.args(ffmpeg_http_input_args(&url));
+        cmd.args(ffmpeg_http_input_args(&url, true));
         cmd.args(["-i", &url]);
         cmd.args([
             "-map",
