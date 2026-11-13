@@ -314,7 +314,7 @@ async fn extract_pgs_to_cache(
     cmd.hide_console();
     cmd.kill_on_drop(true);
     cmd.args(["-y", "-nostdin", "-copyts"]);
-    cmd.args(ffmpeg_http_input_args(input_url));
+    cmd.args(ffmpeg_http_input_args(input_url, true));
     cmd.args(["-i", input_url]);
     cmd.args(["-map", map_spec, "-an", "-vn", "-c:s", "copy", "-f", "sup"]);
     cmd.arg(&tmp);
@@ -438,7 +438,7 @@ fn build_subtitle_extraction_args(
         "-copyts".to_string(),
     ];
     args.extend(
-        ffmpeg_http_input_args(input_url)
+        ffmpeg_http_input_args(input_url, true)
             .iter()
             .map(|s| s.to_string()),
     );
@@ -810,7 +810,7 @@ fn build_attachment_dump_args(
         );
     }
     args.extend(
-        ffmpeg_http_input_args(input_url)
+        ffmpeg_http_input_args(input_url, true)
             .iter()
             .map(|a| std::ffi::OsString::from(*a)),
     );

@@ -5,7 +5,7 @@ use std::{
     path::PathBuf,
     process::Stdio,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicU32, Ordering},
     },
 };
@@ -214,10 +214,16 @@ const SEGMENT_KEEP_SECS: u32 = 30;
 /// sliding HLS playlist.
 const LIVE_REWIND_SECS: u32 = 30 * 60;
 /// ffmpeg (`-v error`) messages showing that a live input failed rather than
-/// ended; ffmpeg still exits with status 0 after them. `Stream ends
+/// ended; ffmpeg can still exit with status 0 after them. `Stream ends
 /// prematurely` is also logged at the end of every body without a length.
-const INPUT_ERROR_MESSAGES: &[&str] =
-    &["Error during demuxing", "Stream ends prematurely"];
+/// Failed opens log `Error opening input: …` (ffmpeg 7) or `<url>: Server
+/// returned …`.
+const INPUT_ERROR_MESSAGES: &[&str] = &[
+    "Error during demuxing",
+    "Stream ends prematurely",
+    "Error opening input",
+    "Server returned",
+];
 /// Log contexts of the network protocols and the HLS demuxer.
 const INPUT_ERROR_CONTEXTS: &[&str] =
     &["[http @", "[https @", "[tcp @", "[tls @", "[hls @"];
@@ -264,6 +270,7 @@ fn spawn_buffer_monitor(
     is_live: bool,
     requested: Arc<AtomicU32>,
     faster_than_realtime: Arc<AtomicBool>,
+    resumed_at: Arc<Mutex<Option<std::time::Instant>>>,
 ) {
     tokio::spawn(async move {
         let started = std::time::Instant::now();
@@ -323,6 +330,10 @@ fn spawn_buffer_monitor(
                 #[cfg(unix)]
                 send_signal(pid, libc::SIGCONT);
                 paused = false;
+                *resumed_at
+                    .lock()
+                    .expect("resumed_at lock is not poisoned") =
+                    Some(std::time::Instant::now());
             }
 
             // Every 30 seconds, delete segments that are no longer needed.
@@ -365,7 +376,9 @@ fn cleanup_cutoff(
 /// Whether a live ffmpeg run that exited by itself read its source to the end.
 /// A live server can close a body cleanly, so a clean exit alone isn't enough.
 /// A source read `faster_than_realtime` ends on any clean exit, also after a
-/// reconnect: a restart would replay it from the start.
+/// reconnect: a restart would replay it from the start. Unless its body was
+/// cut short: live inputs get no `-reconnect_streamed`, so a host without
+/// ranges that drops the reader stops the run mid-file.
 async fn live_source_ended(
     status: Option<&std::process::ExitStatus>,
     stderr: &str,
@@ -375,7 +388,16 @@ async fn live_source_ended(
     if !status.is_some_and(std::process::ExitStatus::success) {
         return false;
     }
-    faster_than_realtime
+    // A reconnected body logs no demuxing error, and a body without a length
+    // always ends "prematurely" (should be u64::MAX).
+    let cut_short = stderr.contains("Error during demuxing")
+        && stderr
+            .lines()
+            .any(|line| {
+                line.contains("Stream ends prematurely")
+                    && !line.contains("should be 18446744073709551615")
+            });
+    (faster_than_realtime && !cut_short)
         || (!stderr_reports_input_error(stderr) && live_input_ends(input_url).await)
 }
 
@@ -952,7 +974,15 @@ fn is_hls_input_url(input_url: &str) -> bool {
 /// demuxer opens the playlists and segments itself, while `-reconnect_streamed`
 /// can leave proxied master playlists waiting indefinitely before the first
 /// rendition is opened.
-pub(crate) fn ffmpeg_http_input_args(input_url: &str) -> &'static [&'static str] {
+///
+/// The live HLS transcode passes `reconnect_streamed = false`: with `-copyts`
+/// an in-place reconnect restarts the timestamps and the segmenter stalls
+/// without ffmpeg exiting. Without it ffmpeg exits on the drop and the live
+/// restart loop continues the playlist.
+pub(crate) fn ffmpeg_http_input_args(
+    input_url: &str,
+    reconnect_streamed: bool,
+) -> &'static [&'static str] {
     match url::Url::parse(input_url) {
         Ok(url)
             if matches!(url.scheme(), "http" | "https")
@@ -960,7 +990,7 @@ pub(crate) fn ffmpeg_http_input_args(input_url: &str) -> &'static [&'static str]
         {
             &["-http_persistent", "0"]
         }
-        Ok(url) if matches!(url.scheme(), "http" | "https") => &[
+        Ok(url) if matches!(url.scheme(), "http" | "https") && reconnect_streamed => &[
             "-reconnect",
             "1",
             "-reconnect_streamed",
@@ -968,6 +998,9 @@ pub(crate) fn ffmpeg_http_input_args(input_url: &str) -> &'static [&'static str]
             "-reconnect_delay_max",
             "5",
         ],
+        Ok(url) if matches!(url.scheme(), "http" | "https") => {
+            &["-reconnect", "1", "-reconnect_delay_max", "5"]
+        }
         _ => &[],
     }
 }
@@ -1107,7 +1140,7 @@ pub(crate) fn build_hls_args(params: &TranscodeParams) -> Vec<String> {
     add_hls_extension_compat_args(&mut args, &params.input_url);
 
     args.extend(
-        ffmpeg_http_input_args(&params.input_url)
+        ffmpeg_http_input_args(&params.input_url, !params.is_live)
             .iter()
             .map(|s| (*s).into()),
     );
@@ -1567,8 +1600,15 @@ pub async fn start_transcode(
     tokio::spawn(async move {
         let mut params = params;
         let mut sw_fallback = false;
+        // Restarts since the last live run that wrote `LIVE_HEALTHY_RUN_SECS`:
+        // a long session doesn't end at its 10th upstream drop.
         let mut live_restarts = 0u32;
         const MAX_LIVE_RESTARTS: u32 = 10;
+        const LIVE_HEALTHY_RUN_SECS: u32 = 60;
+        // An input error this soon after the throttle resumed ffmpeg is the
+        // upstream dropping the reader we paused.
+        const LIVE_THROTTLE_DROP_GRACE: std::time::Duration =
+            std::time::Duration::from_secs(10);
         // Set by the buffer monitor for a file or VOD playlist served as a
         // channel; restarts read the same source, so it is never reset.
         let faster_than_realtime = Arc::new(AtomicBool::new(false));
@@ -1585,6 +1625,7 @@ pub async fn start_transcode(
                 tokio::sync::oneshot::channel::<()>();
 
             let ffmpeg_pid = Arc::new(AtomicU32::new(0));
+            let resumed_at = Arc::new(Mutex::new(None));
             // append_list continues the previous live run's segment numbering.
             let start_index = match highest_segment_index(&params.output_dir) {
                 Some(highest) if params.is_live => highest + 1,
@@ -1623,6 +1664,7 @@ pub async fn start_transcode(
                     s.last_segment_index
                         .clone(),
                     faster_than_realtime.clone(),
+                    resumed_at.clone(),
                 );
                 s.output_dir
                     .clone()
@@ -1644,14 +1686,33 @@ pub async fn start_transcode(
             )
             .await;
 
+            // Restarts replay a file or VOD playlist from the start, so its
+            // runs never reset the budget.
+            if params.is_live
+                && !faster_than_realtime.load(Ordering::Relaxed)
+                && buffered_secs_from_segments(
+                    highest_segment_index(&params.output_dir),
+                    start_index,
+                    params.segment_length,
+                ) >= LIVE_HEALTHY_RUN_SECS
+            {
+                live_restarts = 0;
+            }
+            let live_input_error =
+                params.is_live && stderr_reports_input_error(&stderr_out);
+
             let using_hw = params
                 .accelerator
                 .is_hw();
 
             // If HW accel caused the failure, retry once with software encoding.
+            // Live input errors (a 404 or drop while the channel restarts) are
+            // the upstream's; the restart below handles them, and the fallback
+            // would stick for the rest of the session.
             if !sw_fallback
                 && using_hw
                 && matches!(&result, Some(Ok(s)) if !s.success())
+                && !live_input_error
             {
                 warn!(
                     accel = ?params.accelerator.as_type(),
@@ -1723,12 +1784,25 @@ pub async fn start_transcode(
                             ),
                             Err(e) => ("error".to_string(), e.to_string()),
                         };
-                        if live_restarts < MAX_LIVE_RESTARTS {
+                        // The upstream dropped a reader the throttle had
+                        // paused; ffmpeg only fails once resumed. Such restarts
+                        // are paced by the client catching up, so not counted.
+                        let throttle_drop = live_input_error
+                            && resumed_at
+                                .lock()
+                                .expect("resumed_at lock is not poisoned")
+                                .is_some_and(|resumed| {
+                                    resumed.elapsed() <= LIVE_THROTTLE_DROP_GRACE
+                                });
+                        if !throttle_drop {
                             live_restarts += 1;
+                        }
+                        if live_restarts <= MAX_LIVE_RESTARTS {
                             warn!(
                                 session_id = %s.id,
                                 status = %status_str,
                                 restart = live_restarts,
+                                throttle_drop,
                                 stderr = %stderr_str,
                                 "live stream ffmpeg exited unexpectedly, restarting"
                             );
@@ -1738,7 +1812,7 @@ pub async fn start_transcode(
                         } else {
                             let err_msg = format!(
                                 "live stream ffmpeg exited after {MAX_LIVE_RESTARTS} restarts \
-                                 (status {status_str}): {stderr_str}"
+                                 without a healthy run (status {status_str}): {stderr_str}"
                             );
                             error!(session_id = %s.id, error = %err_msg, "Live stream failed");
                             s.state = TranscodeState::Error(err_msg.clone());
@@ -1952,7 +2026,7 @@ pub(crate) fn build_progressive_args(
         "5000000".into(),
     ];
     args.extend(
-        ffmpeg_http_input_args(&params.input_url)
+        ffmpeg_http_input_args(&params.input_url, true)
             .iter()
             .map(|s| (*s).into()),
     );
@@ -2714,6 +2788,7 @@ mod tests {
                 true,
                 Arc::new(AtomicU32::new(0)),
                 faster_than_realtime.clone(),
+                Default::default(),
             );
             tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
             let paused = process_state(ffmpeg.id()) == 'T';
@@ -2833,7 +2908,25 @@ mod tests {
         let reconnected = "[https @ 0x5613] Stream ends prematurely at 26474512, \
                            should be 47065346\n";
         assert!(live_source_ended(clean.as_ref(), reconnected, &movie, true).await);
+        // A host without ranges dropped the paused reader mid-file: restart,
+        // don't end the film.
+        let dropped = "[http @ 0x55] Stream ends prematurely at 54591488, \
+                       should be 1647791988\n\
+                       [in#0 @ 0x56] Error during demuxing: Input/output error\n";
+        assert!(!live_source_ended(clean.as_ref(), dropped, &movie, true).await);
         assert!(!live_source_ended(None, "", &movie, true).await);
+    }
+
+    #[test]
+    fn failed_live_input_open_is_an_input_error() {
+        // A 404 while the channel restarts must not switch a HW-accelerated
+        // live session to software encoding.
+        for stderr in [
+            "[in#0 @ 0x55] Error opening input: Server returned 404 Not Found\n",
+            "http://10.0.0.5:8080/live/1.ts: Server returned 404 Not Found\n",
+        ] {
+            assert!(stderr_reports_input_error(stderr), "{stderr}");
+        }
     }
 
     #[test]
@@ -5181,11 +5274,11 @@ mod tests {
             "https://cdn.example.com/video.mkv",
         ] {
             assert!(
-                !ffmpeg_http_input_args(url).is_empty(),
+                !ffmpeg_http_input_args(url, true).is_empty(),
                 "expected reconnect args for {url}"
             );
             assert!(
-                !ffmpeg_http_input_args(url).contains(&"-http_persistent"),
+                !ffmpeg_http_input_args(url, true).contains(&"-http_persistent"),
                 "-http_persistent is an HLS-demuxer-only option, rejected for {url}"
             );
         }
@@ -5197,13 +5290,14 @@ mod tests {
             "rtsp://camera.example.com/live",
         ] {
             assert!(
-                ffmpeg_http_input_args(url).is_empty(),
+                ffmpeg_http_input_args(url, true).is_empty(),
                 "expected no reconnect args for {url}"
             );
         }
 
         let hls = ffmpeg_http_input_args(
             "https://relay.example/api/manifest?url=https%3A%2F%2Forigin.example%2Flive.m3u8",
+            true,
         );
         assert_eq!(hls, ["-http_persistent", "0"]);
 
@@ -5211,6 +5305,7 @@ mod tests {
         // need the normal reconnect options.
         let dash = ffmpeg_http_input_args(
             "https://relay.example/hls?url=https%3A%2F%2Forigin.example%2Flive.mpd",
+            true,
         );
         assert!(dash.contains(&"-reconnect"));
     }
@@ -5234,6 +5329,18 @@ mod tests {
         assert!(args_contains(&args, "-reconnect_streamed"));
         assert!(args_contains(&args, "-reconnect_delay_max"));
         assert!(!args_contains(&args, "-reconnect_at_eof"));
+    }
+
+    #[test]
+    fn live_hls_http_input_exits_on_upstream_drop() {
+        // With -copyts an in-place reconnect stalls the segmenter; the live
+        // restart loop handles the drop instead.
+        let args = build_hls_args(&TranscodeParams {
+            is_live: true,
+            ..default_hls(PathBuf::from("/tmp/test_live_session"))
+        });
+        assert!(args_contains(&args, "-reconnect"));
+        assert!(!args_contains(&args, "-reconnect_streamed"));
     }
 
     #[test]
