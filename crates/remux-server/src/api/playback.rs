@@ -231,6 +231,9 @@ async fn items_playbackinfo_inner(
         &session
             .device
             .id,
+        session
+            .user
+            .id,
         id,
         q.media_source_id,
     ) {
@@ -1508,6 +1511,7 @@ async fn videos_stream_inner(
                 .get_by_device(
                     q.device_id
                         .as_deref()?,
+                    user_id,
                 )
                 .filter(|session| session.item_id == id)
                 .map(|session| session.play_session_id)
@@ -3619,7 +3623,7 @@ mod tests {
     #[tokio::test]
     async fn playbackinfo_during_playback_stays_on_the_playing_release() {
         use crate::{
-            integration_test::{auth_header_with_token, seed_movie},
+            integration_test::{AUTH_HEADER, auth_header_with_token, seed_movie},
             services::stream_service::{StreamService, StreamServiceConfig},
         };
 
@@ -3750,6 +3754,46 @@ mod tests {
                 .0,
             playing_ids,
             "the restarted session keeps the release too"
+        );
+
+        // Another user signed in with the same DeviceId plays something else
+        // since: this user's playback still runs on its release.
+        server
+            .post("/users/new")
+            .add_header(http::header::AUTHORIZATION, auth.clone())
+            .json(&json!({ "Name": "other", "Password": "other" }))
+            .await
+            .assert_status_ok();
+        let other_token = server
+            .post("/users/authenticatebyname")
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_static(AUTH_HEADER),
+            )
+            .json(&json!({ "Username": "other", "Pw": "other" }))
+            .await
+            .json::<serde_json::Value>()["AccessToken"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        server
+            .post("/sessions/playing")
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth_header_with_token(&other_token)).unwrap(),
+            )
+            .json(&json!({
+                "ItemId": uuid::Uuid::new_v4().simple().to_string(),
+                "PlaySessionId": "other-user",
+            }))
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
+        assert_eq!(
+            ask()
+                .await
+                .0,
+            playing_ids,
+            "another user's playback on the device is not this user's"
         );
 
         server

@@ -212,6 +212,11 @@ pub async fn report_playback_start(
             &session
                 .device
                 .id,
+            Some(
+                session
+                    .user
+                    .id,
+            ),
         );
     state
         .ctx
@@ -309,6 +314,11 @@ async fn report_item_id(
                         &session
                             .device
                             .id,
+                        Some(
+                            session
+                                .user
+                                .id,
+                        ),
                     )
             })
             .filter(|s| {
@@ -355,6 +365,11 @@ pub async fn report_playback_progress(
             &session
                 .device
                 .id,
+            Some(
+                session
+                    .user
+                    .id,
+            ),
         )
         .is_some_and(|s| s.is_paused);
     let effective_psid = data
@@ -368,6 +383,11 @@ pub async fn report_playback_progress(
                     &session
                         .device
                         .id,
+                    Some(
+                        session
+                            .user
+                            .id,
+                    ),
                 )
                 .map(|s| s.play_session_id)
         });
@@ -508,6 +528,11 @@ pub async fn report_playback_stopped(
                     &session
                         .device
                         .id,
+                    Some(
+                        session
+                            .user
+                            .id,
+                    ),
                 )
                 .map(|s| s.play_session_id)
         });
@@ -569,6 +594,22 @@ pub async fn report_playback_stopped(
             )
             .await
             .context_internal("failed to record stop")?;
+        if let Some(item_id) = changed_item_id {
+            state
+                .ctx
+                .sessions
+                .stop_switched_from(
+                    &session
+                        .device
+                        .id,
+                    session
+                        .user
+                        .id,
+                    item_id,
+                    psid,
+                )
+                .await;
+        }
         state
             .ctx
             .signals
@@ -758,9 +799,14 @@ pub(crate) async fn build_session_list(
         // any session for this device. This handles quality-switch windows where
         // a new stub coexists with the old session that had its transcode
         // cleared. Like Jellyfin, a stub shows nothing before a report.
+        // Another user signed in with the same DeviceId has a row of their own.
         let ps = playback_sessions
             .iter()
-            .filter(|s| s.device_id == device.id && s.is_reported())
+            .filter(|s| {
+                s.device_id == device.id
+                    && s.is_reported()
+                    && s.user_id == device.user_id
+            })
             .max_by_key(|s| {
                 (
                     s.transcode
@@ -1721,6 +1767,7 @@ mod e2e_tests {
             insert_test_source, seed_movie,
         },
         playback::session::TranscodeSession,
+        playback_session::{FfmpegTrack, ServedPlayback},
     };
 
     async fn post_capabilities_full(
@@ -2546,6 +2593,122 @@ mod e2e_tests {
             ctx.sessions
                 .attach_transcode("after", "test-device", ts)
                 .await
+        );
+    }
+
+    /// Two users signed in with one DeviceId (a shared TV or browser) each
+    /// have a `/Sessions` row showing their own playback. One user's start
+    /// report leaves the other's playback alone, and a stop without
+    /// PlaySessionId ends the reporting user's own.
+    #[tokio::test]
+    async fn two_users_on_one_device_keep_their_own_playback() {
+        let (server, guard, token) = authenticated_server().await;
+        let ctx = &guard.0;
+        let auth = auth_header_with_token(&token);
+        server
+            .post("/users/new")
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .json(&json!({ "Name": "user2", "Password": "user2" }))
+            .await
+            .assert_status_ok();
+        // AUTH_HEADER carries the same DeviceId as `auth`.
+        let user2_token = server
+            .post("/users/authenticatebyname")
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_static(AUTH_HEADER),
+            )
+            .json(&json!({ "Username": "user2", "Pw": "user2" }))
+            .await
+            .json::<serde_json::Value>()["AccessToken"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let user2_auth = auth_header_with_token(&user2_token);
+        let plays = [
+            ("test", &auth, Uuid::new_v4()),
+            ("user2", &user2_auth, Uuid::new_v4()),
+        ];
+        for (name, auth, item) in plays {
+            let start = json!({ "ItemId": item, "PlaySessionId": name });
+            report(&server, auth, "/sessions/playing", start).await;
+        }
+
+        let resp = server
+            .get("/sessions")
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .await;
+        resp.assert_status_ok();
+        let rows: Vec<crate::api::SessionInfoDto> = resp.json();
+        for (name, _, item) in plays {
+            let row = rows
+                .iter()
+                .find(|row| {
+                    row.user_name
+                        .as_deref()
+                        == Some(name)
+                })
+                .unwrap();
+            assert_eq!(
+                row.now_playing_item
+                    .as_ref()
+                    .map(|i| i.id),
+                Some(item),
+                "{name}"
+            );
+        }
+
+        // The first user's playback becomes the device's most recently active.
+        let progress = json!({ "ItemId": plays[0].2, "PlaySessionId": "test" });
+        report(&server, &auth, "/sessions/playing/progress", progress).await;
+        let stop = json!({ "ItemId": plays[1].2 });
+        report(&server, &user2_auth, "/sessions/playing/stopped", stop).await;
+        assert!(
+            ctx.sessions
+                .get("test")
+                .is_some()
+        );
+        assert!(
+            ctx.sessions
+                .get("user2")
+                .is_none()
+        );
+    }
+
+    /// jellyfin-web switches streams under a new PlaySessionId, stopping the
+    /// old transcode, and stops playback under the new one: the play session
+    /// it switched away from ends with it.
+    #[tokio::test]
+    async fn a_stop_after_a_stream_switch_ends_the_session_switched_from() {
+        let (server, guard, token) = authenticated_server().await;
+        let ctx = &guard.0;
+        let auth = auth_header_with_token(&token);
+        let item = Uuid::new_v4();
+        let start = json!({ "ItemId": item, "PlaySessionId": "before-switch" });
+        report(&server, &auth, "/sessions/playing", start).await;
+        // Served by ffmpeg; the switch stopped that transcode.
+        ctx.sessions
+            .record_server_play_method(
+                "before-switch",
+                ServedPlayback::Ffmpeg {
+                    video: FfmpegTrack::new(&"h264".into(), Some("hevc")),
+                    audio: FfmpegTrack::new(&"aac".into(), Some("dts")),
+                },
+            );
+
+        let stop = json!({ "ItemId": item, "PlaySessionId": "after-switch" });
+        report(&server, &auth, "/sessions/playing/stopped", stop).await;
+
+        assert!(
+            ctx.sessions
+                .get("before-switch")
+                .is_none()
         );
     }
 }
