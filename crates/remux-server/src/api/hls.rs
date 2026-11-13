@@ -1723,8 +1723,8 @@ async fn hls_segment_inner(
     // FFmpeg needs to be restarted at a different position (like Jellyfin does).
     if !segment_path.exists() {
         if let (Some(session), Some(requested_idx)) = (&session, requested_idx) {
-            let s = session
-                .read()
+            let mut s = session
+                .write()
                 .await;
             let output_dir = s
                 .output_dir
@@ -1764,16 +1764,24 @@ async fn hls_segment_inner(
             };
 
             if needs_restart {
-                // Guard against concurrent restart: only proceed if FFmpeg
-                // is actually running (kill_tx is Some). If another request
-                // already killed it and started a new one, just wait.
-                let has_running_ffmpeg = s
+                // Claim the restart under the write lock: take the running
+                // ffmpeg's kill_tx, or mark a finished VOD run Starting (nothing
+                // else would ever write the segment) unless the session was
+                // stopped. A concurrent request then finds neither and waits.
+                let finished = !s.is_live
+                    && !s.stopped
+                    && matches!(
+                        s.state,
+                        TranscodeState::Error(_) | TranscodeState::Complete
+                    );
+                let kill_tx = s
                     .kill_tx
-                    .is_some();
-                if !has_running_ffmpeg {
+                    .take();
+                if kill_tx.is_none() && !finished {
                     drop(s);
                     // Another request already restarted — fall through to wait loop.
                 } else {
+                    s.state = TranscodeState::Starting;
                     debug!(
                         requested_idx,
                         ?current_idx,
@@ -1781,7 +1789,7 @@ async fn hls_segment_inner(
                         "Segment-driven transcode restart"
                     );
 
-                    // Gather params we need before dropping the read lock.
+                    // Gather params we need before dropping the lock.
                     let input_url = s
                         .input_url
                         .clone();
@@ -1795,27 +1803,17 @@ async fn hls_segment_inner(
                     let audio_channels = s.audio_channels;
                     let subtitle_stream_index = s.subtitle_stream_index;
                     let burn_subtitle = s.burn_subtitle;
+                    let wait_done = s
+                        .wait_done
+                        .clone();
                     drop(s);
 
                     // Kill running FFmpeg and clean up stale segments (params
                     // like bitrate/codec may change, so old segments are invalid).
-                    {
-                        let (kill_tx, wait_done) = {
-                            let mut s = session
-                                .write()
-                                .await;
-                            (
-                                s.kill_tx
-                                    .take(),
-                                s.wait_done
-                                    .clone(),
-                            )
-                        };
-                        if let Some(kill_tx) = kill_tx {
-                            let notification = wait_done.notified();
-                            let _ = kill_tx.send(());
-                            notification.await;
-                        }
+                    if let Some(kill_tx) = kill_tx {
+                        let notification = wait_done.notified();
+                        let _ = kill_tx.send(());
+                        notification.await;
                     }
                     let _ = tokio::fs::remove_dir_all(&output_dir).await;
                     let _ = tokio::fs::create_dir_all(&output_dir).await;
@@ -1950,7 +1948,7 @@ async fn hls_segment_inner(
                             error!("Transcode restart failed: {:#}", e);
                         }
                     });
-                } // else: has_running_ffmpeg
+                } // else: restart claimed
             } // needs_restart
         }
     }
@@ -2862,5 +2860,79 @@ mod tests {
             ),
             "{served}"
         );
+    }
+
+    /// A forward seek's `-c copy` run can finish the file within seconds.
+    /// Seeking back afterwards must restart ffmpeg, not wait 60 s for a 404.
+    #[tokio::test]
+    async fn seeking_back_restarts_a_finished_transcode() {
+        use std::time::Duration;
+
+        let (server, guard) = crate::integration_test::new_test_server()
+            .await
+            .unwrap();
+        let ctx = &guard.0;
+        let dir = attach_live_session(ctx, "vod-seek-back").await;
+        {
+            let session = ctx
+                .sessions
+                .get_transcode("vod-seek-back")
+                .unwrap();
+            let mut s = session
+                .write()
+                .await;
+            s.is_live = false;
+            s.state = super::TranscodeState::Complete;
+        }
+        let last = dir
+            .path()
+            .join("segment_01210.ts");
+        std::fs::write(&last, "ts").unwrap();
+
+        let request = server.get(&format!(
+            "/videos/{}/hls/vod-seek-back/segment_00010.ts",
+            uuid::Uuid::nil()
+        ));
+        // A restart clears the finished run's segments, then the request
+        // waits for the new ffmpeg.
+        let restarted = tokio::time::timeout(Duration::from_secs(10), async {
+            while last.exists() {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        });
+        tokio::select! {
+            _ = request => panic!("answered without restarting ffmpeg"),
+            restarted = restarted => restarted.expect("finished run restarted"),
+        }
+    }
+
+    /// A live channel that used up its restarts must not be restarted as a
+    /// VOD transcode by a segment request.
+    #[tokio::test]
+    async fn a_failed_live_session_is_not_restarted() {
+        use std::time::Duration;
+
+        let (server, guard) = crate::integration_test::new_test_server()
+            .await
+            .unwrap();
+        let ctx = &guard.0;
+        let dir = attach_live_session(ctx, "live-failed").await;
+        ctx.sessions
+            .get_transcode("live-failed")
+            .unwrap()
+            .write()
+            .await
+            .state = super::TranscodeState::Error("gave up".into());
+        let playlist = dir
+            .path()
+            .join("index.m3u8");
+        std::fs::write(&playlist, "#EXTM3U").unwrap();
+
+        let request = server.get(&format!(
+            "/videos/{}/hls/live-failed/segment_00010.ts",
+            uuid::Uuid::nil()
+        ));
+        let _ = tokio::time::timeout(Duration::from_secs(1), request).await;
+        assert!(playlist.exists(), "a restart wiped the live session");
     }
 }
